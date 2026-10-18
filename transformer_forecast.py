@@ -714,6 +714,78 @@ def featurize(wp, pdf, kin, clim, fc, priors, segments, normal_mode, chunk):
 
 
 # =============================================================================
+# Validation block, year-ago features, seasonal-naive forecast
+# =============================================================================
+LY_DAYS = 364                     # "same time last year": 52 weeks back, so the weekday matches too
+
+
+def blocked_validation(origin, val_start, val_end, train_cutoff, horizon):
+    """Validation = origins in (val_start, val_end]; fit = every training origin at least `horizon` days away from it on
+    BOTH sides (before val_start - horizon, or after val_end + horizon), so no fit target day is a validation target day.
+    A block spanning autumn -> spring lets early stopping see the heating-season transitions, not one summer."""
+    o = pd.to_datetime(origin)
+    vs, ve, cut = pd.Timestamp(val_start), pd.Timestamp(val_end), pd.Timestamp(train_cutoff)
+    if not vs < ve <= cut:
+        raise SystemExit(f"--val-end {val_end} must be after --val-start {val_start} and not after the train cutoff {train_cutoff}")
+    emb = pd.Timedelta(days=horizon)
+    val = ((o > vs) & (o <= ve)).to_numpy()
+    fit = (((o <= vs - emb) | (o > ve + emb)) & (o <= cut)).to_numpy()
+    return fit, val
+
+
+def month_span(dates):
+    d = pd.to_datetime(pd.Series(dates))
+    if d.empty:
+        return "none"
+    m = d.dt.to_period("M")
+    return f"{m.min()}..{m.max()} ({m.nunique()} months, {len(d):,} rows)"
+
+
+def take(arr, r_tr, start, length):
+    """arr (n_tr, T) -> (rows, length): arr[tr, start : start+length], NaN where the index falls outside the series
+    (start may be negative; sliding_window_view would wrap around instead)."""
+    T = arr.shape[1]
+    idx = np.asarray(start, dtype=np.int64)[:, None] + np.arange(length)[None, :]
+    ok = (idx >= 0) & (idx < T)
+    rows = np.broadcast_to(np.asarray(r_tr)[:, None], idx.shape)
+    out = np.full(idx.shape, np.nan)
+    out[ok] = arr[rows[ok], idx[ok]]
+    return out
+
+
+def year_ago(wp, arr, r_tr, r_o, blocks, min_ref_days=20, clip=(0.2, 5.0)):
+    """What this transformer did around the same date one year earlier, relative to the 30 days before that date.
+    All days used are <= origin - LY_DAYS + horizon < origin, so this is causal.
+
+    -> (features dict, daily ratio (rows, H))
+       ly_ratio_{a}_{b}   mean of last year's days a..b after the origin  /  mean of last year's 30 days before it
+       ly_ratio_m7_0      last year's 7 days before the origin / its 30 days before (was demand already turning?)
+       daily ratio        7-day centred mean of last year's day h / the same 30-day reference (for the seasonal-naive forecast)
+    NaN where last year is not in the panel or too much of it is missing."""
+    import warnings
+    H = wp.HORIZON
+    o_ly = np.asarray(r_o) - LY_DAYS
+    ref_win = take(arr, r_tr, o_ly - 29, 30)
+    n_ref = np.isfinite(ref_win).sum(1)
+    with np.errstate(invalid="ignore", divide="ignore"), warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)               # nanmean of all-NaN rows -> NaN, as intended
+        ref = np.where(n_ref >= min_ref_days, np.nanmean(ref_win, axis=1), np.nan)
+        ref = np.where(ref > 0, ref, np.nan)
+        fut = take(arr, r_tr, o_ly + 1 - 3, H + 6)                     # 3 extra days each side for the centred mean
+        f = {}
+        for a, b in blocks:
+            blk = fut[:, 3 + a - 1: 3 + b]
+            ok = np.isfinite(blk).sum(1) >= max(1, (b - a + 1) // 2)
+            f[f"ly_ratio_{a}_{b}"] = np.where(ok, np.clip(np.nanmean(blk, axis=1) / ref, *clip), np.nan)
+        last7 = ref_win[:, -7:]
+        f["ly_ratio_m7_0"] = np.where(np.isfinite(last7).sum(1) >= 4, np.clip(np.nanmean(last7, axis=1) / ref, *clip), np.nan)
+        from numpy.lib.stride_tricks import sliding_window_view
+        w = sliding_window_view(fut, 7, axis=1)                         # (rows, H, 7), centred on last year's day h
+        daily = np.where(np.isfinite(w).sum(2) >= 4, np.nanmean(w, axis=2), np.nan) / ref[:, None]
+    return f, np.clip(daily, *clip)
+
+
+# =============================================================================
 # Direct: each transformer is a meter
 # =============================================================================
 def stage_direct(wp, args, world, panel, clim, fc, cutoffs):
@@ -742,6 +814,15 @@ def stage_direct(wp, args, world, panel, clim, fc, cutoffs):
     n_hh = panel.n_hh[r_tr].astype(float)
     feats["n_households"], feats["log_n_households"] = n_hh, np.log(n_hh)
     feats["coverage_30d"] = gather(panel.cover, r_tr, r_o, -29, 30).mean(axis=1)
+    ly_feats, ly_daily = year_ago(wp, panel.filled, r_tr, r_o, wp.BLOCKS)
+    if not args.no_year_ago:
+        for k, v in ly_feats.items():
+            feats[k] = v
+    have_ly = np.isfinite(ly_feats["ly_ratio_1_7"])
+    print(f"[direct] year-ago reference available for {have_ly.mean():.1%} of windows"
+          + ("" if not args.no_year_ago else " (features switched off with --no-year-ago; seasonal-naive still scored)"))
+    # seasonal naive: today's 30-day level x last year's ratio for each target day; plain 30-day persistence where last year is missing
+    snaive = feats["level_kwh"].to_numpy()[:, None] * np.where(np.isfinite(ly_daily), ly_daily, 1.0)
     cats = list(wp.CAT_FEATURES)
     X = pd.concat([feats, meta[cats]], axis=1)
     feature_cols = list(feats.columns) + cats
@@ -757,10 +838,14 @@ def stage_direct(wp, args, world, panel, clim, fc, cutoffs):
         print(f"[direct] --drop-features removed {len(drop)} feature(s): {drop}")
 
     train, fit, val, test = wp.make_masks(meta, train_cutoff, val_start)
+    if getattr(args, "val_end", None):
+        fit, val = blocked_validation(meta["origin_date"], val_start, args.val_end, train_cutoff, H)
     reg = wp.regime_keep_mask(meta)                       # the household pipeline's own old/new-regime and excluded-range policy
     train, fit, val = train & tgt_ok & reg, fit & tgt_ok & reg, val & tgt_ok & reg
     print(f"[direct] fit {fit.sum():,} | val {val.sum():,} | train {train.sum():,} | test {test.sum():,} | "
           f"features {len(feature_cols)}")
+    print("[direct] origin months  fit: " + month_span(meta["origin_date"][fit]) + "  |  val: "
+          + month_span(meta["origin_date"][val]) + "  |  test: " + month_span(meta["origin_date"][test]))
     if not (fit.any() and val.any() and test.any()):
         raise SystemExit("empty split: check --train-cutoff / --val-start against the dates available "
                          f"({pdf['origin_date'].min().date()} .. {pdf['origin_date'].max().date()})")
@@ -793,10 +878,14 @@ def stage_direct(wp, args, world, panel, clim, fc, cutoffs):
                pred=pred.astype("float32"), thermal=(base[test] * scale).astype("float32"),
                pers30=(feats.loc[test, "level_kwh"].to_numpy() * scale[:, 0]).astype("float32"),
                pers7=(feats.loc[test, "kwh_mean_7d"].to_numpy() * scale[:, 0]).astype("float32"),
+               snaive=(snaive[test] * scale).astype("float32"),
                n_hh=scale[:, 0].astype("int64"))
     np.savez_compressed(os.path.join(args.out_dir, "direct_test.npz"), **out)
     with open(os.path.join(args.out_dir, "direct_info.json"), "w") as fh:
-        json.dump(dict(train_cutoff=train_cutoff, val_start=val_start, best_iteration=int(best), final_iterations=int(final),
+        json.dump(dict(train_cutoff=train_cutoff, val_start=val_start, val_end=getattr(args, "val_end", None),
+                       include_old=wp.INCLUDE_OLD, old_regime_flag=bool(wp.OLD_REGIME_FLAG), year_ago=not args.no_year_ago,
+                       fit_months=month_span(meta["origin_date"][fit]), val_months=month_span(meta["origin_date"][val]),
+                       best_iteration=int(best), final_iterations=int(final),
                        features=feature_cols, transformers=int(len(panel.ids)), rows=dict(
                            fit=int(fit.sum()), val=int(val.sum()), train=int(train.sum()), test=int(test.sum()))), fh, indent=2)
     imp = pd.DataFrame({"feature": feature_cols, "importance": m.get_feature_importance()}).sort_values("importance", ascending=False)
@@ -1006,6 +1095,8 @@ def stage_compare(wp, args, panel):
     models = {"persistence30": np.repeat(d["pers30"][i][:, None], len(horizons), 1).astype(float) * calT}
     extra = {"persistence7": np.repeat(d["pers7"][i][:, None], len(horizons), 1).astype(float) * calT,
              "thermal_baseline": d["thermal"][i][:, hi].astype(float) * calT}
+    if "snaive" in d.files:                                   # older direct_test.npz files do not have it
+        extra["seasonal_naive"] = d["snaive"][i][:, hi].astype(float) * calT
     if have_bu:
         P_bu_raw = b["pred"][j][:, hi].astype(float)
         P_bu = P_bu_raw * calT
@@ -1043,7 +1134,7 @@ def stage_compare(wp, args, panel):
 
     boot = []
     pairs = [p for p in [("direct", "persistence30"), ("direct", "persistence7"), ("direct", "thermal_baseline"),
-                         ("direct", "bottom_up"), ("average", "bottom_up"), ("average", "direct")]
+                         ("direct", "seasonal_naive"), ("direct", "bottom_up"), ("average", "bottom_up"), ("average", "direct")]
              if p[0] in allm and p[1] in allm]
     for hx, h in enumerate(horizons):
         for a_name, b_name in pairs:
@@ -1095,7 +1186,7 @@ def stage_compare(wp, args, panel):
 
 def error_diagnostics(out_dir, allm, A, tid, day_idx, horizons, panel, min_tr=100, top=8):
     """Where is the error?  (1) WAPE by target month; (2) the target days with the largest system-level error."""
-    names = [n for n in ("direct", "bottom_up", "persistence7", "persistence30", "thermal_baseline") if n in allm]
+    names = [n for n in ("direct", "bottom_up", "persistence7", "persistence30", "thermal_baseline", "seasonal_naive") if n in allm]
     min_tr = min(min_tr, max(3, int(0.3 * len(np.unique(tid)))))        # small panels: do not demand 100 transformers per day
     hx_list = [horizons.index(h) for h in (7, 30) if h in horizons]
     rows, day_rows = [], []
@@ -1261,6 +1352,10 @@ def cmd_run(args):
     if source == "raw" and int(info.get("n_coatos", 1)) > 1:
         raise SystemExit(f"this work dir holds {info['n_coatos']} coatos: use the cleaned panel (python transformer_clean.py --work-dir ...) "
                          f"or `prepare --coato <code>` into another work dir; the raw panel path forecasts one coato at a time.")
+    if args.include_old:
+        wp.INCLUDE_OLD = args.include_old
+    if args.old_flag:
+        wp.OLD_REGIME_FLAG = True
     cutoffs = (args.train_cutoff or wp.TRAIN_CUTOFF, args.val_start or wp.VAL_START)
     if args.hh_model_dir and os.path.exists(os.path.join(args.hh_model_dir, "columns.json")):
         with open(os.path.join(args.hh_model_dir, "columns.json")) as fh:
@@ -1274,6 +1369,9 @@ def cmd_run(args):
     print(f"[config] source '{source}' | train cutoff {cutoffs[0]} | validation after {cutoffs[1]} | "
           f"test origins from {cutoff_test_start(wp, cutoffs[0]).date()} | normals '{args.normal_mode}' | "
           f"forecast mode '{wp.FORECAST_MODE}' | calendar '{args.calendar}' | stages {','.join(stages)} | outputs {args.out_dir}")
+    print(f"[config] direct: validation {'(' + cutoffs[1] + ', ' + args.val_end + ']' if args.val_end else 'household split'} | "
+          f"old regime '{wp.INCLUDE_OLD}'{' + regime_old feature' if wp.OLD_REGIME_FLAG else ''} | "
+          f"year-ago features {'off' if args.no_year_ago else 'on'} | final-iters cap {args.final_iters_cap}")
 
     with stage("panel"):
         if source == "clean":
@@ -1395,6 +1493,15 @@ def build_parser():
     r.add_argument("--hh-model", choices=["catboost", "xgboost"], default=None, help="default: the model chosen at training")
     r.add_argument("--train-cutoff", default=None, help="default: from the household model")
     r.add_argument("--val-start", default=None, help="default: from the household model")
+    r.add_argument("--val-end", default=None,
+                   help="direct model: validation = origins in (--val-start, --val-end]; fit = training origins at least 60 days "
+                        "away on both sides. Use a block spanning autumn -> spring, e.g. --val-start 2024-09-01 --val-end 2025-04-30. "
+                        "Default: the household split (validation from --val-start to the train cutoff, usually one summer)")
+    r.add_argument("--include-old", choices=["none", "all", "non_winter"], default=None,
+                   help="old-regime (before 2024-08-01) training windows; default: whole_pipeline_v8.INCLUDE_OLD")
+    r.add_argument("--old-flag", action="store_true", help="add the feature regime_old (1 for old-regime origins) to the direct model")
+    r.add_argument("--no-year-ago", action="store_true",
+                   help="direct model: leave out the ly_ratio_* features (same 60 days last year / the 30 days before); for the ablation")
     r.add_argument("--normal-mode", choices=["loyo", "all"], default="loyo",
                    help="climate normals: loyo = leave the year out (as the household evaluation), all = deployment")
     r.add_argument("--min-households", type=int, default=5, help="smallest transformer to model")
