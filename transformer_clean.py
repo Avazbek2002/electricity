@@ -116,6 +116,10 @@ def clean(args):
     os.makedirs(out, exist_ok=True)
     t_start = time.time()
     info, hh, kwh = tf.load_world(args.work_dir)
+    if str(info.get("source", "")).startswith("household_enriched") and not args.clean_households:
+        args.no_clean_households = True
+        print(f"[source] {info['source']}: households are already cleaned (Layer-1 spike, flat-run and gap rules), so the "
+              f"household glitch repair is skipped and clean kwh is used as delivered (--clean-households to run it anyway)")
     T = kwh.shape[1]
     d0 = pd.Timestamp(info["start"])
     dates = d0 + pd.to_timedelta(np.arange(T), unit="D")
@@ -465,6 +469,8 @@ def main(argv=None):
     p.add_argument("--min-hh-days", type=int, default=30)
     p.add_argument("--max-transformers", type=int, default=0, help="debug: random subset")
     p.add_argument("--no-clean-households", action="store_true", help="skip the household glitch repair")
+    p.add_argument("--clean-households", action="store_true",
+                   help="run the household glitch repair even on the enriched dataset, which is already cleaned (default there: off)")
     p.add_argument("--heavy-ratio", type=float, default=5.0, help="household using more than this x the transformer's median household is left out")
     p.add_argument("--core-presence", type=float, default=0.7, help="a household is core if it reports on this share of the transformer's observed days "
                    "(lowered to 0.8 x the transformer's median household when the whole transformer reports less)")
