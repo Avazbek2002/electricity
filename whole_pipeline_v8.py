@@ -167,6 +167,20 @@ What changed versus v3
      - columns.json records the input rule, so transformer_forecast.py's bottom-up stage applies the same rule
    Run:   python whole_pipeline_v8.py --set ENRICHED_BUCKETS=[0,1] --set OUTPUT_DIR=./artifacts/hh_enriched train
 
+10. All customers (national scale). ENRICHED_BUCKETS=None reads every customer of every finished district,
+   ENRICHED_WORKERS districts at a time in separate processes. Holding every window would need ~150 GB and days of
+   CatBoost (MultiRMSE over 60 outputs), so ENRICHED_TRAIN_SAMPLE / ENRICHED_TEST_SAMPLE keep a stable random share of
+   the trainable / test windows of EVERY customer while reading (nothing else is kept in memory). With sampling, each
+   customer's segment features come from its whole daily history up to TRAIN_CUTOFF (a few sampled windows are too little
+   history), and features are built in FEATURE_CHUNK_ROWS chunks (identical result). ENRICHED_CACHE_DIR saves each
+   district's result, so a stopped run resumes where it stopped (the cache holds customer keys: keep it inside the
+   authorised environment). Sampling covers the primary fold only (BACKTEST_CUTOFFS must be empty).
+   Sizes from the 1% run: ~27M trainable windows nationally; a train share of 0.075 keeps ~2M (CatBoost ~5 h per fit on
+   65 cores), a test share of 0.01 keeps ~350k (as many as the 1% run tested).
+   Run:   python whole_pipeline_v8.py --no-mlflow --set ENRICHED_BUCKETS=None --set ENRICHED_TRAIN_SAMPLE=0.075 \
+            --set ENRICHED_TEST_SAMPLE=0.01 --set ENRICHED_WORKERS=8 --set ENRICHED_CACHE_DIR="'$HOME/work/enriched_cache'" \
+            --set OUTPUT_DIR="'$HOME/work/hh_national'" train
+
 Experiment tracking, serving model, registry, monitoring (MLflow; optional, off unless a tracking URI is set)
    Needs next to this file: mlflow_utils.py (the Tracker wrapper) and electricity_pyfunc.py (the serving model).
    Set MLFLOW_TRACKING_URI (or --mlflow-uri); credentials come from the environment only (MLFLOW_TRACKING_USERNAME /
@@ -243,6 +257,18 @@ RECENT_WINDOW = 30
 MIN_TARGET_DAYS = 30           # a window is kept if this many of its 60 target days are observed (scored on those days only)
 TRAIN_MIN_TARGET_DAYS = 54     # a window is TRAINED on if this many target days are observed; on its missing days the label is
                                # "no correction to the thermal baseline" (residual 0), never a made-up consumption value
+# --- national scale (all customers: ENRICHED_BUCKETS = None) ---
+ENRICHED_WORKERS = 8           # districts read in parallel (separate processes; each holds one district's customers x days)
+ENRICHED_TRAIN_SAMPLE = None   # None = keep every window. A share (e.g. 0.075): keep that random share (stable hash of customer +
+                               # origin) of the TRAINABLE windows (origin <= TRAIN_CUTOFF, >= TRAIN_MIN_TARGET_DAYS observed),
+                               # and drop the windows nothing uses (untrainable pre-cutoff, the embargo after the cutoff)
+ENRICHED_TEST_SAMPLE = None    # None = every test window; a share (e.g. 0.01) = that random share of the test windows
+SEGMENT_FROM_FULL_HISTORY = None   # None = automatic (on when sampling): a customer's segment features come from its whole daily
+                               # history up to TRAIN_CUTOFF, computed while its district is read, not from its (sampled) windows
+ENRICHED_CACHE_DIR = None      # a folder: each district's result is saved there, so a stopped run resumes without re-reading it
+                               # (holds customer keys: keep it inside the authorised environment)
+FEATURE_CHUNK_ROWS = 500_000   # features are built in chunks of this many windows (memory); the result is identical
+PRECOMPUTED_SEGMENT_FEATURES = None   # set at run time: (train_cutoff, DataFrame) from the full-history pass
 GLITCH_REPAIR = True           # causal spike/dip repair; switched off for the enriched source (already cleaned by Layer 1)
 CLEAN_STORE_S3 = "s3a://phase1/electricity/analytics/features/clean_daily_store"   # holds daily_<tag>/ and index_<tag>/
 WINDOW_INDEX_DIR = None        # e.g. "index_nb020_qnone_f4_L90_H60_S30_G5_R30"; None = the only index_* folder for LOOKBACK/HORIZON
@@ -640,10 +666,155 @@ def extract_windows_from_index(spark: SparkSession):
     return pdf.reset_index(drop=True), kin, ktg
 
 
+def _enriched_district_worker(code, cfg):
+    """One district of the enriched dataset -> its (sampled) windows and, optionally, per-customer segment features.
+    Runs in a worker process (extract_windows_enriched); everything it needs comes in `cfg`, nothing from module globals
+    that --set may have changed. Streams the district's record batches, so memory is about customers x days x 4 bytes."""
+    import time as _time
+    import zlib
+    import pyarrow as pa
+    import pyarrow.compute as pc
+    import pyarrow.dataset as pads
+    sys.path.insert(0, cfg["here"])
+    import enriched_io as eio
+    t0 = _time.time()
+    fs, root = eio.open_root(cfg["root"])
+    d0, d1 = pd.Timestamp(cfg["start"]), pd.Timestamp(cfg["end"])
+    T, L, H, S = (d1 - d0).days + 1, cfg["L"], cfg["H"], cfg["stride"]
+    e0 = int((d0 - pd.Timestamp("1970-01-01")).days)
+    flt = (pads.field("date") >= d0.date()) & (pads.field("date") <= d1.date())
+    if cfg["buckets"] is not None:
+        flt = flt & pads.field("customer_bucket").isin([int(b) for b in cfg["buckets"]])
+    cols = ["customer_key", "date", "kwh", "label_state", "housing_type_id", "t_mean", "t_min", "t_max"]
+    labels = pa.array(list(cfg["labels"]), type=pa.string())
+    key_of, keys = {}, []
+    C, D, V = [], [], []
+    h_day = np.full(1024, -1, dtype=np.int64)                # latest day with a housing type, per customer (grows)
+    h_val = np.full(1024, np.nan)
+    wt = np.full((3, T), np.nan)
+    for b in eio.district_daily(fs, root, code).scanner(columns=cols, filter=flt, batch_size=262_144,
+                                                         use_threads=True).to_batches():
+        if not b.num_rows:
+            continue
+        de = pc.dictionary_encode(b.column("customer_key"))
+        uq = [str(x) for x in de.dictionary.to_pylist()]
+        inv = de.indices.to_numpy(zero_copy_only=False)
+        idx = np.empty(len(uq), dtype=np.int64)
+        for j, s in enumerate(uq):
+            v = key_of.get(s)
+            if v is None:
+                v = key_of[s] = len(keys)
+                keys.append(s)
+            idx[j] = v
+        c = idx[inv].astype(np.int32)
+        day = pc.cast(pc.cast(b.column("date"), pa.date32()), pa.int32()).to_numpy(zero_copy_only=False).astype(np.int64) - e0
+        for i, col in enumerate(("t_mean", "t_min", "t_max")):          # weather from every row, whatever its label
+            np.fmax.at(wt[i], day, np.asarray(b.column(col).to_numpy(zero_copy_only=False), dtype=float))
+        hcol = b.column("housing_type_id")
+        try:
+            hv = pc.cast(hcol, pa.float64()).to_numpy(zero_copy_only=False)
+        except (pa.ArrowInvalid, pa.ArrowNotImplementedError):
+            hv = pd.to_numeric(pd.Series(hcol.to_pylist()), errors="coerce").to_numpy(float)
+        if len(keys) > len(h_day):
+            grow = max(len(keys), 2 * len(h_day)) - len(h_day)
+            h_day = np.r_[h_day, np.full(grow, -1, dtype=np.int64)]
+            h_val = np.r_[h_val, np.full(grow, np.nan)]
+        hm = np.isfinite(hv)
+        if hm.any():
+            hc_, hd_, hv_ = c[hm], day[hm], hv[hm]
+            order = np.lexsort((hd_, hc_))
+            hc_, hd_, hv_ = hc_[order], hd_[order], hv_[order]
+            lst = np.r_[hc_[1:] != hc_[:-1], True]
+            hc_, hd_, hv_ = hc_[lst], hd_[lst], hv_[lst]
+            newer = hd_ >= h_day[hc_]
+            h_day[hc_[newer]], h_val[hc_[newer]] = hd_[newer], hv_[newer]
+        kwh = b.column("kwh")
+        ok = pc.and_(pc.fill_null(pc.is_in(b.column("label_state"), value_set=labels), False), pc.is_valid(kwh))
+        ok = ok.to_numpy(zero_copy_only=False)
+        C.append(c[ok])
+        D.append(day[ok].astype(np.int32))
+        V.append(kwh.to_numpy(zero_copy_only=False)[ok].astype(np.float32))
+    out = dict(code=str(code), customers=0, candidates=0, passed=0, seconds=0.0, pdf=None, kin=None, ktg=None,
+               seg=None, weather=None)
+    if not keys:
+        out["seconds"] = _time.time() - t0
+        return out
+    n = len(keys)
+    c, day, v = np.concatenate(C), np.concatenate(D), np.concatenate(V)
+    del C, D, V
+    M = np.full((n, T), np.nan, dtype=np.float32)
+    M[c, day] = v
+    del c, day, v
+    house = h_val[:n]                                       # housing type: the customer's latest known value
+    has_obs = np.isfinite(M).any(axis=1)                     # customers with no kept day are counted, not windowed
+    out["customers"] = int(has_obs.sum())
+    dates = d0 + pd.to_timedelta(np.arange(T), unit="D")
+    have_w = np.isfinite(wt).any(axis=0)
+    out["weather"] = pd.DataFrame({"coato_id": str(code), "d": dates[have_w], "t": wt[0, have_w], "tmin": wt[1, have_w],
+                                   "tmax": wt[2, have_w]})
+
+    # staggered origin grid per customer, then the window rules from prefix counts of observed days
+    crc = np.array([zlib.crc32(k.encode()) for k in keys], dtype=np.uint64)
+    K = (T - 1 - H - (L - 1)) // S + 1
+    o = (L - 1) + (crc % S).astype(np.int64)[:, None] + S * np.arange(K)[None, :]
+    r = np.broadcast_to(np.arange(n)[:, None], o.shape)
+    inside = o <= T - 1 - H
+    r, o = r[inside], o[inside]
+    cnt = np.pad(np.cumsum(np.isfinite(M), axis=1, dtype=np.int32), ((0, 0), (1, 0)))
+    n_in = cnt[r, o + 1] - cnt[r, o - L + 1]
+    n_rec = cnt[r, o + 1] - cnt[r, o - cfg["recent_window"] + 1]
+    n_tg = cnt[r, o + H + 1] - cnt[r, o + 1]
+    del cnt
+    keep = (n_in >= cfg["min_input"]) & (n_rec >= cfg["min_recent"]) & (n_tg >= cfg["min_target"])
+    out["candidates"], out["passed"] = int(len(r)), int(keep.sum())
+    if cfg["train_sample"] is not None or cfg["test_sample"] is not None:
+        cut = int((pd.Timestamp(cfg["cutoff"]) - d0).days)
+        u = ((crc[r] * np.uint64(2654435761) + o.astype(np.uint64) * np.uint64(2246822519)) % np.uint64(2 ** 32)) / 2.0 ** 32
+        p_tr = 1.0 if cfg["train_sample"] is None else float(cfg["train_sample"])
+        p_te = 1.0 if cfg["test_sample"] is None else float(cfg["test_sample"])
+        keep &= ((o <= cut) & (n_tg >= cfg["train_min_target"]) & (u < p_tr)) | ((o >= cut + H) & (u < p_te))
+    r, o, n_tg = r[keep], o[keep], n_tg[keep]
+    if len(r):
+        out["kin"] = M[r[:, None], o[:, None] + np.arange(-(L - 1), 1)[None, :]]
+        out["ktg"] = M[r[:, None], o[:, None] + np.arange(1, H + 1)[None, :]]
+        kk = np.asarray(keys, dtype=object)[r]
+        out["pdf"] = pd.DataFrame({"meter_id": kk.astype(str), "consumer_id": kk.astype(str),
+                                   "origin_date": d0 + pd.to_timedelta(o, unit="D"), "coato_code": str(code),
+                                   "housing_type_id": pd.Series(house[r]).astype("Int64").astype(str).replace("<NA>", np.nan).to_numpy(),
+                                   "tgt_days": n_tg.astype("int16")})
+
+    # segment features from each customer's whole daily history up to the cutoff (customers that have a kept window only)
+    if cfg["seg_full"] and len(r):
+        s0 = max(0, int((pd.Timestamp(cfg["seg_start"]) - d0).days))
+        s1 = int((pd.Timestamp(cfg["cutoff"]) - d0).days)
+        months = dates[s0:s1 + 1].month.values
+        t = wt[0, s0:s1 + 1]
+        rows = []
+        for i in np.unique(r):
+            y = M[i, s0:s1 + 1].astype("float64")
+            if np.isfinite(y).sum() < cfg["seg_min_days"]:
+                rows.append((keys[i], int(np.isfinite(y).sum()), np.nan, np.nan, np.nan, np.nan))
+                continue
+            y_clean, _rep, masked = clean_daily_series(y)
+            y_clean = np.where(masked, np.nan, y_clean)
+            n_obs = int(np.isfinite(y_clean).sum())
+            if n_obs < cfg["seg_min_days"]:
+                rows.append((keys[i], n_obs, np.nan, np.nan, np.nan, np.nan))
+                continue
+            seas = _seasonality_strength(y_clean, months)
+            ts, r2 = _weekly_thermal_fit(y_clean, t)
+            rows.append((keys[i], n_obs, np.log1p(max(float(np.nanmedian(y_clean)), 0.0)), ts, r2, seas))
+        out["seg"] = pd.DataFrame(rows, columns=["meter_id", "n_obs_days", "log_median_kwh", "thermal_share", "r2",
+                                                 "seasonality_strength"]).set_index("meter_id")
+    out["seconds"] = _time.time() - t0
+    return out
+
+
 def extract_windows_enriched():
     """National enriched household dataset (v1.4) -> (pdf, kin, ktg, daily_weather), no Spark.
 
-    Reads the ENRICHED_BUCKETS customer sample one finished district at a time (guide rule 10). The unit is a customer
+    Reads the ENRICHED_BUCKETS customers (None = every customer) of every finished district, ENRICHED_WORKERS districts at a
+    time in separate processes (guide rule 10: one district per reader, bounded reads). The unit is a customer
     (customer_key + coato_code; meters already combined). Only ENRICHED_LABELS days (complete_observed) carry a value;
     estimated, partial, unlabelled and long-gap-allocated days are NaN (HH-GAP-001-A1 rules 1-3: a 1-day observed reading
     shares no reading interval with any other day, so no input day leaks its target).
@@ -651,90 +822,125 @@ def extract_windows_enriched():
     calendar day. A window is kept when its 90-day input has >= MIN_INPUT_DAYS observed days and >= MIN_RECENT_DAYS of the
     last RECENT_WINDOW, and its 60-day target >= MIN_TARGET_DAYS. pdf['tgt_days'] = observed target days: windows with
     >= TRAIN_MIN_TARGET_DAYS are trained on (missing days: residual label 0); every kept window is scored on its observed days.
+    National scale: ENRICHED_TRAIN_SAMPLE / ENRICHED_TEST_SAMPLE keep a stable random share of the trainable / test windows
+    of EVERY customer read (the rest is never held in memory), and the customers' segment features then come from their
+    whole history up to TRAIN_CUTOFF (SEGMENT_FROM_FULL_HISTORY), because a few sampled windows are too little history.
     Weather = the table's own daily t_mean / t_min / t_max per district (branch-observed, 24 complete hourly values)."""
-    import zlib
-    import pyarrow.dataset as pads
-    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import concurrent.futures as cf
+    import hashlib
+    import multiprocessing as mp
+    import pickle
+    import time as _time
+    here = os.path.dirname(os.path.abspath(__file__))
+    sys.path.insert(0, here)
     import enriched_io as eio
+    sampling = ENRICHED_TRAIN_SAMPLE is not None or ENRICHED_TEST_SAMPLE is not None
+    if sampling and BACKTEST_CUTOFFS:
+        raise ValueError("ENRICHED_TRAIN_SAMPLE / ENRICHED_TEST_SAMPLE keep only the windows of the primary fold "
+                         "(TRAIN_CUTOFF); run backtests without sampling, or set BACKTEST_CUTOFFS=[]")
+    seg_full = SEGMENT_FROM_FULL_HISTORY if SEGMENT_FROM_FULL_HISTORY is not None else sampling
+    seg_start = ENRICHED_START if SEGMENT_USE_OLD else str((pd.Timestamp(REGIME_CUTOFF) - pd.Timedelta(days=LOOKBACK - 1)).date())
+    cfg = dict(here=here, root=ENRICHED_ROOT, start=ENRICHED_START, end=ENRICHED_END, labels=list(ENRICHED_LABELS),
+               buckets=None if ENRICHED_BUCKETS is None else [int(b) for b in ENRICHED_BUCKETS], L=LOOKBACK, H=HORIZON,
+               stride=WINDOW_STRIDE, min_input=MIN_INPUT_DAYS, min_recent=MIN_RECENT_DAYS, recent_window=RECENT_WINDOW,
+               min_target=MIN_TARGET_DAYS, train_min_target=TRAIN_MIN_TARGET_DAYS, cutoff=TRAIN_CUTOFF,
+               train_sample=ENRICHED_TRAIN_SAMPLE, test_sample=ENRICHED_TEST_SAMPLE, seg_full=bool(seg_full),
+               seg_start=seg_start, seg_min_days=SEGMENT_MIN_COVERAGE_DAYS)
     fs, root = eio.open_root(ENRICHED_ROOT)
     codes = eio.finished_districts(fs, root, set(ENRICHED_COATOS) if ENRICHED_COATOS else None)
-    d0, d1 = pd.Timestamp(ENRICHED_START), pd.Timestamp(ENRICHED_END)
-    T, L, H = (d1 - d0).days + 1, LOOKBACK, HORIZON
-    cols = ["customer_key", "date", "kwh", "label_state", "housing_type_id", "t_mean", "t_min", "t_max"]
-    flt = (pads.field("date") >= d0.date()) & (pads.field("date") <= d1.date())
-    if ENRICHED_BUCKETS is not None:             # None = every customer (e.g. with ENRICHED_COATOS = a few districts)
-        flt = flt & pads.field("customer_bucket").isin([int(b) for b in ENRICHED_BUCKETS])
-    K = (T - 1 - H - (L - 1)) // WINDOW_STRIDE + 1
-    pdfs, kins, ktgs, weather = [], [], [], []
-    n_cust = n_cand = 0
-    import time as _time
+    print(f"[enriched] customers: {'ALL (every bucket)' if ENRICHED_BUCKETS is None else 'buckets ' + str(ENRICHED_BUCKETS)} | "
+          f"labels {ENRICHED_LABELS} | stride {WINDOW_STRIDE} | train sample {ENRICHED_TRAIN_SAMPLE} | test sample "
+          f"{ENRICHED_TEST_SAMPLE} | segment features from {'full history to ' + TRAIN_CUTOFF if seg_full else 'the windows'} | "
+          f"{ENRICHED_WORKERS} worker(s)")
+    cache = None
+    if ENRICHED_CACHE_DIR:
+        sig = hashlib.sha1(json.dumps({k: v for k, v in cfg.items() if k != "here"}, sort_keys=True,
+                                      default=str).encode()).hexdigest()[:12]
+        cache = os.path.join(os.path.expanduser(ENRICHED_CACHE_DIR), f"enriched_{sig}")
+        os.makedirs(cache, exist_ok=True)
+        with open(os.path.join(cache, "config.json"), "w") as fh:
+            json.dump({k: v for k, v in cfg.items() if k != "here"}, fh, indent=2, default=str)
+        print(f"[enriched] district cache: {cache}")
+
+    results, todo = [], []
+    for code in codes:
+        p = os.path.join(cache, f"{code}.pkl") if cache else None
+        if p and os.path.exists(p):
+            with open(p, "rb") as fh:
+                results.append(pickle.load(fh))
+        else:
+            todo.append(code)
+    if cache and results:
+        print(f"[enriched] {len(results)} district(s) loaded from the cache; {len(todo)} to read")
+
     t0 = _time.time()
-    for n, code in enumerate(codes):
-        parts = [b.to_pandas() for b in eio.district_daily(fs, root, code).scanner(
-            columns=cols, filter=flt, batch_size=262_144, use_threads=True).to_batches() if b.num_rows]
-        if not parts:
-            continue
-        x = pd.concat(parts, ignore_index=True)
-        w = (x.groupby("date")[["t_mean", "t_min", "t_max"]].max().reset_index()
-             .rename(columns={"date": "d", "t_mean": "t", "t_min": "tmin", "t_max": "tmax"}))
-        w.insert(0, "coato_id", str(code))
-        weather.append(w)
-        ok = x["label_state"].isin(ENRICHED_LABELS).to_numpy() & x["kwh"].notna().to_numpy()
-        cust = x.groupby("customer_key", sort=True)["housing_type_id"].last()
-        row = pd.Series(np.arange(len(cust)), index=cust.index).reindex(x["customer_key"]).to_numpy()
-        day = (pd.to_datetime(x["date"]) - d0).dt.days.to_numpy()
-        M = np.full((len(cust), T), np.nan, dtype="float32")
-        M[row[ok], day[ok]] = x["kwh"].to_numpy()[ok]
-        del x, parts
-        n_cust += len(cust)
-        # staggered origin grid per customer, then the window rules from prefix counts of observed days
-        off = np.array([zlib.crc32(str(k).encode()) % WINDOW_STRIDE for k in cust.index], dtype=np.int64)
-        o = (L - 1) + off[:, None] + WINDOW_STRIDE * np.arange(K)[None, :]
-        r = np.broadcast_to(np.arange(len(cust))[:, None], o.shape)
-        inside = o <= T - 1 - H
-        r, o = r[inside], o[inside]
-        c = np.pad(np.cumsum(np.isfinite(M), axis=1, dtype=np.int32), ((0, 0), (1, 0)))
-        n_in = c[r, o + 1] - c[r, o - L + 1]
-        n_rec = c[r, o + 1] - c[r, o - RECENT_WINDOW + 1]
-        n_tg = c[r, o + H + 1] - c[r, o + 1]
-        keep = (n_in >= MIN_INPUT_DAYS) & (n_rec >= MIN_RECENT_DAYS) & (n_tg >= MIN_TARGET_DAYS)
-        n_cand += int(inside.sum())
-        r, o, n_tg = r[keep], o[keep], n_tg[keep]
-        if not len(r):
-            continue
-        kins.append(M[r[:, None], o[:, None] + np.arange(-(L - 1), 1)[None, :]])
-        ktgs.append(M[r[:, None], o[:, None] + np.arange(1, H + 1)[None, :]])
-        ht = cust.to_numpy()[r]
-        pdfs.append(pd.DataFrame({"meter_id": cust.index.to_numpy()[r].astype(str), "consumer_id": cust.index.to_numpy()[r].astype(str),
-                                  "origin_date": d0 + pd.to_timedelta(o, unit="D"), "coato_code": str(code),
-                                  "housing_type_id": pd.Series(ht).astype("Int64").astype(str).replace("<NA>", np.nan).to_numpy(),
-                                  "tgt_days": n_tg.astype("int16")}))
-        if (n + 1) % 20 == 0 or n + 1 == len(codes):
+    done_n = [0]
+
+    def _keep(res):
+        if cache:
+            tmp = os.path.join(cache, f"{res['code']}.pkl.tmp")
+            with open(tmp, "wb") as fh:
+                pickle.dump(res, fh, protocol=pickle.HIGHEST_PROTOCOL)
+            os.replace(tmp, os.path.join(cache, f"{res['code']}.pkl"))
+        results.append(res)
+        done_n[0] += 1
+        k = done_n[0]
+        if k % 10 == 0 or k == len(todo):
             el = _time.time() - t0
-            print(f"[windows] {n + 1}/{len(codes)} districts: {n_cust:,} customers, {sum(len(p) for p in pdfs):,} windows; "
-                  f"{el / 60:.1f} min, about {el / (n + 1) * (len(codes) - n - 1) / 60:.1f} min left", flush=True)
-    if not pdfs:
+            nw = sum(len(x["pdf"]) for x in results if x["pdf"] is not None)
+            print(f"[windows] {k}/{len(todo)} districts read: {sum(x['customers'] for x in results):,} customers, "
+                  f"{nw:,} windows kept; {el / 60:.1f} min, about {el / k * (len(todo) - k) / 60:.1f} min left", flush=True)
+
+    if todo and ENRICHED_WORKERS > 1:
+        ctx = mp.get_context("spawn")                     # no fork: the S3 client and its threads must not be copied
+        with cf.ProcessPoolExecutor(max_workers=int(ENRICHED_WORKERS), mp_context=ctx) as ex:
+            futs = {ex.submit(_enriched_district_worker, code, cfg): code for code in todo}
+            for f in cf.as_completed(futs):
+                try:
+                    _keep(f.result())
+                except Exception as e:                    # noqa: BLE001
+                    raise RuntimeError(f"district {futs[f]} failed: {type(e).__name__}: {e}") from e
+    else:
+        for code in todo:
+            _keep(_enriched_district_worker(code, cfg))
+
+    parts = [x for x in results if x["pdf"] is not None]
+    if not parts:
         raise SystemExit(f"no usable windows: customer_bucket {ENRICHED_BUCKETS} in {len(codes)} districts")
-    pdf = pd.concat(pdfs, ignore_index=True)
+    n_cust = sum(x["customers"] for x in results)
+    n_cand = sum(x["candidates"] for x in results)
+    n_pass = sum(x["passed"] for x in results)
+    pdf = pd.concat([x["pdf"] for x in parts], ignore_index=True)
     gb = len(pdf) * (LOOKBACK + HORIZON) * 8 / 2 ** 30
-    print(f"[windows] {len(pdf):,} windows of {n_cand:,} candidates from {pdf['meter_id'].nunique():,} customers in "
-          f"{pdf['coato_code'].nunique()} districts; target days observed: all 60 in {(pdf['tgt_days'] == H).mean():.1%}, "
+    print(f"[windows] {n_cust:,} customers with observed days in {len(results)} districts; {n_cand:,} candidate windows, "
+          f"{n_pass:,} pass the rules ({n_pass / max(n_cand, 1):.1%}); kept {len(pdf):,} windows from "
+          f"{pdf['meter_id'].nunique():,} customers; target days observed: all 60 in {(pdf['tgt_days'] == HORIZON).mean():.1%}, "
           f">= {TRAIN_MIN_TARGET_DAYS} (trainable) in {(pdf['tgt_days'] >= TRAIN_MIN_TARGET_DAYS).mean():.1%}; "
           f"kin + ktg about {gb:.1f} GB")
     if gb > MAX_WINDOW_ARRAY_GB:
-        raise MemoryError(f"kin + ktg would need {gb:.1f} GB (> MAX_WINDOW_ARRAY_GB={MAX_WINDOW_ARRAY_GB}): use fewer ENRICHED_BUCKETS, "
-                          f"a larger WINDOW_STRIDE, or raise the limit")
-    kin = np.concatenate(kins).astype("float64")
-    ktg = np.concatenate(ktgs).astype("float64")
-    del kins, ktgs
+        raise MemoryError(f"kin + ktg would need {gb:.1f} GB (> MAX_WINDOW_ARRAY_GB={MAX_WINDOW_ARRAY_GB}): lower "
+                          f"ENRICHED_TRAIN_SAMPLE / ENRICHED_TEST_SAMPLE, use fewer ENRICHED_BUCKETS, or raise the limit")
+    kin = np.concatenate([x["kin"] for x in parts]).astype("float64")
+    ktg = np.concatenate([x["ktg"] for x in parts]).astype("float64")
+    for x in parts:
+        x["kin"] = x["ktg"] = None
     keep = regime_keep_mask(pdf)
     pdf, kin, ktg = pdf[keep].reset_index(drop=True), kin[keep], ktg[keep]
-    daily_t = pd.concat(weather, ignore_index=True)
+    daily_t = pd.concat([x["weather"] for x in results if x["weather"] is not None], ignore_index=True)
     daily_t["d"] = pd.to_datetime(daily_t["d"])
+    if seg_full:
+        seg = pd.concat([x["seg"] for x in results if x["seg"] is not None])
+        seg = seg[~seg.index.duplicated()]
+        globals()["PRECOMPUTED_SEGMENT_FEATURES"] = (str(TRAIN_CUTOFF), seg)
+        print(f"[segmentation] features from full daily history ({seg_start} .. {TRAIN_CUTOFF}) for {len(seg):,} customers")
+    took = sum(x["seconds"] for x in results)
     DATA_INFO.update(source="household_enriched_v1.4", root=ENRICHED_ROOT, buckets=str(ENRICHED_BUCKETS),
-                     districts=len(codes), customers=int(pdf["meter_id"].nunique()), labels=",".join(ENRICHED_LABELS),
+                     districts=len(codes), customers=int(pdf["meter_id"].nunique()), customers_read=int(n_cust),
+                     labels=",".join(ENRICHED_LABELS), train_sample=str(ENRICHED_TRAIN_SAMPLE),
+                     test_sample=str(ENRICHED_TEST_SAMPLE), segment_features="full_history" if seg_full else "windows",
                      window_rules=f"in>={MIN_INPUT_DAYS}/90, recent>={MIN_RECENT_DAYS}/{RECENT_WINDOW}, target>={MIN_TARGET_DAYS}/60, "
                                   f"stride {WINDOW_STRIDE}")
+    print(f"[enriched] district work {took / 60:.0f} worker-minutes, {(_time.time() - t0) / 60:.1f} min wall clock")
     return pdf, kin, ktg, daily_t
 
 
@@ -1462,6 +1668,13 @@ def build_meter_segment_features(pdf: pd.DataFrame, kin: np.ndarray, ktg: np.nda
     data). Feeds assign_meter_segments() below. Meters with less than
     min_coverage_days of causal history get all-NaN features and are left
     unclassified downstream rather than guessed at."""
+    pre = PRECOMPUTED_SEGMENT_FEATURES
+    if pre is not None and pre[0] == str(train_cutoff):
+        out = pre[1]
+        complete = out[["log_median_kwh", "thermal_share", "r2", "seasonality_strength"]].notna().all(axis=1)
+        print(f"[segmentation] meter features from each customer's full daily history up to {train_cutoff} (computed while "
+              f"reading): {len(out):,} meters ({complete.sum():,} with complete, clusterable features)")
+        return out
     train = (pdf["origin_date"] <= pd.Timestamp(train_cutoff)).values
     if not SEGMENT_USE_OLD:
         train = train & (pdf["origin_date"] >= pd.Timestamp(REGIME_CUTOFF)).values   # new regime only, as in v7
@@ -1799,6 +2012,46 @@ def build_features(pdf, kin, ktg, clim, future_mode=FUTURE_MODE, normal_mode=NOR
     return meta, feats, base, t_fut_actual
 
 
+def build_features_chunked(pdf, kin, ktg, clim, fc_grid=None, fc_grid_mm=None, chunk=None, **kw):
+    """build_features in chunks of FEATURE_CHUNK_ROWS windows (memory: each chunk needs ~12 arrays of chunk x 150 floats).
+    Same result as one call: a simulated forecast is first drawn ONCE per (coato, origin) for all rows, in the order
+    simulate_forecast itself would draw it, and stored as an archive grid, so every chunk (and every meter of a coato on
+    that day) sees the same forecast."""
+    chunk = int(chunk or FEATURE_CHUNK_ROWS)
+    n = len(pdf)
+    if n <= chunk:
+        return build_features(pdf, kin, ktg, clim, fc_grid=fc_grid, fc_grid_mm=fc_grid_mm, **kw)
+    mode = kw.pop("forecast_mode", FORECAST_MODE)
+    if mode == "simulated" and kw.get("future_mode", FUTURE_MODE) != "actual":
+        u = pdf[["coato_code", "origin_date"]].copy()
+        u["coato_code"] = u["coato_code"].astype(str)
+        u = u.drop_duplicates().reset_index(drop=True)              # first-appearance order = simulate_forecast's draw order
+        t_obs, _, _ = lookup_weather(u, clim, "all")
+        t_fc = simulate_forecast(u, t_obs[:, LOOKBACK:])
+        K = FORECAST_DAYS
+        fc = pd.DataFrame({"coato_id": np.repeat(u["coato_code"].to_numpy(), K),
+                           "issue_date": np.repeat(u["origin_date"].to_numpy(), K),
+                           "lead_day": np.tile(np.arange(1, K + 1), len(u)), "t_fc": t_fc.reshape(-1)})
+        fc["issue_date"] = pd.to_datetime(fc["issue_date"])
+        fc_grid, fc_grid_mm = build_forecast_grid(fc, clim), None
+        if USE_MINMAX:
+            tmin_obs, _, tmax_obs, _ = lookup_minmax(u, clim, "all")
+            tmin_fc, tmax_fc = simulate_forecast_minmax(u, t_fc, tmin_obs[:, LOOKBACK:], tmax_obs[:, LOOKBACK:])
+            fc["t_fc_min"], fc["t_fc_max"] = tmin_fc.reshape(-1), tmax_fc.reshape(-1)
+            fc_grid_mm = dict(min=build_forecast_grid(fc, clim, col="t_fc_min"), max=build_forecast_grid(fc, clim, col="t_fc_max"))
+        print(f"[features] simulated forecast drawn once for {len(u):,} (coato, origin) pairs; features in "
+              f"{-(-n // chunk)} chunks of {chunk:,} windows")
+        mode = "archive"
+    metas, featss, bases, tfuts = [], [], [], []
+    for a in range(0, n, chunk):
+        sl = slice(a, a + chunk)
+        kw_c = {k: (v[sl] if isinstance(v, np.ndarray) and v.ndim >= 1 and len(v) == n else v) for k, v in kw.items()}
+        m_, f_, b_, t_ = build_features(pdf.iloc[sl].reset_index(drop=True), kin[sl], ktg[sl], clim, forecast_mode=mode,
+                                        fc_grid=fc_grid, fc_grid_mm=fc_grid_mm, **kw_c)
+        metas.append(m_), featss.append(f_), bases.append(b_), tfuts.append(t_)
+    return (pd.concat(metas, ignore_index=True), pd.concat(featss, ignore_index=True), np.vstack(bases), np.vstack(tfuts))
+
+
 def to_xgb_frame(X: pd.DataFrame, categories: dict = None) -> pd.DataFrame:
     """XGBoost's native categorical support needs pandas 'category' dtype.
     `categories` ({column: list}) pins the category -> code mapping to the one the model was trained with;
@@ -1959,7 +2212,7 @@ def fit_and_evaluate(pdf, kin, ktg, ktg_raw, clim, fc_grid, fc_grid_mm, train_cu
         beta_h_prior_mm, beta_c_prior_mm = row_priors_from_segments(
             pdf, meter_segment, segment_priors_mm, pooled_prior_mm)
 
-    meta, feats, base, t_fut_actual = build_features(
+    meta, feats, base, t_fut_actual = build_features_chunked(
         pdf, kin, ktg, clim, beta_h_prior=beta_h_prior, beta_c_prior=beta_c_prior,
         fc_grid=fc_grid, meter_segment=meter_segment,
         beta_h_prior_mm=beta_h_prior_mm, beta_c_prior_mm=beta_c_prior_mm, fc_grid_mm=fc_grid_mm,
