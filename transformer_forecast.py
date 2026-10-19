@@ -1032,6 +1032,10 @@ class HouseholdModel:
         self.use_mm = bool(mm.get("enabled"))
         self.prior_mm = (({k: tuple(v) for k, v in mm.get("segment_beta_priors", {}).items()},
                           tuple(mm["pooled_beta_prior"])) if self.use_mm else ({}, (None, None)))
+        # the model's own input rules: glitch repair, gap filling and how much history a household needs
+        wp.GLITCH_REPAIR = bool(self.cfg.get("glitch_repair", True))
+        self.rule = dict(min_input_days=80, min_recent_days=30, recent_window=30, gap_fill=3)   # rules before columns.json had them
+        self.rule.update({k: v for k, v in (self.cfg.get("input_rule") or {}).items() if k in self.rule})
         if self.use_mm != bool(wp.USE_MINMAX):
             print(f"[bottom-up] WARNING: the household model was trained with USE_MINMAX={self.use_mm}, "
                   f"whole_pipeline_v8.py now says {wp.USE_MINMAX}: features will not match")
@@ -1062,6 +1066,14 @@ class HouseholdModel:
 def stage_bottom_up(wp, args, world, panel, clim, fc, hh_meta, kwh):
     L, H = wp.LOOKBACK, wp.HORIZON
     model = HouseholdModel(wp, args.hh_model_dir, args.hh_model)
+    rule = dict(model.rule)                                # command-line values override the model's own rules
+    for k, a in (("gap_fill", args.hh_gap_fill), ("min_input_days", args.min_input_days),
+                 ("min_recent_days", args.min_recent_days), ("recent_window", args.recent_window)):
+        if a is not None:
+            rule[k] = int(a)
+    print(f"[bottom-up] household input rule: >= {rule['min_input_days']} of 90 days and >= {rule['min_recent_days']} of the last "
+          f"{rule['recent_window']} observed; gaps filled up to {rule['gap_fill']} days; glitch repair "
+          f"{'on' if wp.GLITCH_REPAIR else 'off (cleaned source)'}")
     train_cutoff = pd.Timestamp(args.train_cutoff or model.cfg["train_cutoff"])
     O = origin_grid(wp, panel, args)
     if args.bu_stride % args.origin_stride:
@@ -1084,7 +1096,7 @@ def stage_bottom_up(wp, args, world, panel, clim, fc, hh_meta, kwh):
         for i, r in enumerate(rows):
             x0 = np.asarray(kwh[r], dtype="float64")
             rawfin[i] = np.isfinite(x0)
-            x = fill_short_gaps(x0[None, :], args.hh_gap_fill)[0]
+            x = fill_short_gaps(x0[None, :], rule["gap_fill"])[0] if rule["gap_fill"] > 0 else x0
             clean[i] = wp.clean_recent_readings_for_serving(x)
             if i and i % 20000 == 0:
                 print(f"  cleaned {i:,} / {len(rows):,} households", flush=True)
@@ -1095,8 +1107,9 @@ def stage_bottom_up(wp, args, world, panel, clim, fc, hh_meta, kwh):
     res_tr, res_o, res_pred, res_share, res_np = [], [], [], [], []
     for n, o in enumerate(O):
         with stage(f"bottom-up: origin {n + 1}/{len(O)} {panel.d0 + pd.Timedelta(days=int(o)):%Y-%m-%d}"):
-            hist = causal_history(clean[:, o - (L - 1): o + 1], rawfin[:, o - (L - 1): o + 1], args.hh_gap_fill)
-            ok = np.isfinite(hist[:, -args.min_recent_days:]).all(axis=1) & (np.isfinite(hist).sum(axis=1) >= args.min_input_days)
+            hist = causal_history(clean[:, o - (L - 1): o + 1], rawfin[:, o - (L - 1): o + 1], rule["gap_fill"])
+            fin = np.isfinite(hist)
+            ok = (fin[:, -rule["recent_window"]:].sum(axis=1) >= rule["min_recent_days"]) & (fin.sum(axis=1) >= rule["min_input_days"])
             idx = np.flatnonzero(ok)
             if not len(idx):
                 continue
@@ -1118,7 +1131,7 @@ def stage_bottom_up(wp, args, world, panel, clim, fc, hh_meta, kwh):
             print(f"  {len(idx):,} households with a usable history; {int(good.sum())} / {len(panel.ids)} transformers "
                   f"have >= {args.bu_min_share:.0%} of their households forecast", flush=True)
     if not res_tr:
-        raise SystemExit("bottom-up produced nothing: check --min-recent-days / --min-input-days")
+        raise SystemExit("bottom-up produced nothing: check --min-recent-days / --min-input-days / --recent-window")
     tr_idx = np.concatenate(res_tr)
     np.savez_compressed(os.path.join(args.out_dir, "bottomup_test.npz"),
                         transformer_id=panel.ids[tr_idx].astype(str), origin=np.concatenate(res_o).astype("int64"),
@@ -1691,10 +1704,13 @@ def build_parser():
     r.add_argument("--origin-stride", type=int, default=1, help="use every n-th origin day for the direct model")
     r.add_argument("--bu-stride", type=int, default=7, help="bottom-up origins: every n-th day (a multiple of --origin-stride)")
     r.add_argument("--bu-min-share", type=float, default=0.6, help="drop a transformer-origin if fewer households than this share could be forecast")
-    r.add_argument("--hh-gap-fill", type=int, default=3,
+    r.add_argument("--hh-gap-fill", type=int, default=None,
                    help="bottom-up: interpolate gaps of up to this many days in a household's history (0 = none)")
-    r.add_argument("--min-input-days", type=int, default=80, help="household needs this many of the last 90 days")
-    r.add_argument("--min-recent-days", type=int, default=30, help="... and all of the last N days")
+    r.add_argument("--min-input-days", type=int, default=None,
+                   help="bottom-up: a household needs this many observed days of the last 90 (default: the household model's rule, "
+                        "from its columns.json; 80 for older models)")
+    r.add_argument("--min-recent-days", type=int, default=None, help="... and this many of the last --recent-window days")
+    r.add_argument("--recent-window", type=int, default=None, help="... (default: the model's rule; 30, i.e. all of the last 30, for older models)")
     r.add_argument("--size-weight", choices=["none", "sqrt", "linear"], default="sqrt",
                    help="direct model sample weight = households^(0/0.5/1): big transformers count more")
     r.add_argument("--size-bands", type=int, default=4)

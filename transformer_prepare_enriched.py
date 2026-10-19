@@ -43,57 +43,12 @@ import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pyarrow.dataset as ds
-import pyarrow.fs as pafs
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import transformer_forecast as tf                                  # noqa: E402  (logging, stages, quota rule)
 
-ENRICHED_ROOT = "s3://phase1/electricity/_staging/household-enriched-v14-nat-b2c-20261017-8e1414/"
-LABELS = {"observed": ["complete_observed"], "clean": ["complete_observed", "complete_with_estimated"]}
-WINDOW_END = "2026-06-29"                                           # last customer-day in the v1.4 window (guide §2)
-
-
-# -----------------------------------------------------------------------------------------------------------------
-def open_root(uri):
-    """(filesystem, path without scheme). s3:// or s3a:// -> S3 from the environment; anything else -> local disk."""
-    if uri.startswith(("s3://", "s3a://")):
-        missing = [v for v in ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "S3_ENDPOINT") if not os.getenv(v)]
-        if missing:
-            raise SystemExit(f"missing environment variables {missing} (source your env file first)")
-        ep = os.environ["S3_ENDPOINT"]
-        scheme, host = ep.split("://", 1) if "://" in ep else ("https", ep)
-        fs = pafs.S3FileSystem(access_key=os.environ["AWS_ACCESS_KEY_ID"], secret_key=os.environ["AWS_SECRET_ACCESS_KEY"],
-                               session_token=os.getenv("AWS_SESSION_TOKEN"), endpoint_override=host.rstrip("/"),
-                               scheme=scheme, region=os.getenv("AWS_REGION", "us-east-1"))
-        return fs, uri.split("://", 1)[1].rstrip("/")
-    return pafs.LocalFileSystem(), os.path.abspath(os.path.expanduser(uri)).rstrip("/")
-
-
-def list_districts(fs, root):
-    """[(code, finished)] for every coato=<code> worker root under the campaign root."""
-    base = f"{root}/household_daily_enriched"
-    out = []
-    for info in fs.get_file_info(pafs.FileSelector(base)):
-        if info.type == pafs.FileType.Directory and info.base_name.startswith("coato="):
-            code = info.base_name.split("=", 1)[1]
-            done = fs.get_file_info(f"{info.path}/_SUCCESS").type == pafs.FileType.File
-            out.append((code, done))
-    return sorted(out)
-
-
-def district_daily(fs, root, code):
-    """The district's daily table as a pyarrow dataset; `period` (YYYY-MM) comes from the month folders, as a string."""
-    path = f"{root}/household_daily_enriched/coato={code}/household_daily_enriched/data"
-    part = ds.partitioning(pa.schema([("period", pa.string())]), flavor="hive")
-    return ds.dataset(path, filesystem=fs, format="parquet", partitioning=part)
-
-
-def period_range(a, b):
-    return [p.strftime("%Y-%m") for p in pd.period_range(pd.Timestamp(a), pd.Timestamp(b), freq="M")]
-
-
-def kept_label(keep):
-    return ds.field("label_state").isin(keep) & ds.field("kwh").is_valid()
+from enriched_io import (ENRICHED_ROOT, LABELS, WINDOW_END, district_daily, finished_districts, kept_label,  # noqa: E402
+                         open_root, period_range)
 
 
 # -----------------------------------------------------------------------------------------------------------------
@@ -251,17 +206,9 @@ def main(argv=None):
     with tf.logging_to(os.path.join(args.work_dir, "run_log.txt")):
         fs, root = open_root(args.root)
         with tf.stage("districts"):
-            dist = list_districts(fs, root)
-            if not dist:
-                raise SystemExit(f"no coato=<code> folders under {root}/household_daily_enriched")
             want = None if args.coato == "all" else {c.strip() for c in args.coato.split(",") if c.strip()}
-            todo = [c for c, done in dist if (done or args.include_unfinished) and (want is None or c in want)]
-            unfinished = [c for c, done in dist if not done]
-            print(f"{len(dist)} district folders, {len(dist) - len(unfinished)} finished (_SUCCESS); reading {len(todo)}"
-                  + (f"; not finished: {unfinished[:10]}{' ...' if len(unfinished) > 10 else ''}" if unfinished else ""))
+            todo = finished_districts(fs, root, want, args.include_unfinished)
             print(f"labels kept: {keep} (everything else, incl. long-gap allocations, stays missing)")
-            if not todo:
-                raise SystemExit("no finished district matches --coato")
         with tf.stage("census (observed customers per transformer)"):
             c = census(fs, root, todo, args, keep)
         with tf.stage("sample transformers"):

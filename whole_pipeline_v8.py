@@ -155,6 +155,18 @@ What changed versus v3
    Because the index keeps the COUNTS, not just the verdict, windows that failed a rule can be
    inspected or admitted later without re-running the raw data.
 
+9. National ENRICHED household dataset (WINDOW_SOURCE="enriched", the default; see HOUSEHOLD_NATIONAL_DATASETS_GUIDE.md).
+   Reads the cleaned v1.4 staging dataset with PyArrow, one finished district at a time; no Spark (weather comes from the
+   same table). The unit is a customer (customer_key + coato_code). ENRICHED_BUCKETS picks a stable customer_bucket sample.
+     - labels: only complete_observed days have a value (HH-GAP-001-A1 rules 1-3); everything else is NaN
+     - windows: origins every WINDOW_STRIDE days per customer (staggered); input >= MIN_INPUT_DAYS of 90 observed and
+       >= MIN_RECENT_DAYS of the last RECENT_WINDOW; target >= MIN_TARGET_DAYS observed (scored on observed days only);
+       trained on when >= TRAIN_MIN_TARGET_DAYS observed (a missing target day = residual 0, never an invented value)
+     - GLITCH_REPAIR off: the data is already cleaned, values are used as delivered (training and serving alike)
+     - validation = the autumn-to-spring block (VAL_START, VAL_END]; BACKTEST_CUTOFFS entries may be (cutoff, val_start, val_end)
+     - columns.json records the input rule, so transformer_forecast.py's bottom-up stage applies the same rule
+   Run:   python whole_pipeline_v8.py --set ENRICHED_BUCKETS=[0,1] --set OUTPUT_DIR=./artifacts/hh_enriched train
+
 Experiment tracking, serving model, registry, monitoring (MLflow; optional, off unless a tracking URI is set)
    Needs next to this file: mlflow_utils.py (the Tracker wrapper) and electricity_pyfunc.py (the serving model).
    Set MLFLOW_TRACKING_URI (or --mlflow-uri); credentials come from the environment only (MLFLOW_TRACKING_USERNAME /
@@ -214,7 +226,24 @@ warnings.filterwarnings("ignore", category=RuntimeWarning)  # nanmean of empty s
 # Configuration
 # =============================================================================
 # --- where the training windows come from ---
-WINDOW_SOURCE = "index"        # "index" = daily table + window index from process_raw.py | "legacy" = saved window arrays
+WINDOW_SOURCE = "enriched"     # "enriched" = national enriched household dataset v1.4 (default; no Spark)
+                               # "index" = daily table + window index from process_raw.py | "legacy" = saved window arrays
+
+# --- enriched source (WINDOW_SOURCE="enriched"); see HOUSEHOLD_NATIONAL_DATASETS_GUIDE.md ---
+ENRICHED_ROOT = "s3://phase1/electricity/_staging/household-enriched-v14-nat-b2c-20261017-8e1414/"
+ENRICHED_BUCKETS = [0]         # customer_bucket values (stable hash 0-99): each bucket is ~1% of customers nationally;
+                               # None = every customer of the districts read (use with ENRICHED_COATOS)
+ENRICHED_COATOS = None         # None = every finished district; or a list of coato codes
+ENRICHED_LABELS = ["complete_observed"]   # HH-GAP-001-A1 rule 1: only observed 1-day clean kwh is a label or an input
+ENRICHED_START, ENRICHED_END = "2022-01-01", "2026-06-29"
+WINDOW_STRIDE = 30             # days between a customer's origins (staggered per customer, so every calendar day is used)
+MIN_INPUT_DAYS = 60            # an input window needs this many observed days of its 90 ...
+MIN_RECENT_DAYS = 20           # ... and this many of its last RECENT_WINDOW days
+RECENT_WINDOW = 30
+MIN_TARGET_DAYS = 30           # a window is kept if this many of its 60 target days are observed (scored on those days only)
+TRAIN_MIN_TARGET_DAYS = 54     # a window is TRAINED on if this many target days are observed; on its missing days the label is
+                               # "no correction to the thermal baseline" (residual 0), never a made-up consumption value
+GLITCH_REPAIR = True           # causal spike/dip repair; switched off for the enriched source (already cleaned by Layer 1)
 CLEAN_STORE_S3 = "s3a://phase1/electricity/analytics/features/clean_daily_store"   # holds daily_<tag>/ and index_<tag>/
 WINDOW_INDEX_DIR = None        # e.g. "index_nb020_qnone_f4_L90_H60_S30_G5_R30"; None = the only index_* folder for LOOKBACK/HORIZON
 WINDOW_BATCHES = [0]          # one hash batch = about 4.9M windows, a random 5% of the meters
@@ -295,7 +324,10 @@ GLITCH_SPIKE_MIN_EXCESS = 15.0
 
 # --- split ---
 TRAIN_CUTOFF = "2025-09-01"
-VAL_START = "2025-07-02"
+VAL_START = "2024-09-01"
+VAL_END = "2025-04-30"         # validation = origins in (VAL_START, VAL_END]; fit = training origins >= HORIZON days away on both
+                               # sides. An autumn-to-spring block: a summer-only block (the old VAL_START 2025-07-02 to the cutoff)
+                               # stopped the transformer model at 0 trees. None = the old split (VAL_START .. TRAIN_CUTOFF)
 
 # --- model selection ---
 MAX_FINAL_ITERATIONS = 150   # cap on the final refit tree count for BOTH models
@@ -606,6 +638,104 @@ def extract_windows_from_index(spark: SparkSession):
     pdf = ix[["meter_id", "origin_date"]].merge(meta, on="meter_id", how="left")
     assert len(pdf) == len(ix) and kin.shape[1] == LOOKBACK and ktg.shape[1] == HORIZON
     return pdf.reset_index(drop=True), kin, ktg
+
+
+def extract_windows_enriched():
+    """National enriched household dataset (v1.4) -> (pdf, kin, ktg, daily_weather), no Spark.
+
+    Reads the ENRICHED_BUCKETS customer sample one finished district at a time (guide rule 10). The unit is a customer
+    (customer_key + coato_code; meters already combined). Only ENRICHED_LABELS days (complete_observed) carry a value;
+    estimated, partial, unlabelled and long-gap-allocated days are NaN (HH-GAP-001-A1 rules 1-3: a 1-day observed reading
+    shares no reading interval with any other day, so no input day leaks its target).
+    Each customer gets origins every WINDOW_STRIDE days, offset by a stable hash of the key so that origins cover every
+    calendar day. A window is kept when its 90-day input has >= MIN_INPUT_DAYS observed days and >= MIN_RECENT_DAYS of the
+    last RECENT_WINDOW, and its 60-day target >= MIN_TARGET_DAYS. pdf['tgt_days'] = observed target days: windows with
+    >= TRAIN_MIN_TARGET_DAYS are trained on (missing days: residual label 0); every kept window is scored on its observed days.
+    Weather = the table's own daily t_mean / t_min / t_max per district (branch-observed, 24 complete hourly values)."""
+    import zlib
+    import pyarrow.dataset as pads
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import enriched_io as eio
+    fs, root = eio.open_root(ENRICHED_ROOT)
+    codes = eio.finished_districts(fs, root, set(ENRICHED_COATOS) if ENRICHED_COATOS else None)
+    d0, d1 = pd.Timestamp(ENRICHED_START), pd.Timestamp(ENRICHED_END)
+    T, L, H = (d1 - d0).days + 1, LOOKBACK, HORIZON
+    cols = ["customer_key", "date", "kwh", "label_state", "housing_type_id", "t_mean", "t_min", "t_max"]
+    flt = (pads.field("date") >= d0.date()) & (pads.field("date") <= d1.date())
+    if ENRICHED_BUCKETS is not None:             # None = every customer (e.g. with ENRICHED_COATOS = a few districts)
+        flt = flt & pads.field("customer_bucket").isin([int(b) for b in ENRICHED_BUCKETS])
+    K = (T - 1 - H - (L - 1)) // WINDOW_STRIDE + 1
+    pdfs, kins, ktgs, weather = [], [], [], []
+    n_cust = n_cand = 0
+    import time as _time
+    t0 = _time.time()
+    for n, code in enumerate(codes):
+        parts = [b.to_pandas() for b in eio.district_daily(fs, root, code).scanner(
+            columns=cols, filter=flt, batch_size=262_144, use_threads=True).to_batches() if b.num_rows]
+        if not parts:
+            continue
+        x = pd.concat(parts, ignore_index=True)
+        w = (x.groupby("date")[["t_mean", "t_min", "t_max"]].max().reset_index()
+             .rename(columns={"date": "d", "t_mean": "t", "t_min": "tmin", "t_max": "tmax"}))
+        w.insert(0, "coato_id", str(code))
+        weather.append(w)
+        ok = x["label_state"].isin(ENRICHED_LABELS).to_numpy() & x["kwh"].notna().to_numpy()
+        cust = x.groupby("customer_key", sort=True)["housing_type_id"].last()
+        row = pd.Series(np.arange(len(cust)), index=cust.index).reindex(x["customer_key"]).to_numpy()
+        day = (pd.to_datetime(x["date"]) - d0).dt.days.to_numpy()
+        M = np.full((len(cust), T), np.nan, dtype="float32")
+        M[row[ok], day[ok]] = x["kwh"].to_numpy()[ok]
+        del x, parts
+        n_cust += len(cust)
+        # staggered origin grid per customer, then the window rules from prefix counts of observed days
+        off = np.array([zlib.crc32(str(k).encode()) % WINDOW_STRIDE for k in cust.index], dtype=np.int64)
+        o = (L - 1) + off[:, None] + WINDOW_STRIDE * np.arange(K)[None, :]
+        r = np.broadcast_to(np.arange(len(cust))[:, None], o.shape)
+        inside = o <= T - 1 - H
+        r, o = r[inside], o[inside]
+        c = np.pad(np.cumsum(np.isfinite(M), axis=1, dtype=np.int32), ((0, 0), (1, 0)))
+        n_in = c[r, o + 1] - c[r, o - L + 1]
+        n_rec = c[r, o + 1] - c[r, o - RECENT_WINDOW + 1]
+        n_tg = c[r, o + H + 1] - c[r, o + 1]
+        keep = (n_in >= MIN_INPUT_DAYS) & (n_rec >= MIN_RECENT_DAYS) & (n_tg >= MIN_TARGET_DAYS)
+        n_cand += int(inside.sum())
+        r, o, n_tg = r[keep], o[keep], n_tg[keep]
+        if not len(r):
+            continue
+        kins.append(M[r[:, None], o[:, None] + np.arange(-(L - 1), 1)[None, :]])
+        ktgs.append(M[r[:, None], o[:, None] + np.arange(1, H + 1)[None, :]])
+        ht = cust.to_numpy()[r]
+        pdfs.append(pd.DataFrame({"meter_id": cust.index.to_numpy()[r].astype(str), "consumer_id": cust.index.to_numpy()[r].astype(str),
+                                  "origin_date": d0 + pd.to_timedelta(o, unit="D"), "coato_code": str(code),
+                                  "housing_type_id": pd.Series(ht).astype("Int64").astype(str).replace("<NA>", np.nan).to_numpy(),
+                                  "tgt_days": n_tg.astype("int16")}))
+        if (n + 1) % 20 == 0 or n + 1 == len(codes):
+            el = _time.time() - t0
+            print(f"[windows] {n + 1}/{len(codes)} districts: {n_cust:,} customers, {sum(len(p) for p in pdfs):,} windows; "
+                  f"{el / 60:.1f} min, about {el / (n + 1) * (len(codes) - n - 1) / 60:.1f} min left", flush=True)
+    if not pdfs:
+        raise SystemExit(f"no usable windows: customer_bucket {ENRICHED_BUCKETS} in {len(codes)} districts")
+    pdf = pd.concat(pdfs, ignore_index=True)
+    gb = len(pdf) * (LOOKBACK + HORIZON) * 8 / 2 ** 30
+    print(f"[windows] {len(pdf):,} windows of {n_cand:,} candidates from {pdf['meter_id'].nunique():,} customers in "
+          f"{pdf['coato_code'].nunique()} districts; target days observed: all 60 in {(pdf['tgt_days'] == H).mean():.1%}, "
+          f">= {TRAIN_MIN_TARGET_DAYS} (trainable) in {(pdf['tgt_days'] >= TRAIN_MIN_TARGET_DAYS).mean():.1%}; "
+          f"kin + ktg about {gb:.1f} GB")
+    if gb > MAX_WINDOW_ARRAY_GB:
+        raise MemoryError(f"kin + ktg would need {gb:.1f} GB (> MAX_WINDOW_ARRAY_GB={MAX_WINDOW_ARRAY_GB}): use fewer ENRICHED_BUCKETS, "
+                          f"a larger WINDOW_STRIDE, or raise the limit")
+    kin = np.concatenate(kins).astype("float64")
+    ktg = np.concatenate(ktgs).astype("float64")
+    del kins, ktgs
+    keep = regime_keep_mask(pdf)
+    pdf, kin, ktg = pdf[keep].reset_index(drop=True), kin[keep], ktg[keep]
+    daily_t = pd.concat(weather, ignore_index=True)
+    daily_t["d"] = pd.to_datetime(daily_t["d"])
+    DATA_INFO.update(source="household_enriched_v1.4", root=ENRICHED_ROOT, buckets=str(ENRICHED_BUCKETS),
+                     districts=len(codes), customers=int(pdf["meter_id"].nunique()), labels=",".join(ENRICHED_LABELS),
+                     window_rules=f"in>={MIN_INPUT_DAYS}/90, recent>={MIN_RECENT_DAYS}/{RECENT_WINDOW}, target>={MIN_TARGET_DAYS}/60, "
+                                  f"stride {WINDOW_STRIDE}")
+    return pdf, kin, ktg, daily_t
 
 
 def extract_windows(spark: SparkSession):
@@ -1179,6 +1309,8 @@ def clean_recent_readings_for_serving(daily_kwh: np.ndarray, **kwargs) -> np.nda
     (oldest-to-newest) with EXACTLY the same trailing-only logic as training.
     Non-isolated anomalous days are left unrepaired; it's up to the caller
     to decide how to handle a meter whose latest window looks anomalous."""
+    if not GLITCH_REPAIR:              # trained on already-cleaned data (enriched source): serve the values as delivered
+        return np.asarray(daily_kwh, dtype="float64")
     y_clean, _repaired, _masked = clean_daily_series(np.asarray(daily_kwh, dtype="float64"), **kwargs)
     return y_clean
 
@@ -1688,12 +1820,14 @@ def xgb_categories(Xg: pd.DataFrame) -> dict:
 # =============================================================================
 # Split, diagnostics, evaluation
 # =============================================================================
-def make_masks(meta: pd.DataFrame, train_cutoff: str = TRAIN_CUTOFF, val_start: str = VAL_START, test_end=None):
+def make_masks(meta: pd.DataFrame, train_cutoff: str = TRAIN_CUTOFF, val_start: str = VAL_START, test_end=None, val_end=None):
     """
     'test' uses EVERY daily origin from cutoff+embargo through the last
     available date (overlap isn't a problem for system-level sysMAPE: each
     horizon's target day still gets exactly one contribution per meter).
     With `test_end` (a backtest fold) the test origins stop there, so folds do not overlap.
+    With `val_end`: validation = origins in (val_start, val_end] and fit = training origins at least HORIZON days away from
+    that block on BOTH sides (no fit target day is a validation target day). Without it: validation runs to the cutoff.
     """
     o = meta["origin_date"]
     cutoff = pd.Timestamp(train_cutoff)
@@ -1701,8 +1835,15 @@ def make_masks(meta: pd.DataFrame, train_cutoff: str = TRAIN_CUTOFF, val_start: 
     train = (o <= cutoff).values
 
     val_start = pd.Timestamp(val_start)
-    fit = (o <= val_start - embargo).values
-    val = ((o > val_start) & (o <= cutoff)).values
+    if val_end:
+        ve = pd.Timestamp(val_end)
+        if not val_start < ve <= cutoff:
+            raise ValueError(f"validation block ({val_start.date()}, {ve.date()}] must lie before the cutoff {cutoff.date()}")
+        val = ((o > val_start) & (o <= ve)).values
+        fit = (((o <= val_start - embargo) | (o > ve + embargo)) & (o <= cutoff)).values
+    else:
+        fit = (o <= val_start - embargo).values
+        val = ((o > val_start) & (o <= cutoff)).values
 
     test = (o >= cutoff + embargo).values
     if test_end is not None:
@@ -1719,11 +1860,12 @@ def regime_report(name, t_actual):
 
 
 def mae_report(name, pred, y):
+    """MAE over the scored (observed) target days; missing days are NaN and left out."""
     e = np.abs(pred - y)
-    print(f"{name:<34} MAE all {e.mean():7.3f} | t+7 {e[:, 6].mean():7.3f} | t+14 {e[:, 13].mean():7.3f} | "
-          f"t+30 {e[:, 29].mean():7.3f} | t+60 {e[:, 59].mean():7.3f}")
-    return {"all": float(e.mean()), 7: float(e[:, 6].mean()), 14: float(e[:, 13].mean()),
-            30: float(e[:, 29].mean()), 60: float(e[:, 59].mean())}
+    m = lambda a: float(np.nanmean(a)) if np.isfinite(a).any() else float("nan")      # noqa: E731
+    print(f"{name:<34} MAE all {m(e):7.3f} | t+7 {m(e[:, 6]):7.3f} | t+14 {m(e[:, 13]):7.3f} | "
+          f"t+30 {m(e[:, 29]):7.3f} | t+60 {m(e[:, 59]):7.3f}")
+    return {"all": m(e), 7: m(e[:, 6]), 14: m(e[:, 13]), 30: m(e[:, 29]), 60: m(e[:, 59])}
 
 
 def sys_mape_report(name, pred, y, origin_days, horizons=(7, 14, 30, 60)):
@@ -1795,7 +1937,7 @@ def system_daily_frame(model, pred, y, origin_days, horizons=HORIZONS_REPORTED):
 
 
 def fit_and_evaluate(pdf, kin, ktg, ktg_raw, clim, fc_grid, fc_grid_mm, train_cutoff, val_start,
-                     test_end=None, label="primary"):
+                     test_end=None, label="primary", val_end=None):
     """Everything that depends on the train cutoff, for ONE fold: behaviour segments and priors (training
     history only), features, the CatBoost / XGBoost fits with early stopping on the validation slice, the
     final refits on the whole training period, and the test evaluation against RAW targets.
@@ -1831,14 +1973,22 @@ def fit_and_evaluate(pdf, kin, ktg, ktg_raw, clim, fc_grid, fc_grid_mm, train_cu
             print(f"  {pre}*: share of row-days > 0 = {(feats[cols].values > 0).mean():.1%} "
                   f"(NaN share {np.isnan(feats[cols].values).mean():.1%})")
     y_res = ktg - base  # residual target for training (uses REPAIRED ktg)
+    y_res = np.where(np.isfinite(y_res), y_res, 0.0)   # a missing target day (enriched) = no correction, never an invented value
     feature_cols = list(feats.columns) + CAT_FEATURES
     X = pd.concat([feats, meta[CAT_FEATURES]], axis=1)[feature_cols]
     Xg = to_xgb_frame(X)
     res_cols = [f"res_{i}" for i in range(1, HORIZON + 1)]
     Y = pd.DataFrame(y_res, columns=res_cols)
 
-    train, fit, val, test = make_masks(meta, train_cutoff, val_start, test_end)
+    train, fit, val, test = make_masks(meta, train_cutoff, val_start, test_end, val_end)
+    if "tgt_days" in pdf:                     # enriched source: train on windows with enough observed target days
+        full = (pdf["tgt_days"] >= TRAIN_MIN_TARGET_DAYS).to_numpy()
+        train, fit, val = train & full, fit & full, val & full
     print(f"train {train.sum()} (fit {fit.sum()} / val {val.sum()}) | test {test.sum()} | features {len(feature_cols)}")
+    om = meta["origin_date"].dt.to_period("M")
+    print(f"origin months  fit {om[fit].min()}..{om[fit].max()} ({om[fit].nunique()}) | val {om[val].min()}..{om[val].max()} "
+          f"({om[val].nunique()}) | test {om[test].min()}..{om[test].max()} ({om[test].nunique()})" if fit.any() and val.any()
+          and test.any() else "origin months: a split is empty")
     if not test.any() or not fit.any() or not val.any():
         raise ValueError(f"fold '{label}': empty split (fit {fit.sum()}, val {val.sum()}, test {test.sum()}); "
                          f"check the cutoffs against the available origin dates "
@@ -1900,24 +2050,31 @@ def fit_and_evaluate(pdf, kin, ktg, ktg_raw, clim, fc_grid, fc_grid_mm, train_cu
     pers7 = np.repeat(feats.loc[test, "kwh_mean_7d"].values[:, None], HORIZON, 1)
     preds = {"persistence30": pers30, "persistence7": pers7, "thermal": base[test],
              "catboost": pred_cb, "xgboost": pred_xgb}
+    # score only target days with an observed value (rule 1): a forecast for a missing day is set aside, not compared
+    obs = np.isfinite(y_test)
+    if not obs.all():
+        print(f"[score] {obs.mean():.1%} of the test target days are observed; forecasts are scored on those only")
+        preds = {k: np.where(obs, v, np.nan) for k, v in preds.items()}
+        pred_cb, pred_xgb, pers30, pers7 = preds["catboost"], preds["xgboost"], preds["persistence30"], preds["persistence7"]
+    base_test = preds["thermal"]
 
     print(f"\n[config] future_mode={FUTURE_MODE} forecast_mode={FORECAST_MODE} prev_year_features={USE_PREV_YEAR_FEATURES}")
     print("\n--- Test results (MAE, vs. raw targets) ---")
     mae = {"persistence30": mae_report("Persistence (30d mean)", pers30, y_test),
            "persistence7": mae_report("Persistence (7d mean)", pers7, y_test),
-           "thermal": mae_report("Thermal baseline only", base[test], y_test),
+           "thermal": mae_report("Thermal baseline only", base_test, y_test),
            "catboost": mae_report("Baseline + CatBoost", pred_cb, y_test),
            "xgboost": mae_report("Baseline + XGBoost", pred_xgb, y_test)}
 
     print("\n--- Test results (system-level MAPE, vs. raw targets) ---")
     sys_mape_report("Persistence (30d mean)", pers30, y_test, origin_days_test)
-    sys_mape_report("Thermal baseline only", base[test], y_test, origin_days_test)
+    sys_mape_report("Thermal baseline only", base_test, y_test, origin_days_test)
     sys_mape_report("Baseline + CatBoost", pred_cb, y_test, origin_days_test)
     sys_mape_report("Baseline + XGBoost", pred_xgb, y_test, origin_days_test)
 
     print("\n--- Test results (sysMAPE | acceptance-spec sysWAPE | signed bias | scored days) ---")
     sysr = {"persistence30": sys_report("Persistence (30d mean)", pers30, y_test, origin_days_test),
-            "thermal": sys_report("Thermal baseline only", base[test], y_test, origin_days_test),
+            "thermal": sys_report("Thermal baseline only", base_test, y_test, origin_days_test),
             "catboost": sys_report("Baseline + CatBoost", pred_cb, y_test, origin_days_test),
             "xgboost": sys_report("Baseline + XGBoost", pred_xgb, y_test, origin_days_test)}
 
@@ -1998,6 +2155,12 @@ def persist_model(fold, daily_t, clim, out_dir=None, extra=None):
                 lookback=LOOKBACK, horizon=HORIZON, serve_model=SERVE_MODEL,
                 train_cutoff=fold.train_cutoff, val_start=fold.val_start,
                 window_source=WINDOW_SOURCE, index_tag=DATA_INFO.get("index_tag"),
+                glitch_repair=bool(GLITCH_REPAIR), val_end=VAL_END,
+                # what a history must look like to be forecast (bottom-up and serving use the same rule as training)
+                input_rule=dict(min_input_days=MIN_INPUT_DAYS, min_recent_days=MIN_RECENT_DAYS, recent_window=RECENT_WINDOW,
+                                gap_fill=0 if WINDOW_SOURCE == "enriched" else 3,
+                                labels=ENRICHED_LABELS if WINDOW_SOURCE == "enriched" else None),
+                data_info={k: str(v) for k, v in DATA_INFO.items()},
                 xgb_categories=xgb_categories(fold.Xg),
                 **(extra or {}),
             ),
@@ -2200,7 +2363,10 @@ CONFIG_NAMES = [
     "INCLUDE_OLD", "OLD_START", "OLD_EXCLUDE_TARGET_MONTHS", "OLD_WEIGHT", "OLD_REGIME_FLAG", "SEGMENT_USE_OLD",
     "EXCLUDE_RANGES", "EXCLUDE_MODE", "BETA_H_PRIOR", "BETA_C_PRIOR", "BETA_MAX", "RIDGE_LAMBDA", "LEVEL_DAYS",
     "BLOCKS", "GLITCH_WINDOW", "GLITCH_MIN_VALID", "GLITCH_DIP_RATIO", "GLITCH_DIP_MIN_MED", "GLITCH_SPIKE_RATIO",
-    "GLITCH_SPIKE_MIN_EXCESS", "TRAIN_CUTOFF", "VAL_START", "MAX_FINAL_ITERATIONS", "SEGMENT_K",
+    "GLITCH_SPIKE_MIN_EXCESS", "TRAIN_CUTOFF", "VAL_START", "VAL_END", "MAX_FINAL_ITERATIONS", "SEGMENT_K",
+    "ENRICHED_ROOT", "ENRICHED_BUCKETS", "ENRICHED_COATOS", "ENRICHED_LABELS", "ENRICHED_START", "ENRICHED_END",
+    "WINDOW_STRIDE", "MIN_INPUT_DAYS", "MIN_RECENT_DAYS", "RECENT_WINDOW", "MIN_TARGET_DAYS", "TRAIN_MIN_TARGET_DAYS",
+    "GLITCH_REPAIR",
     "SEGMENT_MIN_COVERAGE_DAYS", "CATBOOST_EARLY_STOPPING_ROUNDS", "XGB_EARLY_STOPPING_ROUNDS", "SERVE_MODEL",
     "BACKTEST_CUTOFFS", "BACKTEST_TEST_DAYS",
 ]
@@ -2299,13 +2465,25 @@ def main_train(tr):
             tr.params({f"catboost.{k}": v for k, v in CATBOOST_PARAMS.items()})
             tr.params({f"xgboost.{k}": v for k, v in XGB_PARAMS.items()})
 
-            spark = build_spark_session()
+            spark = daily_t = None
             print(f"Reading windows (WINDOW_SOURCE={WINDOW_SOURCE!r}) + metadata...")
-            pdf, kin, ktg = extract_windows(spark)
+            if WINDOW_SOURCE == "enriched":
+                globals()["GLITCH_REPAIR"] = False     # Layer-1 clean kwh is the truth: never repaired or dropped again
+                if FORECAST_MODE == "archive":
+                    raise ValueError("FORECAST_MODE='archive' needs Spark for FORECAST_S3; not wired for the enriched source")
+                pdf, kin, ktg, daily_t = extract_windows_enriched()
+            else:
+                spark = build_spark_session()
+                pdf, kin, ktg = extract_windows(spark)
             if WINDOW_SOURCE == "legacy":          # the index source applies the regime policy while reading
                 pdf, kin, ktg = filter_regime(pdf, kin, ktg)
             n_regime_kept = len(pdf)
-            pdf, kin, ktg, ktg_raw = detect_and_repair_glitches(pdf, kin, ktg)
+            if GLITCH_REPAIR:
+                pdf, kin, ktg, ktg_raw = detect_and_repair_glitches(pdf, kin, ktg)
+            else:
+                ktg_raw = ktg.copy()
+                LAST_GLITCH_STATS.update(windows_before=len(pdf), repaired_days=0, masked_days=0, windows_dropped=0)
+                print("[glitch repair] off: the source is already cleaned; values are used as delivered")
 
             # lineage: which data-prep run made the store this model was trained on
             if DATA_INFO:
@@ -2317,15 +2495,19 @@ def main_train(tr):
             tr.metrics({f"glitch/{k}": v for k, v in LAST_GLITCH_STATS.items()})
             tr.metrics({"windows_after_glitch_repair": len(pdf), "windows_after_regime_filter": n_regime_kept})
 
-            print("Loading daily weather...")
-            daily_t = load_daily_temperature(spark)
             fc_df = None
-            if FORECAST_MODE == "archive":
-                if not FORECAST_S3:
-                    raise ValueError("FORECAST_MODE='archive' but FORECAST_S3 is not set")
-                print("Loading archived forecasts...")
-                fc_df = load_archived_forecasts(spark)
-            spark.stop()
+            if spark is not None:
+                print("Loading daily weather...")
+                daily_t = load_daily_temperature(spark)
+                if FORECAST_MODE == "archive":
+                    if not FORECAST_S3:
+                        raise ValueError("FORECAST_MODE='archive' but FORECAST_S3 is not set")
+                    print("Loading archived forecasts...")
+                    fc_df = load_archived_forecasts(spark)
+                spark.stop()
+            else:
+                print(f"[weather] from the enriched table: {daily_t['coato_id'].nunique()} districts, "
+                      f"{daily_t['t'].notna().mean():.1%} of district-days with a mean temperature")
             print(f"Windows: {len(pdf)}")
 
             clim = build_climate(daily_t)
@@ -2336,7 +2518,7 @@ def main_train(tr):
                                   max=build_forecast_grid(fc_df, clim, col="t_fc_max"))
 
             # ---------------- primary fold ----------------
-            fold = fit_and_evaluate(pdf, kin, ktg, ktg_raw, clim, fc_grid, fc_grid_mm, TRAIN_CUTOFF, VAL_START)
+            fold = fit_and_evaluate(pdf, kin, ktg, ktg_raw, clim, fc_grid, fc_grid_mm, TRAIN_CUTOFF, VAL_START, val_end=VAL_END)
             persist_model(fold, daily_t, clim, extra=dict(mlflow_run_id=run_id))
             print_importances(fold)
             log_fold(tr, fold)
@@ -2364,14 +2546,19 @@ def main_train(tr):
 
             # ---------------- rolling-origin backtest (optional) ----------------
             bt_folds = []
-            for cutoff in BACKTEST_CUTOFFS:
+            for entry in BACKTEST_CUTOFFS:
+                # "CUTOFF" (validation shifted by the primary fold's offsets) or ("CUTOFF", "VAL_START", "VAL_END")
+                cutoff, vs, ve = (tuple(entry) + (None, None))[:3] if isinstance(entry, (tuple, list)) else (entry, None, None)
                 c = pd.Timestamp(cutoff)
-                vs = (c - (pd.Timestamp(TRAIN_CUTOFF) - pd.Timestamp(VAL_START))).strftime("%Y-%m-%d")
+                if vs is None:
+                    vs = (c - (pd.Timestamp(TRAIN_CUTOFF) - pd.Timestamp(VAL_START))).strftime("%Y-%m-%d")
+                    if VAL_END:
+                        ve = (c - (pd.Timestamp(TRAIN_CUTOFF) - pd.Timestamp(VAL_END))).strftime("%Y-%m-%d")
                 te = (c + pd.Timedelta(days=HORIZON + BACKTEST_TEST_DAYS)).strftime("%Y-%m-%d")
                 with tr.run(f"backtest {cutoff}", nested=True, tags={"stage": "backtest"}):
                     try:
                         f = fit_and_evaluate(pdf, kin, ktg, ktg_raw, clim, fc_grid, fc_grid_mm, cutoff, vs, te,
-                                             label=f"backtest {cutoff}")
+                                             label=f"backtest {cutoff}", val_end=ve)
                     except ValueError as e:
                         import traceback
                         traceback.print_exc()
@@ -2494,6 +2681,9 @@ def build_parser():
     p.add_argument("--mlflow-uri", default=None, help="MLflow server / store (default: MLFLOW_TRACKING_URI; "
                                                       "without one tracking is off)")
     p.add_argument("--no-mlflow", action="store_true", help="tracking off even if a URI is set")
+    p.add_argument("--set", action="append", default=[], metavar="NAME=VALUE",
+                   help="override a configuration constant, e.g. --set ENRICHED_BUCKETS=[0,1] --set OUTPUT_DIR=./artifacts/hh_enriched "
+                        "(Python literal; plain text otherwise). Repeatable")
     sub = p.add_subparsers(dest="cmd")
     sub.add_parser("train", help="train, evaluate, log, register (the default)")
     pr = sub.add_parser("promote", help="make a registered version the champion (after the gate)")
@@ -2508,6 +2698,18 @@ def build_parser():
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
+    import ast
+    for item in args.set:
+        name, _, raw = item.partition("=")
+        name = name.strip()
+        if not name.isupper() or name not in globals():
+            raise SystemExit(f"--set {item!r}: {name!r} is not a configuration constant of this file")
+        try:
+            value = ast.literal_eval(raw)
+        except (ValueError, SyntaxError):
+            value = raw
+        globals()[name] = value
+        print(f"[config] {name} = {value!r}")
     cmd = args.cmd or "train"
     if cmd == "monitor":
         return main_monitor(args)
