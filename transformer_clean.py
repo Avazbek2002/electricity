@@ -22,6 +22,12 @@ It applies what `transformer_noise_audit.py` found, in this order:
   8. local dips         intensity far below its own recent level while reporting normally, and NOT shared with the
                         transformer's coato peers or the country (holidays and weather are shared)                   -> flag 16
 
+No look-ahead (for forecast evaluation): `--fit-end <date>` chooses heavy consumers, the stable core and churn from days up
+to that date only, and `--reference trailing` (the default) compares each day with the days BEFORE it when flagging system
+days, regional events, gaps and dips. Set --fit-end to the earliest train cutoff of the forecast run:
+
+    python transformer_clean.py --work-dir ~/work/tf_national_v2 --fit-end 2025-03-01
+
 Outputs in <work-dir>/clean/:
   transformer_clean.npz    ids, coato, dates, intensity (cleaned), intensity_raw, n_core, cover, flags (uint8 bits above)
   transformers_kept.csv    one row per transformer: sizes, core share, usable share, complete 90+60 windows, why dropped
@@ -42,6 +48,7 @@ import argparse
 import os
 import sys
 import time
+import warnings
 from types import SimpleNamespace
 
 import numpy as np
@@ -58,9 +65,15 @@ def runs(mask):
     return list(zip(np.flatnonzero(d == 1), np.flatnonzero(d == -1)))
 
 
-def rolling_median(a, win, minp):
-    """a (n, T) -> rolling median along time, NaN-aware"""
-    return pd.DataFrame(a.T).rolling(win, center=True, min_periods=minp).median().to_numpy().T
+def rolling_median(a, win, minp, trailing=True):
+    """a (n, T) -> rolling median along time, NaN-aware.
+    trailing=True: the median of the `win` days BEFORE each day (the day itself excluded), so a day is judged only against
+    its past, as a live system would judge it. trailing=False: centred on the day (the old behaviour; it looks ahead)."""
+    df = pd.DataFrame(np.atleast_2d(a).T)
+    if trailing:
+        df = df.shift(1)
+    out = df.rolling(win, center=not trailing, min_periods=minp).median().to_numpy().T
+    return out if np.ndim(a) > 1 else out[0]
 
 
 # -----------------------------------------------------------------------------------------------------------------
@@ -68,7 +81,8 @@ def national_and_regional(n_rep, n_hh, cidx, n_coatos, dates, args):
     """Same rules as the audit (sections 1 and 1b). -> system_bad (T,), regional_bad (n_tr, T), regional events"""
     T = n_rep.shape[1]
     cover = n_rep / n_hh[:, None]
-    roll = lambda v: pd.Series(v).rolling(61, center=True, min_periods=15).median().to_numpy()      # noqa: E731
+    trailing = args.reference == "trailing"
+    roll = lambda v: rolling_median(v, 61, 15, trailing)                                                # noqa: E731
     cov_c, ref_c, checked = {}, {}, []
     for c in range(n_coatos):
         m = cidx == c
@@ -108,8 +122,20 @@ def clean(args):
     hh = hh.reset_index(drop=True)
     print(f"[load] {len(hh):,} households x {T:,} days from {args.work_dir}")
 
+    if args.fit_end:
+        fe = int(np.searchsorted(dates, pd.Timestamp(args.fit_end), side="right")) - 1
+        if fe < 60:
+            raise SystemExit(f"--fit-end {args.fit_end} leaves fewer than 60 days of data (the panel starts {dates[0].date()})")
+        print(f"[causal] heavy consumers, stable core and churn are chosen on days up to {dates[fe].date()} only; "
+              f"thresholds use {'trailing' if args.reference == 'trailing' else 'CENTRED (looks ahead)'} references")
+    else:
+        fe = T - 1
+        print("[causal] WARNING: no --fit-end, so the stable core and heavy consumers are chosen on ALL days, test months included. "
+              "Pass --fit-end <the earliest train cutoff you will use> for a forecast evaluation without look-ahead.")
+
     # ---- which households and transformers take part ---------------------------------------------------------
-    fin_days = np.concatenate([np.isfinite(kwh[a:a + 5000]).sum(axis=1) for a in range(0, kwh.shape[0], 5000)])
+    # reading days up to the fit end: a household that only appears later is unknown when the model is trained
+    fin_days = np.concatenate([np.isfinite(kwh[a:a + 5000, :fe + 1]).sum(axis=1) for a in range(0, kwh.shape[0], 5000)])
     size_on_id = hh.groupby("transformer_id")["meter_id"].transform("size").to_numpy()
     role = np.where(fin_days < args.min_hh_days, "short", "").astype(object)
     role[size_on_id > args.max_households] = "placeholder"
@@ -166,8 +192,11 @@ def clean(args):
                 dips += int((rep & (block[i] < yc)).sum())
                 masked_hd += int(msk.sum())
                 cl[i] = yc
-        hm = np.nanmean(np.where(np.isfinite(block), block, np.nan), axis=1)
-        med = np.nanmedian(hm)
+        # who is heavy / core / churn is decided on days up to the fit end only (fe), as a model trained then would know it
+        with np.errstate(invalid="ignore"), warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            hm = np.nanmean(np.where(np.isfinite(block[:, :fe + 1]), block[:, :fe + 1], np.nan), axis=1)
+            med = np.nanmedian(hm)
         heavy = hm > args.heavy_ratio * med if med > 0 else np.zeros(len(rows), dtype=bool)
         n_heavy[k] = int(heavy.sum())
         for i in np.flatnonzero(heavy):
@@ -179,21 +208,27 @@ def clean(args):
         if len(obs) == 0:
             dropped[tid] = "never observed"
             continue
-        first_obs[k], last_obs[k] = obs.min(), obs.max()
+        first_obs[k], last_obs[k] = obs.min(), obs.max()                 # the whole period: only used to flag days with no data
+        obs_fit = obs[obs <= fe]
+        if len(obs_fit) == 0:
+            dropped[tid] = "not observed before the fit end"
+            continue
+        first_fit, last_fit = obs_fit.min(), obs_fit.max()
         elig = ~system_bad & ~regional[k]
-        elig[:first_obs[k]] = False
-        elig[last_obs[k] + 1:] = False
+        elig[:first_fit] = False
+        elig[last_fit + 1:] = False
         for a, b in excl:
             elig[a:b] = False
         if elig.sum() < 60:
-            dropped[tid] = "fewer than 60 observed days"
+            dropped[tid] = "fewer than 60 observed days before the fit end"
             continue
         pres = fin[:, elig].sum(1) / elig.sum()
         thr_p = min(args.core_presence, 0.8 * float(np.median(pres[~heavy]))) if (~heavy).any() else args.core_presence
-        anyf = fin.any(1)
-        f_day = np.where(anyf, fin.argmax(1), T)
-        l_day = np.where(anyf, T - 1 - fin[:, ::-1].argmax(1), -1)
-        churn = (f_day > first_obs[k] + args.churn_days) | (l_day < last_obs[k] - args.churn_days)       # joined / left during the period
+        fin_fit = fin[:, :fe + 1]
+        anyf = fin_fit.any(1)
+        f_day = np.where(anyf, fin_fit.argmax(1), T)                    # never seen by the fit end -> not core
+        l_day = np.where(anyf, fe - fin_fit[:, ::-1].argmax(1), -1)
+        churn = (f_day > first_fit + args.churn_days) | (l_day < last_fit - args.churn_days)      # joined / left before the fit end
         core = (pres >= thr_p) & ~churn & ~heavy
         for i in np.flatnonzero(~heavy):
             role[rows[i]] = "core" if core[i] else ("churn" if churn[i] else "intermittent")
@@ -227,9 +262,10 @@ def clean(args):
             flags[k, :] |= OUTSIDE
         for a, b in excl:
             flags[k, a:b] |= SYSTEM
+    trailing = args.reference == "trailing"
     good = (flags & (SYSTEM | REGIONAL | OUTSIDE)) == 0
     cover_good = np.where(good & kept[:, None], cover, np.nan)
-    ref = rolling_median(cover_good, 61, 15)                                          # each transformer's own usual coverage
+    ref = rolling_median(cover_good, 61, 15, trailing)                                # each transformer's own usual coverage
     thr = np.where(np.isfinite(ref), args.gap_ratio * ref, args.gap_floor)           # the floor only applies where no own baseline exists
     gap = good & kept[:, None] & ((cover < thr) | (n_rep_core < args.min_reporting))
     flags[gap] |= GAP
@@ -239,7 +275,7 @@ def clean(args):
     # local dips: on RAW core intensity (the glitch cleaner would repair a 1-day outage away), relative to own median,
     # and not shared with coato peers / the country (shared = holiday, weather, collection)
     raw_ok = np.where(usable_in & np.isfinite(inten_raw), inten_raw, np.nan)
-    refm = rolling_median(raw_ok, 29, 15)
+    refm = rolling_median(raw_ok, 29, 15, trailing)
     with np.errstate(invalid="ignore", divide="ignore"):
         rel = raw_ok / refm
     dip = np.isfinite(rel) & (rel < args.dip_ratio)
@@ -281,7 +317,8 @@ def clean(args):
     np.savez_compressed(os.path.join(out, "transformer_clean.npz"), transformer_id=ids.astype(str), coato_code=coato_of,
                         dates=dates.values.astype("datetime64[D]"), intensity=np.where(usable_t, inten, np.nan).astype("float32"),
                         intensity_all=inten.astype("float32"), intensity_raw=inten_raw.astype("float32"),
-                        n_core=n_core, cover=cover.astype("float32"), flags=flags, kept=kept)
+                        n_core=n_core, cover=cover.astype("float32"), flags=flags, kept=kept,
+                        fit_end=np.array(str(dates[fe].date())), reference=np.array(args.reference))
     report(args, out, ids, kt, flags, kept, dates, ev, n_win, T, system_bad, regional, n_hh, role)
     print(f"\nwrote {out} in {(time.time() - t_start) / 60:.1f} min")
 
@@ -408,6 +445,13 @@ def report(args, out, ids, kt, flags, kept, dates, ev, n_win, T, system_bad, reg
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--work-dir", required=True)
+    p.add_argument("--fit-end", default=None,
+                   help="choose heavy consumers, the stable core and churn from days up to this date only (YYYY-MM-DD). Set it to the "
+                        "EARLIEST train cutoff of the forecast run (the first --folds cutoff), so no test-period data shapes the panel. "
+                        "Default: all days (looks ahead)")
+    p.add_argument("--reference", choices=["trailing", "centred"], default="trailing",
+                   help="system-day, regional, gap and dip thresholds compare a day with the median of the days BEFORE it (trailing, "
+                        "causal) or of the days around it (centred, the old behaviour)")
     p.add_argument("--min-households", type=int, default=20, help="transformers with fewer households (with enough readings) are not considered")
     p.add_argument("--max-households", type=int, default=1500)
     p.add_argument("--min-hh-days", type=int, default=30)

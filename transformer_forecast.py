@@ -57,6 +57,14 @@ What the numbers mean (read before trusting them)
   (`bottom_up_nocal` in metrics.csv is the household sum without them). The factors, and what each holiday date did in the data,
   are printed and written to calendar_factors.csv / calendar_holidays.csv. The moving holidays (Ramazon / Qurbon hayit) are typed in
   from memory: check them against the printed effects and fix them with --holidays-csv.
+* No look-ahead in the inputs: a gap still open at a forecast's origin is carried forward from the last known value (for at most
+  --gap-fill days), never interpolated with days after the origin; gaps that closed before the origin are interpolated as before.
+  Run transformer_clean.py with --fit-end <first cutoff> so the stable core is also chosen without test-period data.
+* Rolling folds (--folds): each fold trains up to its own cutoff and forecasts the months after it, so several folds test a
+  full year (summer included) instead of one season. compare reports every fold together and writes metrics_by_fold.csv.
+    python transformer_clean.py --work-dir ~/work/tf_national_v2 --fit-end 2025-03-01
+    python transformer_forecast.py run --work-dir ~/work/tf_national_v2 --stages direct,compare \\
+        --folds 2025-03-01:2024-08-01:2025-01-31,2025-09-01:2024-09-01:2025-04-30 --out-dir ~/work/tf_national_v2/forecast_folds
 * The direct model only has the history you give `prepare` (default: everything in the daily table).  With about
   one year of history it sees one seasonal cycle; give it >= 2 years if you can.
 """
@@ -455,14 +463,63 @@ def origin_grid(wp, panel, args):
     return O[(O % args.origin_stride) == 0]
 
 
+def gap_parts(x):
+    """For each NaN cell of x (n, T): where its NaN run starts (run_a) and the last value before the run (locf).
+    run_a = -1 for observed cells. Used to fill the input window without looking past the origin (causal_input)."""
+    x = np.asarray(x, dtype="float64")
+    n, T = x.shape
+    t = np.broadcast_to(np.arange(T), (n, T))
+    fin = np.isfinite(x)
+    last = np.maximum.accumulate(np.where(fin, t, -1), axis=1)          # last observed index <= t (-1 = none yet)
+    run_a = np.where(fin, -1, last + 1)
+    locf = np.where(last >= 0, np.take_along_axis(x, np.maximum(last, 0), axis=1), np.nan)
+    return run_a, np.where(fin, np.nan, locf)
+
+
 def windows(wp, panel, O):
-    """(transformer index, origin index) of every window whose 90-day input is complete (after gap filling)."""
+    """(transformer index, origin index) of every window whose 90-day input is complete (after gap filling), and whether its
+    60-day target is complete.
+
+    Causal when the panel carries gap_parts (panel.run_a, set by apply_calendar): a gap that ENDS on or before the origin may be
+    interpolated (both ends are known at the origin), as panel.filled does; a gap still open AT the origin may only be carried
+    forward from the last value, and only while it has lasted <= panel.gap days. Without run_a: the old rule (panel.filled,
+    which interpolates a gap at the origin using days after it)."""
     L, H = wp.LOOKBACK, wp.HORIZON
     bad = np.pad(np.cumsum(~np.isfinite(panel.filled), axis=1), ((0, 0), (1, 0)))
-    inp_bad = bad[:, O + 1] - bad[:, O - (L - 1)]
     tgt_bad = bad[:, O + H + 1] - bad[:, O + 1]
-    r_tr, r_o = np.nonzero(inp_bad == 0)
+    run_a = getattr(panel, "run_a", None)
+    if run_a is None:
+        inp_ok = (bad[:, O + 1] - bad[:, O - (L - 1)]) == 0
+    else:
+        a = run_a[:, O]                                                   # (n_tr, len(O)); -1 where the origin day is observed
+        open_ = a >= 0
+        open_len = np.where(open_, O[None, :] - a + 1, 0)
+        upto = np.where(open_, a, O[None, :] + 1)                         # the part before the open gap must be complete
+        lo = np.broadcast_to(O[None, :] - (L - 1), upto.shape)
+        before_ok = (np.take_along_axis(bad, upto, axis=1) - np.take_along_axis(bad, lo, axis=1)) == 0
+        inp_ok = before_ok & (~open_ | ((open_len <= panel.gap) & (a >= 1)))
+    r_tr, r_o = np.nonzero(inp_ok)
     return r_tr, O[r_o], tgt_bad[r_tr, r_o] == 0
+
+
+def causal_input(panel, r_tr, r_o, L):
+    """The 90-day inputs (rows, L) as known AT each origin: interpolated gaps from panel.filled where the gap closed before the
+    origin; a gap still open at the origin carried forward from its last value (if open <= panel.gap days), else NaN."""
+    kin = gather(panel.filled, r_tr, r_o, -(L - 1), L).copy()
+    if getattr(panel, "run_a", None) is None:
+        return kin
+    a = panel.run_a[r_tr, r_o]
+    open_ = a >= 0
+    if not open_.any():
+        return kin
+    k = np.flatnonzero(open_)
+    n_open = r_o[k] - a[k] + 1                                            # days of the gap up to and including the origin
+    col = np.arange(L)[None, :]
+    tail = col >= (L - np.minimum(n_open, L))[:, None]
+    ok = (n_open <= panel.gap) & (a[k] >= 1)
+    val = np.where(ok, panel.locf[r_tr[k], r_o[k]], np.nan)
+    kin[k] = np.where(tail, val[:, None], kin[k])
+    return kin
 
 
 def gather(arr, r_tr, r_o, first, length):
@@ -499,6 +556,8 @@ def calendar_factors(inten, dates, train_end, holidays, min_transformers=30):
     A day's factor = weekday factor x (1 + holiday-class effect).  Everything is estimated on days <= train_end."""
     import warnings
     T = len(dates)
+    train = np.asarray(dates <= pd.Timestamp(train_end))
+    inten = np.where(train[None, :], inten, np.nan)           # nothing after the cutoff, not even inside the centred 7-day mean
     c7 = pd.DataFrame(inten.T).rolling(7, center=True, min_periods=5).mean().to_numpy().T
     with np.errstate(invalid="ignore", divide="ignore"):
         res = inten / c7 - 1
@@ -511,7 +570,6 @@ def calendar_factors(inten, dates, train_end, holidays, min_transformers=30):
     near = np.zeros(T, dtype=bool)
     for i in hol_idx:
         near[max(0, i - 1):i + 2] = True
-    train = np.asarray(dates <= pd.Timestamp(train_end))
     use = train & ~near & np.isfinite(nat)
     eff = np.zeros(7)
     cnt = np.zeros(7, dtype=int)
@@ -566,6 +624,8 @@ def apply_calendar(wp, panel, args, train_cutoff):
                 print(f"  class '{c}': factor {f - 1:+.1%} | {txt}")
     adj = panel.inten / panel.cal[None, :]
     panel.filled = fill_short_gaps(adj, args.gap_fill)
+    panel.run_a, panel.locf = gap_parts(adj)                  # for inputs that do not look past their origin (causal_input)
+    panel.gap = int(args.gap_fill)
     return panel
 
 
@@ -613,7 +673,8 @@ def load_clean_panel(wp, args, hh_meta):
         housing.append(mm.mode().iloc[0] if len(mm) else "Missing")
     panel = SimpleNamespace(ids=ids_s, n_hh=n_core[idx], inten=inten[idx], cover=z["cover"][idx].astype("float64"),
                             housing=np.asarray(housing, dtype=object), coato_of=z["coato_code"].astype(str)[idx].astype(object),
-                            d0=dates[0], n_days=T, hh_rows={t: grp[t] for t in ids_s}, flags=z["flags"][idx])
+                            d0=dates[0], n_days=T, hh_rows={t: grp[t] for t in ids_s}, flags=z["flags"][idx],
+                            fit_end=str(z["fit_end"]) if "fit_end" in z.files else None)
     panel.filled = fill_short_gaps(panel.inten, args.gap_fill)
     print(f"[panel] cleaned panel {os.path.join(cdir, 'transformer_clean.npz')}: {len(ids_s):,} of {len(ids):,} transformers "
           f"({len(np.unique(panel.coato_of))} coatos), core households {int(panel.n_hh.sum()):,} (median {np.median(panel.n_hh):.0f} per transformer), "
@@ -788,17 +849,18 @@ def year_ago(wp, arr, r_tr, r_o, blocks, min_ref_days=20, clip=(0.2, 5.0)):
 # =============================================================================
 # Direct: each transformer is a meter
 # =============================================================================
-def stage_direct(wp, args, world, panel, clim, fc, cutoffs):
+def fit_direct_fold(wp, args, panel, clim, fc, train_cutoff, val_start, val_end, test_end, label):
+    """One fold: windows, features, CatBoost fit with early stopping, test forecasts. Test origins run from train_cutoff + 60
+    days to test_end (None = the last origin). Returns (test arrays, info)."""
     from catboost import CatBoostRegressor
-    train_cutoff, val_start = cutoffs
     L, H = wp.LOOKBACK, wp.HORIZON
     O = origin_grid(wp, panel, args)
     r_tr, r_o, tgt_ok = windows(wp, panel, O)
     pdf = pd.DataFrame({"meter_id": panel.ids[r_tr].astype(str), "consumer_id": np.nan,
                         "origin_date": panel.d0 + pd.to_timedelta(r_o, unit="D"),
                         "coato_code": panel.coato_of[r_tr], "housing_type_id": panel.housing[r_tr]})
-    kin = gather(panel.filled, r_tr, r_o, -(L - 1), L)
-    ktg = gather(panel.filled, r_tr, r_o, 1, H)
+    kin = causal_input(panel, r_tr, r_o, L)               # inputs as known at the origin (no gap filled from later days)
+    ktg = gather(panel.filled, r_tr, r_o, 1, H)            # targets (labels) may use interpolation
     print(f"[direct] {len(pdf):,} windows ({pdf['meter_id'].nunique():,} transformers), "
           f"{tgt_ok.mean():.1%} with a complete 60-day target")
 
@@ -837,9 +899,9 @@ def stage_direct(wp, args, world, panel, clim, fc, cutoffs):
         X = X[feature_cols]
         print(f"[direct] --drop-features removed {len(drop)} feature(s): {drop}")
 
-    train, fit, val, test = wp.make_masks(meta, train_cutoff, val_start)
-    if getattr(args, "val_end", None):
-        fit, val = blocked_validation(meta["origin_date"], val_start, args.val_end, train_cutoff, H)
+    train, fit, val, test = wp.make_masks(meta, train_cutoff, val_start, test_end)
+    if val_end:
+        fit, val = blocked_validation(meta["origin_date"], val_start, val_end, train_cutoff, H)
     reg = wp.regime_keep_mask(meta)                       # the household pipeline's own old/new-regime and excluded-range policy
     train, fit, val = train & tgt_ok & reg, fit & tgt_ok & reg, val & tgt_ok & reg
     print(f"[direct] fit {fit.sum():,} | val {val.sum():,} | train {train.sum():,} | test {test.sum():,} | "
@@ -847,13 +909,13 @@ def stage_direct(wp, args, world, panel, clim, fc, cutoffs):
     print("[direct] origin months  fit: " + month_span(meta["origin_date"][fit]) + "  |  val: "
           + month_span(meta["origin_date"][val]) + "  |  test: " + month_span(meta["origin_date"][test]))
     if not (fit.any() and val.any() and test.any()):
-        raise SystemExit("empty split: check --train-cutoff / --val-start against the dates available "
+        raise SystemExit(f"fold {label}: empty split: check its cutoff / validation dates against the dates available "
                          f"({pdf['origin_date'].min().date()} .. {pdf['origin_date'].max().date()})")
     Y = pd.DataFrame(ktg - base, columns=[f"res_{i}" for i in range(1, H + 1)])
     w_all = {"none": np.ones(len(X)), "sqrt": np.sqrt(n_hh), "linear": n_hh}[args.size_weight]
     w_all = w_all / w_all.mean()
 
-    with stage("direct: CatBoost fit"):
+    with stage(f"direct: CatBoost fit, fold {label}"):
         m = CatBoostRegressor(cat_features=cats, **wp.CATBOOST_PARAMS)
         m.fit(X[fit], Y[fit], eval_set=(X[val], Y[val]), early_stopping_rounds=wp.CATBOOST_EARLY_STOPPING_ROUNDS,
               sample_weight=w_all[fit])
@@ -870,27 +932,77 @@ def stage_direct(wp, args, world, panel, clim, fc, cutoffs):
                   f"validation window and/or --drop-features 'origin_doy*' (date identity lets trees memorise one shared residual per day).")
         m = CatBoostRegressor(cat_features=cats, **dict(wp.CATBOOST_PARAMS, iterations=final, verbose=200))
         m.fit(X[train], Y[train], sample_weight=w_all[train])
-        m.save_model(os.path.join(args.out_dir, "direct_catboost.cbm"))
+        m.save_model(os.path.join(args.out_dir, f"direct_catboost_{label}.cbm"))
 
     scale = panel.n_hh[r_tr][test][:, None].astype(float)
     pred = np.maximum(base[test] + m.predict(X[test]), 0.0) * scale
-    out = dict(transformer_id=panel.ids[r_tr][test].astype(str), origin=r_o[test].astype("int64"),
+    o_test = r_o[test].astype("int64")
+    cal_rows = panel.cal[np.minimum(o_test[:, None] + np.arange(1, H + 1)[None, :], panel.n_days - 1)]
+    out = dict(transformer_id=panel.ids[r_tr][test].astype(str), origin=o_test,
                pred=pred.astype("float32"), thermal=(base[test] * scale).astype("float32"),
                pers30=(feats.loc[test, "level_kwh"].to_numpy() * scale[:, 0]).astype("float32"),
                pers7=(feats.loc[test, "kwh_mean_7d"].to_numpy() * scale[:, 0]).astype("float32"),
                snaive=(snaive[test] * scale).astype("float32"),
+               cal=cal_rows.astype("float32"),                 # this fold's calendar factor on every target day
                n_hh=scale[:, 0].astype("int64"))
-    np.savez_compressed(os.path.join(args.out_dir, "direct_test.npz"), **out)
-    with open(os.path.join(args.out_dir, "direct_info.json"), "w") as fh:
-        json.dump(dict(train_cutoff=train_cutoff, val_start=val_start, val_end=getattr(args, "val_end", None),
-                       include_old=wp.INCLUDE_OLD, old_regime_flag=bool(wp.OLD_REGIME_FLAG), year_ago=not args.no_year_ago,
-                       fit_months=month_span(meta["origin_date"][fit]), val_months=month_span(meta["origin_date"][val]),
-                       best_iteration=int(best), final_iterations=int(final),
-                       features=feature_cols, transformers=int(len(panel.ids)), rows=dict(
-                           fit=int(fit.sum()), val=int(val.sum()), train=int(train.sum()), test=int(test.sum()))), fh, indent=2)
     imp = pd.DataFrame({"feature": feature_cols, "importance": m.get_feature_importance()}).sort_values("importance", ascending=False)
-    print("[direct] top features:\n" + imp.head(12).to_string(index=False))
-    print(f"[direct] saved {int(test.sum()):,} test forecasts (60 days each) -> direct_test.npz")
+    print(f"[direct] fold {label} top features:\n" + imp.head(12).to_string(index=False))
+    info = dict(fold=label, train_cutoff=str(train_cutoff), val_start=str(val_start), val_end=val_end, test_end=test_end,
+                fit_months=month_span(meta["origin_date"][fit]), val_months=month_span(meta["origin_date"][val]),
+                test_months=month_span(meta["origin_date"][test]),
+                best_iteration=int(best), final_iterations=int(final), features=feature_cols,
+                rows=dict(fit=int(fit.sum()), val=int(val.sum()), train=int(train.sum()), test=int(test.sum())))
+    return out, info
+
+
+def parse_folds(args, cutoffs):
+    """--folds 'CUTOFF:VAL_START:VAL_END,...' -> [(cutoff, val_start, val_end, test_end)], sorted by cutoff. Fold i tests origins
+    from its cutoff + 60 days up to the next fold's cutoff + 59 days (the last fold: to the end of the data), so the folds' test
+    origins do not overlap and together run from the first fold's test start to the end. Without --folds: one fold from
+    --train-cutoff / --val-start / --val-end, as before."""
+    if not args.folds:
+        return [(str(cutoffs[0]), str(cutoffs[1]), args.val_end, None)]
+    folds = []
+    for part in [p.strip() for p in args.folds.split(",") if p.strip()]:
+        bits = part.split(":")
+        if len(bits) not in (2, 3):
+            raise SystemExit(f"--folds entry {part!r}: use CUTOFF:VAL_START:VAL_END (or CUTOFF:VAL_START for the plain split)")
+        c, vs, ve = (bits + [None])[:3]
+        folds.append((pd.Timestamp(c), str(pd.Timestamp(vs).date()), str(pd.Timestamp(ve).date()) if ve else None))
+    folds.sort(key=lambda f: f[0])
+    out = []
+    for i, (c, vs, ve) in enumerate(folds):
+        nxt = folds[i + 1][0] + pd.Timedelta(days=59) if i + 1 < len(folds) else None
+        out.append((str(c.date()), vs, ve, str(nxt.date()) if nxt is not None else None))
+    return out
+
+
+def stage_direct(wp, args, world, panel, clim, fc, cutoffs):
+    """The direct model over one or more rolling folds. Each fold re-estimates the calendar factors on its own training days,
+    fits its own model, and forecasts only its own test origins; the forecasts are saved together (direct_test.npz, with a
+    `fold` index and each row's calendar factors)."""
+    folds = parse_folds(args, cutoffs)
+    outs, infos = [], []
+    for i, (c, vs, ve, te) in enumerate(folds):
+        label = f"f{i + 1}"
+        print(f"\n[direct] ===== fold {label}: train cutoff {c} | validation {'(' + vs + ', ' + ve + ']' if ve else 'after ' + vs} | "
+              f"test origins {(pd.Timestamp(c) + pd.Timedelta(days=wp.HORIZON)).date()} .. {te or 'end of data'} =====")
+        apply_calendar(wp, panel, args, c)                     # factors from this fold's training days only
+        out, info = fit_direct_fold(wp, args, panel, clim, fc, c, vs, ve, te, label)
+        out["fold"] = np.full(len(out["origin"]), i, dtype="int16")
+        outs.append(out)
+        infos.append(info)
+    keys = outs[0].keys()
+    allout = {k: np.concatenate([o[k] for o in outs]) for k in keys}
+    np.savez_compressed(os.path.join(args.out_dir, "direct_test.npz"), **allout,
+                        fold_names=np.array([f["fold"] for f in infos]))
+    with open(os.path.join(args.out_dir, "direct_info.json"), "w") as fh:
+        json.dump(dict(include_old=wp.INCLUDE_OLD, old_regime_flag=bool(wp.OLD_REGIME_FLAG), year_ago=not args.no_year_ago,
+                       transformers=int(len(panel.ids)), folds=infos,
+                       # the first fold's numbers at the top level, as older readers of this file expect
+                       **{k: infos[0][k] for k in ("train_cutoff", "val_start", "val_end", "best_iteration", "final_iterations",
+                                                    "features")}), fh, indent=2, default=str)
+    print(f"[direct] saved {len(allout['origin']):,} test forecasts from {len(folds)} fold(s) -> direct_test.npz")
 
 
 # =============================================================================
@@ -968,8 +1080,11 @@ def stage_bottom_up(wp, args, world, panel, clim, fc, hh_meta, kwh):
     meta = hh_meta.iloc[rows].reset_index(drop=True)
     with stage("bottom-up: clean household series"):
         clean = np.empty((len(rows), kwh.shape[1]), dtype="float32")
+        rawfin = np.zeros((len(rows), kwh.shape[1]), dtype=bool)          # which days really had a reading (for open gaps)
         for i, r in enumerate(rows):
-            x = fill_short_gaps(np.asarray(kwh[r], dtype="float64")[None, :], args.hh_gap_fill)[0]
+            x0 = np.asarray(kwh[r], dtype="float64")
+            rawfin[i] = np.isfinite(x0)
+            x = fill_short_gaps(x0[None, :], args.hh_gap_fill)[0]
             clean[i] = wp.clean_recent_readings_for_serving(x)
             if i and i % 20000 == 0:
                 print(f"  cleaned {i:,} / {len(rows):,} households", flush=True)
@@ -980,7 +1095,7 @@ def stage_bottom_up(wp, args, world, panel, clim, fc, hh_meta, kwh):
     res_tr, res_o, res_pred, res_share, res_np = [], [], [], [], []
     for n, o in enumerate(O):
         with stage(f"bottom-up: origin {n + 1}/{len(O)} {panel.d0 + pd.Timedelta(days=int(o)):%Y-%m-%d}"):
-            hist = clean[:, o - (L - 1): o + 1]
+            hist = causal_history(clean[:, o - (L - 1): o + 1], rawfin[:, o - (L - 1): o + 1], args.hh_gap_fill)
             ok = np.isfinite(hist[:, -args.min_recent_days:]).all(axis=1) & (np.isfinite(hist).sum(axis=1) >= args.min_input_days)
             idx = np.flatnonzero(ok)
             if not len(idx):
@@ -1010,6 +1125,24 @@ def stage_bottom_up(wp, args, world, panel, clim, fc, hh_meta, kwh):
                         pred=np.vstack(res_pred).astype("float32"), share=np.concatenate(res_share),
                         n_pred=np.concatenate(res_np), n_hh=panel.n_hh[tr_idx])
     print(f"[bottom-up] saved {len(tr_idx):,} transformer-origin forecasts -> bottomup_test.npz")
+
+
+def causal_history(hist, fin, gap):
+    """hist (n, L) gap-filled + cleaned household histories ending at the origin; fin (n, L) where a reading really existed.
+    A gap still open at the origin (trailing missing days) was interpolated with days AFTER the origin: replace it by the last
+    known value while it has lasted <= gap days, else NaN. Gaps that closed before the origin keep their interpolation."""
+    n, L = hist.shape
+    out = np.array(hist, dtype="float64", copy=True)
+    trail = np.where(fin.any(1), np.argmax(fin[:, ::-1], axis=1), L)    # missing days at the end of the window
+    k = np.flatnonzero(trail > 0)
+    if len(k):
+        col = np.arange(L)[None, :]
+        tail = col >= (L - trail[k])[:, None]
+        keep = (trail[k] <= gap) & (trail[k] < L)
+        last = out[k, np.maximum(L - trail[k] - 1, 0)]
+        val = np.where(keep, last, np.nan)
+        out[k] = np.where(tail, val[:, None], out[k])
+    return out
 
 
 def cutoff_test_start(wp, train_cutoff):
@@ -1090,7 +1223,12 @@ def stage_compare(wp, args, panel):
     day_idx = org[:, None] + np.asarray(horizons)[None, :]
     A = panel.inten[k[:, None], day_idx] * n_hh[:, None]                     # NaN on days that are not usable / not observed
     cal = getattr(panel, "cal", None)
-    calT = cal[day_idx] if cal is not None else np.ones(day_idx.shape)       # calendar factor of every target day
+    if "cal" in d.files:                                       # each fold's own factors, saved with its forecasts
+        calT = d["cal"][i][:, hi].astype(float)
+    else:
+        calT = cal[day_idx] if cal is not None else np.ones(day_idx.shape)   # calendar factor of every target day
+    fold = d["fold"][i] if "fold" in d.files else np.zeros(len(i), dtype=int)
+    fold_names = list(d["fold_names"]) if "fold_names" in d.files else ["f1"]
     P_dir = d["pred"][i][:, hi].astype(float) * calT
     models = {"persistence30": np.repeat(d["pers30"][i][:, None], len(horizons), 1).astype(float) * calT}
     extra = {"persistence7": np.repeat(d["pers7"][i][:, None], len(horizons), 1).astype(float) * calT,
@@ -1118,6 +1256,24 @@ def stage_compare(wp, args, panel):
     band_names = [names[c] for c in range(q)]
 
     allm = {**models, **extra}
+    if len(fold_names) > 1:
+        rows = []
+        for fi, fname in enumerate(fold_names):
+            fm = fold == fi
+            dts = panel.d0 + pd.to_timedelta(day_idx[fm, 0], unit="D")
+            for name, P in allm.items():
+                for hx, h in enumerate(horizons):
+                    w, b_, n = wape_bias(P[fm, hx], A[fm, hx])
+                    rows.append(dict(fold=fname, model=name, horizon=h, wape=w, bias=b_, n=n,
+                                     targets=f"{dts.min():%Y-%m}..{(dts.max() + pd.Timedelta(days=horizons[-1])):%Y-%m}"))
+        ft = pd.DataFrame(rows)
+        os.makedirs(os.path.join(args.out_dir, "results"), exist_ok=True)
+        ft.to_csv(os.path.join(args.out_dir, "results", "metrics_by_fold.csv"), index=False)
+        print("\n=== Pooled WAPE by fold (each fold is tested on its own months; rows: fold, target months) ===")
+        ft["label"] = ft["fold"] + "  " + ft["targets"]
+        for name in [n for n in ("direct", "seasonal_naive", "thermal_baseline", "persistence7", "persistence30") if n in allm]:
+            t = ft[ft["model"] == name].pivot(index="label", columns="horizon", values="wape")
+            print(f"-- {name}\n" + _fmt(t, lambda x: f"{x:6.1%}").to_string())
     tab = score_table(allm, A, tid, day_idx, band, horizons, band_names)
     base = tab[tab["model"] == "persistence30"].set_index(["horizon", "band"])["wape"]
     tab["skill_vs_persistence30"] = [1 - r.wape / base.get((r.horizon, r.band), np.nan) if np.isfinite(r.wape) else np.nan
@@ -1159,7 +1315,8 @@ def stage_compare(wp, args, panel):
     band_tab.to_csv(os.path.join(out_dir, "size_bands.csv"))
 
     print_summary(tab, boot, horizons, band_names, A, models)
-    keep = pd.DataFrame({"transformer_id": tid, "origin_date": panel.d0 + pd.to_timedelta(org, unit="D"), "n_hh": n_hh})
+    keep = pd.DataFrame({"transformer_id": tid, "origin_date": panel.d0 + pd.to_timedelta(org, unit="D"), "n_hh": n_hh,
+                         "fold": [fold_names[int(f)] for f in fold]})
     for hx, h in enumerate(horizons):
         keep[f"actual_t{h}"] = A[:, hx]
         for name, P in allm.items():
@@ -1369,13 +1526,29 @@ def cmd_run(args):
     print(f"[config] source '{source}' | train cutoff {cutoffs[0]} | validation after {cutoffs[1]} | "
           f"test origins from {cutoff_test_start(wp, cutoffs[0]).date()} | normals '{args.normal_mode}' | "
           f"forecast mode '{wp.FORECAST_MODE}' | calendar '{args.calendar}' | stages {','.join(stages)} | outputs {args.out_dir}")
-    print(f"[config] direct: validation {'(' + cutoffs[1] + ', ' + args.val_end + ']' if args.val_end else 'household split'} | "
+    folds = parse_folds(args, cutoffs)
+    if args.folds:
+        print("[config] direct folds: " + " | ".join(
+            f"f{i + 1}: cutoff {c}, validation ({vs}, {ve or c}], test origins {(pd.Timestamp(c) + pd.Timedelta(days=wp.HORIZON)).date()}"
+            f"..{te or 'end'}" for i, (c, vs, ve, te) in enumerate(folds)))
+    print(f"[config] direct: validation {'(' + str(cutoffs[1]) + ', ' + args.val_end + ']' if args.val_end else 'household split'} | "
           f"old regime '{wp.INCLUDE_OLD}'{' + regime_old feature' if wp.OLD_REGIME_FLAG else ''} | "
           f"year-ago features {'off' if args.no_year_ago else 'on'} | final-iters cap {args.final_iters_cap}")
 
     with stage("panel"):
         if source == "clean":
             panel = load_clean_panel(wp, args, hh_meta)
+            first_cut = pd.Timestamp(folds[0][0])
+            fe = getattr(panel, "fit_end", None)
+            if fe is None:
+                print("[causal] WARNING: this cleaned panel was built without --fit-end: its stable core and heavy consumers were "
+                      "chosen with test-period data. Re-run  transformer_clean.py --fit-end " + str(first_cut.date()))
+            elif pd.Timestamp(fe) > first_cut:
+                print(f"[causal] WARNING: the cleaned panel's fit end {fe} is after the first train cutoff {first_cut.date()}: "
+                      f"its stable core used data the first fold's test period should not see. Re-run transformer_clean.py "
+                      f"--fit-end {first_cut.date()}")
+            else:
+                print(f"[causal] cleaned panel fit end {fe} <= first train cutoff {first_cut.date()}: no look-ahead in the core")
         else:
             coato = info["coato"].split(",")[0]
             panel = build_panel(wp, info, hh_meta, kwh, args)
@@ -1497,6 +1670,12 @@ def build_parser():
                    help="direct model: validation = origins in (--val-start, --val-end]; fit = training origins at least 60 days "
                         "away on both sides. Use a block spanning autumn -> spring, e.g. --val-start 2024-09-01 --val-end 2025-04-30. "
                         "Default: the household split (validation from --val-start to the train cutoff, usually one summer)")
+    r.add_argument("--folds", default=None,
+                   help="rolling evaluation: comma list of CUTOFF:VAL_START:VAL_END, one per fold, e.g. "
+                        "'2025-03-01:2024-08-01:2025-01-31,2025-09-01:2024-09-01:2025-04-30'. Each fold trains on origins up to its "
+                        "cutoff (early stopping on its validation block) and forecasts the origins from its cutoff + 60 days up to the "
+                        "next fold's; together the folds test a full year. Overrides --train-cutoff / --val-start / --val-end for the "
+                        "direct model")
     r.add_argument("--include-old", choices=["none", "all", "non_winter"], default=None,
                    help="old-regime (before 2024-08-01) training windows; default: whole_pipeline_v8.INCLUDE_OLD")
     r.add_argument("--old-flag", action="store_true", help="add the feature regime_old (1 for old-regime origins) to the direct model")
