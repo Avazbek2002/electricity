@@ -162,6 +162,14 @@ def clean(args):
     system_bad, regional, reg_rows = national_and_regional(n_rep_raw, n_hh, cidx, len(coatos), dates, args)
     print(f"[masks] system days: {int(system_bad.sum())} of {T}; regional transformer-days: {regional.mean():.2%} "
           f"({len(reg_rows)} coato episodes)")
+    if system_bad.mean() > 0.15:
+        cov_sys = n_rep_raw.sum(0) / n_hh.sum()
+        yr = pd.Series(cov_sys, index=dates).groupby(dates.year).median()
+        print(f"[masks] WARNING: {system_bad.mean():.0%} of days are flagged as national outages. The absolute floor "
+              f"--system-floor {args.system_floor} is probably above this panel's normal coverage (median by year: "
+              + ", ".join(f"{y} {v:.0%}" for y, v in yr.items())
+              + "). Observed-only labels (enriched dataset) lower coverage in the older years; re-run with a floor below "
+              f"those levels, e.g. --system-floor {max(0.1, round(0.6 * float(yr.min()), 2))}")
     excl = [(np.searchsorted(dates, pd.Timestamp(a)), np.searchsorted(dates, pd.Timestamp(b), side="right")) for a, b in wp.EXCLUDE_RANGES]
 
     # ---- 3-5. household cleaning, heavy consumers, stable core, transformer series -------------------------------------
