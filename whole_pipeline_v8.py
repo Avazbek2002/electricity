@@ -178,7 +178,7 @@ What changed versus v3
    Sizes from the 1% run: ~27M trainable windows nationally; a train share of 0.075 keeps ~2M (CatBoost ~5 h per fit on
    65 cores), a test share of 0.01 keeps ~350k (as many as the 1% run tested).
    Run:   python whole_pipeline_v8.py --no-mlflow --set ENRICHED_BUCKETS=None --set ENRICHED_TRAIN_SAMPLE=0.075 \
-            --set ENRICHED_TEST_SAMPLE=0.01 --set ENRICHED_WORKERS=8 --set ENRICHED_CACHE_DIR="'$HOME/work/enriched_cache'" \
+            --set ENRICHED_TEST_SAMPLE=0.01 --set ENRICHED_WORKERS=4 --set ENRICHED_CACHE_DIR="'$HOME/work/enriched_cache'" \
             --set OUTPUT_DIR="'$HOME/work/hh_national'" train
 
 Experiment tracking, serving model, registry, monitoring (MLflow; optional, off unless a tracking URI is set)
@@ -258,7 +258,8 @@ MIN_TARGET_DAYS = 30           # a window is kept if this many of its 60 target 
 TRAIN_MIN_TARGET_DAYS = 54     # a window is TRAINED on if this many target days are observed; on its missing days the label is
                                # "no correction to the thermal baseline" (residual 0), never a made-up consumption value
 # --- national scale (all customers: ENRICHED_BUCKETS = None) ---
-ENRICHED_WORKERS = 8           # districts read in parallel (separate processes; each holds one district's customers x days)
+ENRICHED_WORKERS = 4           # districts read in parallel (separate processes; each holds one district's customers x days,
+                               # ~1-3 GB for a big city district; the log prints every worker's peak)
 ENRICHED_TRAIN_SAMPLE = None   # None = keep every window. A share (e.g. 0.075): keep that random share (stable hash of customer +
                                # origin) of the TRAINABLE windows (origin <= TRAIN_CUTOFF, >= TRAIN_MIN_TARGET_DAYS observed),
                                # and drop the windows nothing uses (untrainable pre-cutoff, the embargo after the cutoff)
@@ -688,7 +689,8 @@ def _enriched_district_worker(code, cfg):
     cols = ["customer_key", "date", "kwh", "label_state", "housing_type_id", "t_mean", "t_min", "t_max"]
     labels = pa.array(list(cfg["labels"]), type=pa.string())
     key_of, keys = {}, []
-    C, D, V = [], [], []
+    cap = 4096                                               # rows of M allocated so far (doubles as customers appear)
+    M = np.full((cap, T), np.nan, dtype=np.float32)          # customer x day kWh, written batch by batch
     h_day = np.full(1024, -1, dtype=np.int64)                # latest day with a housing type, per customer (grows)
     h_val = np.full(1024, np.nan)
     wt = np.full((3, T), np.nan)
@@ -719,6 +721,11 @@ def _enriched_district_worker(code, cfg):
             grow = max(len(keys), 2 * len(h_day)) - len(h_day)
             h_day = np.r_[h_day, np.full(grow, -1, dtype=np.int64)]
             h_val = np.r_[h_val, np.full(grow, np.nan)]
+        if len(keys) > cap:
+            new = np.full((max(len(keys), 2 * cap), T), np.nan, dtype=np.float32)
+            new[:cap] = M
+            M, cap = new, len(new)
+            del new
         hm = np.isfinite(hv)
         if hm.any():
             hc_, hd_, hv_ = c[hm], day[hm], hv[hm]
@@ -731,20 +738,15 @@ def _enriched_district_worker(code, cfg):
         kwh = b.column("kwh")
         ok = pc.and_(pc.fill_null(pc.is_in(b.column("label_state"), value_set=labels), False), pc.is_valid(kwh))
         ok = ok.to_numpy(zero_copy_only=False)
-        C.append(c[ok])
-        D.append(day[ok].astype(np.int32))
-        V.append(kwh.to_numpy(zero_copy_only=False)[ok].astype(np.float32))
+        M[c[ok], day[ok]] = kwh.to_numpy(zero_copy_only=False)[ok].astype(np.float32)
+        del b, de, inv, c, day, ok, kwh, hv
     out = dict(code=str(code), customers=0, candidates=0, passed=0, seconds=0.0, pdf=None, kin=None, ktg=None,
                seg=None, weather=None)
     if not keys:
         out["seconds"] = _time.time() - t0
         return out
     n = len(keys)
-    c, day, v = np.concatenate(C), np.concatenate(D), np.concatenate(V)
-    del C, D, V
-    M = np.full((n, T), np.nan, dtype=np.float32)
-    M[c, day] = v
-    del c, day, v
+    M = M[:n]                                                # a view: no copy
     house = h_val[:n]                                       # housing type: the customer's latest known value
     has_obs = np.isfinite(M).any(axis=1)                     # customers with no kept day are counted, not windowed
     out["customers"] = int(has_obs.sum())
@@ -753,30 +755,47 @@ def _enriched_district_worker(code, cfg):
     out["weather"] = pd.DataFrame({"coato_id": str(code), "d": dates[have_w], "t": wt[0, have_w], "tmin": wt[1, have_w],
                                    "tmax": wt[2, have_w]})
 
-    # staggered origin grid per customer, then the window rules from prefix counts of observed days
+    # staggered origin grid per customer, then the window rules from prefix counts of observed days, in blocks of
+    # customers so the count matrix never covers the whole district
     crc = np.array([zlib.crc32(k.encode()) for k in keys], dtype=np.uint64)
     K = (T - 1 - H - (L - 1)) // S + 1
-    o = (L - 1) + (crc % S).astype(np.int64)[:, None] + S * np.arange(K)[None, :]
-    r = np.broadcast_to(np.arange(n)[:, None], o.shape)
-    inside = o <= T - 1 - H
-    r, o = r[inside], o[inside]
-    cnt = np.pad(np.cumsum(np.isfinite(M), axis=1, dtype=np.int32), ((0, 0), (1, 0)))
-    n_in = cnt[r, o + 1] - cnt[r, o - L + 1]
-    n_rec = cnt[r, o + 1] - cnt[r, o - cfg["recent_window"] + 1]
-    n_tg = cnt[r, o + H + 1] - cnt[r, o + 1]
-    del cnt
-    keep = (n_in >= cfg["min_input"]) & (n_rec >= cfg["min_recent"]) & (n_tg >= cfg["min_target"])
-    out["candidates"], out["passed"] = int(len(r)), int(keep.sum())
-    if cfg["train_sample"] is not None or cfg["test_sample"] is not None:
-        cut = int((pd.Timestamp(cfg["cutoff"]) - d0).days)
-        u = ((crc[r] * np.uint64(2654435761) + o.astype(np.uint64) * np.uint64(2246822519)) % np.uint64(2 ** 32)) / 2.0 ** 32
-        p_tr = 1.0 if cfg["train_sample"] is None else float(cfg["train_sample"])
-        p_te = 1.0 if cfg["test_sample"] is None else float(cfg["test_sample"])
-        keep &= ((o <= cut) & (n_tg >= cfg["train_min_target"]) & (u < p_tr)) | ((o >= cut + H) & (u < p_te))
-    r, o, n_tg = r[keep], o[keep], n_tg[keep]
+    sampling = cfg["train_sample"] is not None or cfg["test_sample"] is not None
+    cut = int((pd.Timestamp(cfg["cutoff"]) - d0).days)
+    p_tr = 1.0 if cfg["train_sample"] is None else float(cfg["train_sample"])
+    p_te = 1.0 if cfg["test_sample"] is None else float(cfg["test_sample"])
+    R, O, NT, KIN, KTG = [], [], [], [], []
+    blk = int(cfg.get("block", 10000))
+    for a in range(0, n, blk):
+        b_ = min(n, a + blk)
+        o = (L - 1) + (crc[a:b_] % S).astype(np.int64)[:, None] + S * np.arange(K)[None, :]
+        r = np.broadcast_to(np.arange(a, b_)[:, None], o.shape)
+        inside = o <= T - 1 - H
+        r, o = r[inside], o[inside]
+        cnt = np.zeros((b_ - a, T + 1), dtype=np.int16)
+        np.cumsum(np.isfinite(M[a:b_]), axis=1, dtype=np.int16, out=cnt[:, 1:])
+        rl = r - a
+        n_in = cnt[rl, o + 1] - cnt[rl, o - L + 1]
+        n_rec = cnt[rl, o + 1] - cnt[rl, o - cfg["recent_window"] + 1]
+        n_tg = cnt[rl, o + H + 1] - cnt[rl, o + 1]
+        del cnt, rl
+        keep = (n_in >= cfg["min_input"]) & (n_rec >= cfg["min_recent"]) & (n_tg >= cfg["min_target"])
+        out["candidates"] += int(len(r))
+        out["passed"] += int(keep.sum())
+        if sampling:
+            u = ((crc[r] * np.uint64(2654435761) + o.astype(np.uint64) * np.uint64(2246822519)) % np.uint64(2 ** 32)) / 2.0 ** 32
+            keep &= ((o <= cut) & (n_tg >= cfg["train_min_target"]) & (u < p_tr)) | ((o >= cut + H) & (u < p_te))
+        r, o, n_tg = r[keep], o[keep], n_tg[keep]
+        if len(r):
+            R.append(r), O.append(o), NT.append(n_tg)
+            KIN.append(M[r[:, None], o[:, None] + np.arange(-(L - 1), 1)[None, :]])
+            KTG.append(M[r[:, None], o[:, None] + np.arange(1, H + 1)[None, :]])
+    r = np.concatenate(R) if R else np.zeros(0, dtype=np.int64)
+    o = np.concatenate(O) if O else np.zeros(0, dtype=np.int64)
+    n_tg = np.concatenate(NT) if NT else np.zeros(0, dtype=np.int16)
     if len(r):
-        out["kin"] = M[r[:, None], o[:, None] + np.arange(-(L - 1), 1)[None, :]]
-        out["ktg"] = M[r[:, None], o[:, None] + np.arange(1, H + 1)[None, :]]
+        out["kin"] = np.concatenate(KIN)
+        out["ktg"] = np.concatenate(KTG)
+        del KIN, KTG
         kk = np.asarray(keys, dtype=object)[r]
         out["pdf"] = pd.DataFrame({"meter_id": kk.astype(str), "consumer_id": kk.astype(str),
                                    "origin_date": d0 + pd.to_timedelta(o, unit="D"), "coato_code": str(code),
@@ -807,7 +826,39 @@ def _enriched_district_worker(code, cfg):
         out["seg"] = pd.DataFrame(rows, columns=["meter_id", "n_obs_days", "log_median_kwh", "thermal_share", "r2",
                                                  "seasonality_strength"]).set_index("meter_id")
     out["seconds"] = _time.time() - t0
+    try:
+        import resource
+        out["peak_gb"] = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 2 ** 20     # Linux: kB
+    except Exception:                                        # noqa: BLE001
+        out["peak_gb"] = float("nan")
+    out["rows_customers"] = n
     return out
+
+
+def _memory_limit_gb():
+    """The container's memory limit (cgroup v2 or v1), else the machine's RAM; None if unknown."""
+    for p in ("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"):
+        try:
+            v = open(p).read().strip()
+            if v.isdigit() and int(v) < 2 ** 60:
+                return int(v) / 2 ** 30
+        except OSError:
+            pass
+    try:
+        return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / 2 ** 30
+    except (ValueError, OSError, AttributeError):
+        return None
+
+
+def _rss_gb():
+    try:
+        with open("/proc/self/status") as fh:
+            for line in fh:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) / 2 ** 20
+    except OSError:
+        pass
+    return float("nan")
 
 
 def extract_windows_enriched():
@@ -852,6 +903,8 @@ def extract_windows_enriched():
           f"labels {ENRICHED_LABELS} | stride {WINDOW_STRIDE} | train sample {ENRICHED_TRAIN_SAMPLE} | test sample "
           f"{ENRICHED_TEST_SAMPLE} | segment features from {'full history to ' + TRAIN_CUTOFF if seg_full else 'the windows'} | "
           f"{ENRICHED_WORKERS} worker(s)")
+    lim = _memory_limit_gb()
+    print(f"[memory] container limit {'unknown' if lim is None else f'{lim:.0f} GB'} | this process {_rss_gb():.1f} GB now")
     cache = None
     if ENRICHED_CACHE_DIR:
         sig = hashlib.sha1(json.dumps({k: v for k, v in cfg.items() if k != "here"}, sort_keys=True,
@@ -885,11 +938,14 @@ def extract_windows_enriched():
         results.append(res)
         done_n[0] += 1
         k = done_n[0]
-        if k % 10 == 0 or k == len(todo):
+        if k % 10 == 0 or k == len(todo) or k <= 3:
             el = _time.time() - t0
             nw = sum(len(x["pdf"]) for x in results if x["pdf"] is not None)
+            peak = max((x.get("peak_gb", 0) or 0) for x in results)
             print(f"[windows] {k}/{len(todo)} districts read: {sum(x['customers'] for x in results):,} customers, "
-                  f"{nw:,} windows kept; {el / 60:.1f} min, about {el / k * (len(todo) - k) / 60:.1f} min left", flush=True)
+                  f"{nw:,} windows kept; {el / 60:.1f} min, about {el / k * (len(todo) - k) / 60:.1f} min left | memory: "
+                  f"largest worker peak {peak:.1f} GB (district of {max(x.get('rows_customers', 0) for x in results):,} "
+                  f"customers), main process {_rss_gb():.1f} GB", flush=True)
 
     if todo and ENRICHED_WORKERS > 1:
         ctx = mp.get_context("spawn")                     # no fork: the S3 client and its threads must not be copied
