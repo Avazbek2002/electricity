@@ -8,3 +8,5 @@ catboost
 xgboost
 scikit-learn
 pytest
+interpret-core
+joblib

@@ -3,10 +3,8 @@ import importlib.util
 import os
 import sys
 import time
-import zlib
 
 import numpy as np
-import pandas as pd
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 for _p in (os.path.join(os.path.dirname(HERE), "core"), os.path.dirname(HERE)):
@@ -15,6 +13,7 @@ for _p in (os.path.join(os.path.dirname(HERE), "core"), os.path.dirname(HERE)):
 
 from harness.contract import HORIZON, Panel                                 # noqa: E402
 from harness.data import MISSING, read_district, restore_credentials, scrub_credentials  # noqa: E402
+from harness.weather import district_weather, issue_index                       # noqa: E402
 
 REFERENCE = "persistence30_ref"                     # scored next to every model, on the same households and days
 
@@ -60,7 +59,6 @@ def _groups(network, code):
 def district_worker(code, cfg):
     t0 = time.time()
     import whole_pipeline_v8 as wp
-    from household_nlinear import _quiet
     L, H = wp.LOOKBACK, HORIZON
     restore_credentials()                                           # this worker may have hidden them for an earlier district
     D = read_district(code, cfg["roots"], cfg["start"], cfg["end"], cfg["labels"])
@@ -69,7 +67,6 @@ def district_worker(code, cfg):
         return res
     M, wt, dates = D["M"], D["wt"], D["dates"]
     T = M.shape[1]
-    d0 = dates[0]
     origins = np.asarray(cfg["origins"], dtype=np.int64)           # day indices from cfg["start"]
     origins = origins[(origins >= L - 1) & (origins + H <= T - 1)]
     hz = np.asarray(cfg["horizons"]) - 1
@@ -77,25 +74,7 @@ def district_worker(code, cfg):
     oi_of = {int(o): i for i, o in enumerate(cfg["origins"])}
 
     # weather: climate normals and the simulated 10-day forecast, exactly as household_nlinear / node_syswape build them
-    have = np.isfinite(wt).any(axis=0)
-    wdf = pd.DataFrame({"coato_id": str(code), "d": dates[have], "t": wt[0, have], "tmin": wt[1, have], "tmax": wt[2, have]})
-    od = np.arange(L - 1, T - H)
-    with _quiet():
-        clim = wp.build_climate(wdf)
-        u_fc = pd.DataFrame({"coato_code": str(code), "origin_date": d0 + pd.to_timedelta(od, unit="D")})
-        seed = int(cfg["seed"]) + zlib.crc32(str(code).encode()) % 1_000_003
-        t_obs, _, _ = wp.lookup_weather(u_fc, clim, "all")
-        t_fc = wp.simulate_forecast(u_fc, t_obs[:, L:], seed=seed)
-        K = wp.FORECAST_DAYS
-        fc = pd.DataFrame({"coato_id": str(code), "issue_date": np.repeat(u_fc["origin_date"].to_numpy(), K),
-                           "lead_day": np.tile(np.arange(1, K + 1), len(u_fc)), "t_fc": t_fc.reshape(-1)})
-        fc["issue_date"] = pd.to_datetime(fc["issue_date"])
-        grid = wp.build_forecast_grid(fc, clim)
-        tmin_obs, _, tmax_obs, _ = wp.lookup_minmax(u_fc, clim, "all")
-        tmin_fc, tmax_fc = wp.simulate_forecast_minmax(u_fc, t_fc, tmin_obs[:, L:], tmax_obs[:, L:], seed=seed)
-        fc["t_fc_min"], fc["t_fc_max"] = tmin_fc.reshape(-1), tmax_fc.reshape(-1)
-        grid_mm = dict(min=wp.build_forecast_grid(fc, clim, col="t_fc_min"), max=wp.build_forecast_grid(fc, clim, col="t_fc_max"))
-    del fc, t_obs, t_fc
+    clim, grid, grid_mm = district_weather(code, wt, dates, cfg["seed"], wp)
 
     groups = _groups(D["network"], code)
     models = [cfg["model_name"], REFERENCE]
@@ -119,7 +98,7 @@ def district_worker(code, cfg):
         if not len(elig):
             continue
         lo = max(0, o - W + 1)
-        gi = int((np.datetime64(dates[o].date(), "D") - np.datetime64(clim.start, "D")).astype(int))
+        gi = issue_index(clim, dates[o])
         g1 = np.full_like(grid, np.nan)
         g1[:, gi] = grid[:, gi]                                     # only the forecast issued on this origin
         gm = {k: np.full_like(v, np.nan) for k, v in grid_mm.items()}

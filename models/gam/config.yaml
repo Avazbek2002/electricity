@@ -1,0 +1,21 @@
+family: gam
+# training rows: household x origin x knot horizon (1, 2, 3, 5, 7, 10, 14, 21, 30, 45, 60)
+household_share: 0.005           # stable hash share of households used for training (0.5% ~ 40k nationally)
+origin_step: 28                  # days between training origins (staggered across districts)
+max_rows: 4000000                # random cap on training rows
+history_days: 730
+min_level: 0.2                   # kWh/day: lower levels are not trained on; predict persistence for them
+fit_coatos: []                   # [] = every district; a list for quick runs
+# EBM
+interactions:                    # explicit pairs; [] -> auto_interactions strongest pairs
+  - [temp, log_level]
+  - [temp, housing]
+  - [temp, h]
+  - [doy, h]
+  - [r7_30, h]
+auto_interactions: 10
+outer_bags: 4
+max_bins: 256
+learning_rate: 0.015
+max_rounds: 5000
+n_jobs: 16                       # EBM fitting threads (the server has 64 cores)

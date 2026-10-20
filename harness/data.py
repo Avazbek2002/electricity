@@ -98,7 +98,11 @@ def read_district(code, roots, start, end, labels):
                 if col in cols:
                     np.fmax.at(wt[i], day, np.asarray(bt.column(col).to_numpy(zero_copy_only=False), dtype=float))
             if "housing_type_id" in cols:
-                hv = pd.to_numeric(pd.Series(bt.column("housing_type_id").to_pylist()), errors="coerce").to_numpy(float)
+                hcol = bt.column("housing_type_id")
+                try:
+                    hv = pc.cast(hcol, pa.float64()).to_numpy(zero_copy_only=False)
+                except (pa.ArrowInvalid, pa.ArrowNotImplementedError):
+                    hv = pd.to_numeric(pd.Series(hcol.to_pylist()), errors="coerce").to_numpy(float)
                 m = np.isfinite(hv) & (day >= hday[c])
                 hday[c[m]], house[c[m]] = day[m], hv[m]
             for j, col in enumerate(("transformer_id", "feeder_id", "substation_id")):

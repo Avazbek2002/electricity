@@ -10,7 +10,6 @@ import json
 import multiprocessing as mp
 import os
 import shutil
-import sys
 import time
 
 import pandas as pd
