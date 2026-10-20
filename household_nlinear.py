@@ -146,6 +146,28 @@ def design(wp, feats, ly, kin, level, n_hist):
     return X, names
 
 
+def series_acf_sums(M, lags, min_level, smooth_days=31):
+    """Pooled autocorrelation sums of the customers' daily series, observed days only (EDA).
+    Two versions: 'level' = kWh / the customer's mean - 1 (seasonal swings included) and 'short' = kWh / its centred
+    31-day mean - 1 (slow seasonal swings removed: what is left is the weekly and day-to-day structure).
+    -> {version: {lag: [n, sum_a, sum_b, sum_aa, sum_bb, sum_ab]}}; Pearson r = combine these over districts."""
+    with _warn_off():
+        mu = np.nanmean(M, axis=1)
+        lvl = (M / np.where(mu > min_level, mu, np.nan)[:, None] - 1.0).astype(np.float32)
+        roll = pd.DataFrame(M.T).rolling(smooth_days, center=True, min_periods=smooth_days // 3).mean().to_numpy().T
+        sht = (M / np.where(roll > min_level, roll, np.nan) - 1.0).astype(np.float32)
+    out = {}
+    for name, Y in (("level", lvl), ("short", sht)):
+        d = {}
+        for k in lags:
+            a, b = Y[:, :-k], Y[:, k:]
+            m = np.isfinite(a) & np.isfinite(b)
+            av, bv = a[m].astype(np.float64), b[m].astype(np.float64)
+            d[int(k)] = np.array([m.sum(), av.sum(), bv.sum(), (av * av).sum(), (bv * bv).sum(), (av * bv).sum()])
+        out[name] = d
+    return out
+
+
 # =============================================================================
 # One district (worker process)
 # =============================================================================
@@ -164,6 +186,8 @@ def district_worker(code, cfg):
         res["seconds"] = time.time() - t0
         return res
     res["customers"] = int(np.isfinite(M).any(axis=1).sum())
+    if cfg.get("acf_lags"):                                          # EDA hook (feature_autocorr.py); off in training
+        res["acf"] = series_acf_sums(M, cfg["acf_lags"], cfg["min_level"])
     dates = d0 + pd.to_timedelta(np.arange(T), unit="D")
     have = np.isfinite(wt).any(axis=0)
     wdf = pd.DataFrame({"coato_id": str(code), "d": dates[have], "t": wt[0, have], "tmin": wt[1, have], "tmax": wt[2, have]})
@@ -244,6 +268,14 @@ def district_worker(code, cfg):
         ok = np.isfinite(lev) & (lev > cfg["min_level"])
         levs = np.where(ok, lev, 1.0)
         X, names = design(wp, feats, ly, kin, levs, L)
+        if cfg.get("dump_rate"):                                     # EDA hook: a sample of training rows as fed to the model
+            ds_ = train & ok & (u < cfg["dump_rate"])
+            if ds_.any():
+                hz = np.array(cfg.get("dump_horizons", (1, 7, 14, 30, 60))) - 1
+                with np.errstate(invalid="ignore", divide="ignore"):
+                    yr = np.where(np.isfinite(ktg[ds_][:, hz]), ktg[ds_][:, hz] / levs[ds_][:, None] - 1.0, np.nan)
+                res.setdefault("dump_X", []).append(X[ds_].astype(np.float32))
+                res.setdefault("dump_y", []).append(yr.astype(np.float32))
         obs = np.isfinite(ktg)
         with np.errstate(invalid="ignore", divide="ignore"):
             y_ratio = np.clip(ktg / levs[:, None] - 1.0, -1.0, 4.0)
