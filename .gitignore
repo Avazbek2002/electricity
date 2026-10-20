@@ -1,0 +1,16 @@
+# python / notebooks
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+*.egg-info/
+# training side files
+catboost_info/
+mlruns/
+# outputs: keep them under ~/work, not in the repo
+outputs/
+*.npz
+*.npy
+*.parquet
+# credentials
+*_env.sh
+.env

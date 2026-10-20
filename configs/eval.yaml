@@ -1,0 +1,50 @@
+# Evaluation harness settings (evaluate.py). Fixed before any holdout run; change them only between holdout periods.
+data:
+  start: "2022-01-01"
+  labels: [complete_observed]            # HH-GAP-001-A1: only observed one-day clean kWh is an input or an actual
+  history_days: 730                      # days of history each panel carries (year-ago inputs need >= 425)
+  dev:                                   # developer zone: everything I may look at
+    uri: s3://phase1/electricity/_staging/household-enriched-v14-nat-b2c-20261017-8e1414/
+    env_prefix: ""                       # my normal key (AWS_ACCESS_KEY_ID, ...)
+    end: "2026-06-29"
+  vault:                                 # holdout: the next data release, read only by evaluate.py
+    uri: null                            # set when the data owner has built it, e.g. s3://phase1/electricity/_vault/household-enriched-v15/
+    env_prefix: VAULT_                   # its own key: VAULT_AWS_ACCESS_KEY_ID, VAULT_AWS_SECRET_ACCESS_KEY, VAULT_S3_ENDPOINT
+    env_file: ~/work/vault_env.sh        # holds those three lines; never sourced in notebooks
+    start: "2026-06-30"
+    end: null                            # last day in the vault release
+
+modes:                                   # origins: every household is forecast from the same dates
+  validate:                              # tuning and model choice, unlimited
+    cutoff: "2025-01-31"
+    train_val: ["2024-08-01", "2025-01-31"]
+    origins: {first: "2025-04-01", last: "2025-06-30", step: 14}
+  dev-test:                              # sanity check on the period already used for comparisons (not a fair final test)
+    cutoff: "2025-09-01"
+    train_val: ["2024-09-01", "2025-04-30"]
+    origins: {first: "2025-10-31", last: "2026-04-30", step: 14}
+  holdout:                               # the one honest score per model version
+    cutoff: "2026-04-30"
+    train_val: ["2025-08-01", "2026-02-28"]
+    origins: {first: "2026-06-30", last: null, step: 7}   # last: the vault's end minus 60 days
+    period: "2026-H2"                    # budget is counted per period
+
+scoring:
+  horizons: [1, 7, 14, 30, 60]
+  min_households: 10                     # nodes with fewer scored households per day are not summarised
+  headline: {level: feeder, stat: pooled, horizons: [7, 30]}
+
+budget:                                  # holdout looks
+  per_commit: 1
+  per_month: 2
+
+mlflow:
+  enabled: true
+  uri: null                              # null: MLFLOW_TRACKING_URI, else a local store at ~/work/eval/mlruns
+  experiment: electricity/eval
+  registered_model: electricity_household_forecast
+
+run:
+  out_dir: ~/work/eval
+  workers: 4
+  block: 20000                           # households per predict call

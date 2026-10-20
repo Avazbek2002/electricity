@@ -1,93 +1,122 @@
-# electrcity
+# electricity
 
+Household electricity forecasting for Uzbekistan (national enriched dataset v1.4): models, analysis scripts and a
+personal hidden-test harness that scores every model the same way.
 
-
-## Getting started
-
-To make it easy for you to get started with GitLab, here's a list of recommended next steps.
-
-Already a pro? Just edit this README.md and make it your own. Want to make it easy? [Use the template at the bottom](#editing-this-readme)!
-
-## Add your files
-
-* [Create](https://docs.gitlab.com/user/project/repository/web_editor/#create-a-file) or [upload](https://docs.gitlab.com/user/project/repository/web_editor/#upload-a-file) files
-* [Add files using the command line](https://docs.gitlab.com/topics/git/add_files/#add-files-to-a-git-repository) or push an existing Git repository with the following command:
+## Layout
 
 ```
-cd existing_repo
-git remote add origin https://gitlab.gpu.uz/a.isroilov/electrcity.git
-git branch -M main
-git push -uf origin main
+evaluate.py            one command: fit a model, forecast every household from the same origins, score, log
+configs/eval.yaml      data zones, modes (validate / dev-test / holdout), headline metric, budget, MLflow
+harness/               the evaluation harness
+  contract.py            the Model interface (fit / load / predict) and the Panel predict receives
+  data.py                reads one district (developer zone + vault) into a customer x day matrix
+  runner.py              per district: as-of panels per origin -> predict -> node sums (worker processes)
+  scoring.py             system WAPE per level, household MAE, headline
+  tracking.py            git guard, vault look budget, MLflow + local CSVs
+  cli.py                 the evaluate.py command line
+models/<name>/         one folder per model: model.py (class Model), config.yaml, NOTES.md
+  nlinear_x/             NLinear with weather inputs (trains through core/household_nlinear.py)
+  persistence30/         baseline: mean of the last 30 observed days
+  persistence7/          baseline: mean of the last 7 observed days
+core/                  shared code (imported by everything else)
+  whole_pipeline_v8.py   features, weather, CatBoost / XGBoost household pipeline
+  enriched_io.py         bounded reads of the enriched dataset
+  household_nlinear.py   NLinear training on every customer (also a CLI)
+  node_syswape.py        bottom-up system WAPE per transformer / feeder / substation (also a CLI)
+  transformer_forecast.py, process_raw.py   transformer-level pipeline, raw-data processing
+scripts/analysis/      EDA and checks (hierarchy, feeders, autocorrelation, ...)
+scripts/transformer/   transformer-level experiments
+tests/                 harness tests (a probe model checks what predict can see)
 ```
 
-## Integrate with your tools
+## The evaluation harness
 
-* [Set up project integrations](https://gitlab.gpu.uz/a.isroilov/electrcity/-/settings/integrations)
+```bash
+source ~/work/ec_env.sh
+python evaluate.py --model nlinear_x --mode validate        # tuning and model choice: unlimited
+python evaluate.py --model nlinear_x --mode dev-test        # sanity check on Nov 2025 - Apr 2026 (already seen)
+python evaluate.py --model nlinear_x --mode holdout --register   # the honest score: clean git tree, budgeted
+python evaluate.py --model persistence30 --mode dev-test --coatos 03202 --allow-dirty   # quick check, one district
+```
 
-## Collaborate with your team
+| Mode | Training cutoff | Origins (every household, same dates) | Looks |
+|---|---|---|---|
+| `validate` | 2025-01-31 | 2025-04-01 .. 2025-06-30, every 14 days | unlimited |
+| `dev-test` | 2025-09-01 | 2025-10-31 .. 2026-04-30, every 14 days | unlimited, logged |
+| `holdout` | 2026-04-30 | the vault (next data release), every 7 days | 1 per commit, 2 per month |
 
-* [Invite team members and collaborators](https://docs.gitlab.com/user/project/members/)
-* [Create a new merge request](https://docs.gitlab.com/user/project/merge_requests/creating_merge_requests/)
-* [Automatically close issues from merge requests](https://docs.gitlab.com/user/project/issues/managing_issues/#closing-issues-automatically)
-* [Enable merge request approvals](https://docs.gitlab.com/user/project/merge_requests/approvals/)
-* [Set auto-merge](https://docs.gitlab.com/user/project/merge_requests/auto_merge/)
+What a run does:
+1. **Guard**: records the git commit; holdout refuses uncommitted changes and checks the look budget (`runs.csv`).
+2. **Fit** (main process) on the developer zone up to the cutoff + 60 days; cached per model, commit and cutoff.
+3. **Predict** (worker per district): for each origin, the households passing the input rules get a `Panel` with
+   history up to the origin and the forecast issued that day. S3 keys are removed from the worker before the model runs.
+4. **Score**: forecasts and actuals summed per transformer, feeder, substation, district and the country (system WAPE),
+   household MAE; a 30-day persistence reference is scored on the same households and days.
+5. **Log**: run folder (`summary.csv`, `by_size.csv`, `mae.csv`, `nodes.csv`, `run.json`), `runs.csv`,
+   `leaderboard.csv`, and MLflow.
 
-## Test and Deploy
+Headline metric (fixed in `configs/eval.yaml`): feeder system WAPE, pooled, mean of 7 and 30 days.
 
-Use the built-in continuous integration in GitLab.
+### Adding a model
 
-* [Get started with GitLab CI/CD](https://docs.gitlab.com/ci/quick_start/)
-* [Analyze your code for known vulnerabilities with Static Application Security Testing (SAST)](https://docs.gitlab.com/user/application_security/sast/)
-* [Deploy to Kubernetes, Amazon EC2, or Amazon ECS using Auto Deploy](https://docs.gitlab.com/topics/autodevops/requirements/)
-* [Use pull-based deployments for improved Kubernetes management](https://docs.gitlab.com/user/clusters/agent/)
-* [Set up protected environments](https://docs.gitlab.com/ci/environments/protected_environments/)
+```python
+# models/my_model/model.py
+from harness.contract import BaseModel, HORIZON
 
-***
+class Model(BaseModel):
+    def fit(self, spec, artifacts_dir):      # spec.roots, spec.cutoff, spec.data_end, spec.val_start/val_end
+        ...                                   # train on the developer zone only; save to artifacts_dir
+    def load(self, artifacts_dir):
+        ...
+    def predict(self, panel):                 # panel.kwh (n, days up to origin), panel.weather, panel.pipeline, ...
+        return forecasts                      # (panel.n, 60) kWh
+```
+Add `config.yaml` (`family:` plus hyperparameters) and `NOTES.md`, commit, run `validate`.
 
-# Editing this README
+### The vault (holdout)
 
-When you're ready to make this README your own, just edit this file and use the handy template below (or feel free to structure it however you want - this is just a starting point!). Thanks to [makeareadme.com](https://www.makeareadme.com/) for this template.
+The data owner builds the next enriched release into a separate prefix with its own read key. Put the key in
+`~/work/vault_env.sh` (`VAULT_AWS_ACCESS_KEY_ID`, `VAULT_AWS_SECRET_ACCESS_KEY`, `VAULT_S3_ENDPOINT`), never in
+`ec_env.sh`, and set `data.vault.uri` and `data.vault.end` in `configs/eval.yaml`. Only `evaluate.py --mode holdout`
+loads it.
 
-## Suggestions for a good README
+### MLflow
 
-Every project is different, so consider which of these sections apply to yours. The sections used in the template are suggestions for most open source projects. Also keep in mind that while a README can be too long and detailed, too long is better than too short. If you think your README is too long, consider utilizing another form of documentation rather than cutting out information.
+| Experiment | Contents | Written by |
+|---|---|---|
+| `electricity/eval` | every evaluate.py run: parent run `<model> @ <commit>`, child runs `fit` and `<mode>` | evaluate.py only |
+| `electricity/training` | CatBoost / XGBoost pipeline runs | core/whole_pipeline_v8.py |
+| `electricity/data-prep` | data builds | core/process_raw.py |
+| `electricity/monitoring` | production checks | core/whole_pipeline_v8.py |
 
-## Name
-Choose a self-explaining name for your project.
+- Tags: `model_family`, `model`, `git_commit`, `dirty`, `mode`, `cutoff`, `holdout_period`, `data_version`.
+- Metrics: `<level>/syswape_h<h>`, `<level>/syswape_median_h<h>`, `<level>/bias_h<h>`, `household/mae_h<h>`,
+  `headline`; the persistence reference under `ref/...`. Per-node results are a CSV artifact, never metrics.
+- `--register` (holdout only) registers the fitted model as `electricity_household_forecast` with alias `challenger`;
+  promotion to `champion` stays with the gate in core/whole_pipeline_v8.py.
+- Tracking server: `MLFLOW_TRACKING_URI`; without it, a local SQLite store in `~/work/eval/mlflow.db`.
+- Leaderboard: filter `tags.mode = "validate"` in the `electricity/eval` experiment and sort by `headline`.
 
-## Description
-Let people know what your project can do specifically. Provide context and add a link to any reference visitors might be unfamiliar with. A list of Features or a Background subsection can also be added here. If there are alternatives to your project, this is a good place to list differentiating factors.
+## Other entry points
 
-## Badges
-On some READMEs, you may see small images that convey metadata, such as whether or not all the tests are passing for the project. You can use Shields to add some to your README. Many services also have instructions for adding a badge.
+```bash
+python core/household_nlinear.py --out-dir ~/work/hh_nlinear --workers 4 --cache-dir ~/work/hh_nlinear_cache
+python core/node_syswape.py --weights-dir ~/work/hh_nlinear --out-dir ~/work/hh_nodes --workers 4
+python core/whole_pipeline_v8.py train
+python scripts/analysis/hierarchy_check.py --out-dir ~/work/hierarchy --workers 12
+python scripts/analysis/feature_autocorr.py --out-dir ~/work/feature_autocorr --buckets 0 --workers 8
+```
 
-## Visuals
-Depending on what you are making, it can be a good idea to include screenshots or even a video (you'll frequently see GIFs rather than actual videos). Tools like ttygif can help, but check out Asciinema for a more sophisticated method.
+## Setup
 
-## Installation
-Within a particular ecosystem, there may be a common way of installing things, such as using Yarn, NuGet, or Homebrew. However, consider the possibility that whoever is reading your README is a novice and would like more guidance. Listing specific steps helps remove ambiguity and gets people to using your project as quickly as possible. If it only runs in a specific context like a particular programming language version or operating system or has dependencies that have to be installed manually, also add a Requirements subsection.
+```bash
+pip install -r requirements.txt
+EVAL_TEST_CONFIG=<config pointing at a synthetic copy> python -m pytest tests -q
+```
 
-## Usage
-Use examples liberally, and show the expected output if you can. It's helpful to have inline the smallest example of usage that you can demonstrate, while providing links to more sophisticated examples if they are too long to reasonably include in the README.
+`core/whole_pipeline_v8.py` and `core/process_raw.py` import `mlflow_utils.py` and `electricity_pyfunc.py` when present;
+those two files are not in the repository yet; put them in `core/`.
 
-## Support
-Tell people where they can go to for help. It can be any combination of an issue tracker, a chat room, an email address, etc.
-
-## Roadmap
-If you have ideas for releases in the future, it is a good idea to list them in the README.
-
-## Contributing
-State if you are open to contributions and what your requirements are for accepting them.
-
-For people who want to make changes to your project, it's helpful to have some documentation on how to get started. Perhaps there is a script that they should run or some environment variables that they need to set. Make these steps explicit. These instructions could also be useful to your future self.
-
-You can also document commands to lint the code or run tests. These steps help to ensure high code quality and reduce the likelihood that the changes inadvertently break something. Having instructions for running tests is especially helpful if it requires external setup, such as starting a Selenium server for testing in a browser.
-
-## Authors and acknowledgment
-Show your appreciation to those who have contributed to the project.
-
-## License
-For open source projects, say how it is licensed.
-
-## Project status
-If you have run out of energy or time for your project, put a note at the top of the README saying that development has slowed down or stopped completely. Someone may choose to fork your project or volunteer to step in as a maintainer or owner, allowing your project to keep going. You can also make an explicit request for maintainers.
+Data rules (from the analytical datasets guide): credentials only from the environment; customer keys stay inside the
+authorised environment; only aggregates of at least 10 customers leave it; never read the whole `_staging` parent.
