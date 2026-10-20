@@ -667,21 +667,18 @@ def extract_windows_from_index(spark: SparkSession):
     return pdf.reset_index(drop=True), kin, ktg
 
 
-def _enriched_district_worker(code, cfg):
-    """One district of the enriched dataset -> its (sampled) windows and, optionally, per-customer segment features.
-    Runs in a worker process (extract_windows_enriched); everything it needs comes in `cfg`, nothing from module globals
-    that --set may have changed. Streams the district's record batches, so memory is about customers x days x 4 bytes."""
-    import time as _time
-    import zlib
+def _read_enriched_district(code, cfg):
+    """Streams one district of the enriched dataset into a customer x day float32 matrix (kept labels only; NaN elsewhere).
+    -> (keys, M (n x T), weather (3 x T: t_mean, t_min, t_max; from every row), housing (n,) latest known value).
+    Memory: the matrix (grown by doubling) plus one record batch."""
     import pyarrow as pa
     import pyarrow.compute as pc
     import pyarrow.dataset as pads
     sys.path.insert(0, cfg["here"])
     import enriched_io as eio
-    t0 = _time.time()
     fs, root = eio.open_root(cfg["root"])
     d0, d1 = pd.Timestamp(cfg["start"]), pd.Timestamp(cfg["end"])
-    T, L, H, S = (d1 - d0).days + 1, cfg["L"], cfg["H"], cfg["stride"]
+    T = (d1 - d0).days + 1
     e0 = int((d0 - pd.Timestamp("1970-01-01")).days)
     flt = (pads.field("date") >= d0.date()) & (pads.field("date") <= d1.date())
     if cfg["buckets"] is not None:
@@ -740,14 +737,27 @@ def _enriched_district_worker(code, cfg):
         ok = ok.to_numpy(zero_copy_only=False)
         M[c[ok], day[ok]] = kwh.to_numpy(zero_copy_only=False)[ok].astype(np.float32)
         del b, de, inv, c, day, ok, kwh, hv
+    n = len(keys)
+    return keys, M[:n], wt, h_val[:n]
+
+
+def _enriched_district_worker(code, cfg):
+    """One district of the enriched dataset -> its (sampled) windows and, optionally, per-customer segment features.
+    Runs in a worker process (extract_windows_enriched); everything it needs comes in `cfg`, nothing from module globals
+    that --set may have changed. Streams the district's record batches, so memory is about customers x days x 4 bytes."""
+    import time as _time
+    import zlib
+    t0 = _time.time()
+    d0, d1 = pd.Timestamp(cfg["start"]), pd.Timestamp(cfg["end"])
+    T, L, H, S = (d1 - d0).days + 1, cfg["L"], cfg["H"], cfg["stride"]
+    keys, M, wt, h_val = _read_enriched_district(code, cfg)
     out = dict(code=str(code), customers=0, candidates=0, passed=0, seconds=0.0, pdf=None, kin=None, ktg=None,
                seg=None, weather=None)
     if not keys:
         out["seconds"] = _time.time() - t0
         return out
     n = len(keys)
-    M = M[:n]                                                # a view: no copy
-    house = h_val[:n]                                       # housing type: the customer's latest known value
+    house = h_val                                       # housing type: the customer's latest known value
     has_obs = np.isfinite(M).any(axis=1)                     # customers with no kept day are counted, not windowed
     out["customers"] = int(has_obs.sum())
     dates = d0 + pd.to_timedelta(np.arange(T), unit="D")
