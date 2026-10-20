@@ -960,12 +960,18 @@ def extract_windows_enriched():
     if todo and ENRICHED_WORKERS > 1:
         ctx = mp.get_context("spawn")                     # no fork: the S3 client and its threads must not be copied
         with cf.ProcessPoolExecutor(max_workers=int(ENRICHED_WORKERS), mp_context=ctx) as ex:
-            futs = {ex.submit(_enriched_district_worker, code, cfg): code for code in todo}
-            for f in cf.as_completed(futs):
-                try:
-                    _keep(f.result())
-                except Exception as e:                    # noqa: BLE001
-                    raise RuntimeError(f"district {futs[f]} failed: {type(e).__name__}: {e}") from e
+            pending = {ex.submit(_enriched_district_worker, code, cfg): code for code in todo}
+            while pending:                                # drop each future once kept (it holds the district's windows)
+                done_now, _ = cf.wait(list(pending), return_when=cf.FIRST_COMPLETED)
+                for f in done_now:
+                    code = pending.pop(f)
+                    try:
+                        res = f.result()
+                    except Exception as e:                # noqa: BLE001
+                        raise RuntimeError(f"district {code} failed: {type(e).__name__}: {e}") from e
+                    del f
+                    _keep(res)
+                    del res
     else:
         for code in todo:
             _keep(_enriched_district_worker(code, cfg))

@@ -517,12 +517,18 @@ def run(wp, args, out_dir, variants):
                 os.environ[v] = str(thr)
             try:
                 with cf.ProcessPoolExecutor(max_workers=args.workers, mp_context=mp.get_context("spawn")) as ex:
-                    futs = {ex.submit(district_worker, c, cfg): c for c in todo}
-                    for f in cf.as_completed(futs):
-                        try:
-                            keep(f.result())
-                        except Exception as e:                       # noqa: BLE001
-                            raise RuntimeError(f"district {futs[f]} failed: {type(e).__name__}: {e}") from e
+                    pending = {ex.submit(district_worker, c, cfg): c for c in todo}
+                    while pending:                                   # drop each future once absorbed (it holds the result)
+                        done_now, _ = cf.wait(list(pending), return_when=cf.FIRST_COMPLETED)
+                        for f in done_now:
+                            code = pending.pop(f)
+                            try:
+                                res = f.result()
+                            except Exception as e:                   # noqa: BLE001
+                                raise RuntimeError(f"district {code} failed: {type(e).__name__}: {e}") from e
+                            del f
+                            keep(res)
+                            del res
             finally:
                 for v, x in saved.items():
                     if x is None:
