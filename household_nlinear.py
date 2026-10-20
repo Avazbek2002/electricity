@@ -346,6 +346,7 @@ def wape(P, A):
 
 
 def metrics(name, P, A, day, set_name):
+    P, A = np.asarray(P, dtype="float64"), np.asarray(A, dtype="float64")
     rows = []
     for h in HORIZONS:
         p, a = P[:, h - 1].astype(float), A[:, h - 1].astype(float)
@@ -384,6 +385,8 @@ def main(argv=None):
     p.add_argument("--val-sample", type=float, default=0.1, help="share of validation windows kept to choose the penalty")
     p.add_argument("--catboost-test-share", type=float, default=0.01,
                    help="the household CatBoost run's ENRICHED_TEST_SAMPLE: that subset is scored separately")
+    p.add_argument("--coato-min-households", type=int, default=10,
+                   help="district-level sysWAPE: leave out districts with fewer test households per target day")
     p.add_argument("--variants", default=",".join(VARIANTS))
     p.add_argument("--norm-days", type=int, default=7)
     p.add_argument("--min-level", type=float, default=0.2, help="kWh/day: lower levels are not trained on (fallback forecast)")
@@ -481,7 +484,9 @@ def run(wp, args, out_dir, variants):
         if res.get("val_sample") is not None:
             vs.append(res["val_sample"])
         if res.get("test_sample") is not None:
-            tsamp.append(res["test_sample"])
+            ts_ = res["test_sample"]
+            ts_["coato"] = np.full(len(ts_["day"]), str(res["code"]), dtype=object)
+            tsamp.append(ts_)
 
     def keep(res, from_cache=False):
         if cache and not from_cache:
@@ -585,21 +590,30 @@ def run(wp, args, out_dir, variants):
             print(f"[penalty] WARNING: {v}: the chosen penalty is at the end of the grid")
 
     # ---------------- test ----------------
-    Tx = np.concatenate([t["X"] for t in tsamp]).astype("float64")
-    Ty = np.concatenate([t["y"] for t in tsamp]).astype("float64")
-    Tb = np.concatenate([t["b"] for t in tsamp]).astype("float64")
+    Tx = np.concatenate([t["X"] for t in tsamp])                    # float32 throughout: memory for large test samples
+    Ty = np.concatenate([t["y"] for t in tsamp])
+    Tb = np.concatenate([t["b"] for t in tsamp])
     Tl = np.concatenate([t["l"] for t in tsamp]).astype("float64")
-    Tp30 = np.concatenate([t["p30"] for t in tsamp]).astype("float64")
-    Tp7 = np.concatenate([t["p7"] for t in tsamp]).astype("float64")
+    Tp30 = np.concatenate([t["p30"] for t in tsamp])
+    Tp7 = np.concatenate([t["p7"] for t in tsamp])
     Tday = np.concatenate([t["day"] for t in tsamp]).astype("int64")
     Tu = np.concatenate([t["u"] for t in tsamp]).astype("float64")
+    Tco = np.concatenate([t["coato"] for t in tsamp])
+    for t in tsamp:                                                  # the per-district copies are no longer needed
+        t.clear()
     Tok = np.isfinite(Tl) & (Tl > args.min_level)
     preds = {"persistence30": np.repeat(Tp30[:, None], wp.HORIZON, 1), "persistence7": np.repeat(Tp7[:, None], wp.HORIZON, 1),
-             "thermal_baseline": Tb}
+             "thermal_baseline": Tb}                                 # float32 (n, 60) each
     for v in variants:
         cols, Wraw = Wfinal[v]
-        P = to_kwh(v, Tx[:, cols] @ Wraw, np.where(Tok, Tl, 0.0), Tb)
-        preds[v] = np.where(Tok[:, None], P, Tb if v.startswith("thermal") else np.nan_to_num(Tl)[:, None])
+        out = np.empty((len(Tx), wp.HORIZON), dtype=np.float32)
+        for a in range(0, len(Tx), 200_000):                          # chunks: no float64 copy of the whole sample
+            sl = slice(a, a + 200_000)
+            lv = np.where(Tok[sl], Tl[sl], 0.0)
+            P = to_kwh(v, Tx[sl][:, cols].astype("float64") @ Wraw, lv, Tb[sl].astype("float64"))
+            out[sl] = np.where(Tok[sl][:, None], P, Tb[sl] if v.startswith("thermal") else np.nan_to_num(Tl[sl])[:, None])
+        preds[v] = out
+    del Tx
     rows = []
     sets = [("all_test_sample", np.ones(len(Tu), bool)), ("catboost_test_set", Tu < args.catboost_test_share)]
     for set_name, m in sets:
@@ -610,7 +624,7 @@ def run(wp, args, out_dir, variants):
     tab = pd.DataFrame(rows)
     tab.to_csv(os.path.join(out_dir, "metrics.csv"), index=False)
     first = pd.Timestamp(wp.ENRICHED_START)
-    print(f"\n[test] {len(Tx):,} test windows, origins {(first + pd.Timedelta(days=int(Tday.min()))).date()} .. "
+    print(f"\n[test] {len(Ty):,} test windows, origins {(first + pd.Timedelta(days=int(Tday.min()))).date()} .. "
           f"{(first + pd.Timedelta(days=int(Tday.max()))).date()}; {np.isfinite(Ty).mean():.1%} of their target days observed; "
           f"CatBoost-run subset {int((Tu < args.catboost_test_share).sum()):,} windows")
     order = list(preds)
@@ -626,6 +640,17 @@ def run(wp, args, out_dir, variants):
             print(f"\n=== {set_name}: {lab} ===")
             print(th.pivot(index="model", columns="horizon", values=col).reindex(order)
                   .map(lambda x: f"{x:+6.1%}" if col == "bias" else f"{x:6.1%}").to_string())
+    # district-level system WAPE: each coato's test households summed per target day
+    for set_name, m in sets:
+        if not m.any():
+            continue
+        per, summ = wp.coato_sys_report({k: P[m] for k, P in preds.items()}, Ty[m], Tday[m], Tco[m],
+                                        horizons=HORIZONS, min_households=args.coato_min_households,
+                                        title=f"{set_name}: ")
+        per.insert(0, "set", set_name)
+        summ.insert(0, "set", set_name)
+        per.to_csv(os.path.join(out_dir, f"metrics_by_coato_{set_name}.csv"), index=False)
+        summ.to_csv(os.path.join(out_dir, f"metrics_by_coato_summary_{set_name}.csv"), index=False)
     with open(os.path.join(out_dir, "nlinear_info.json"), "w") as fh:
         json.dump(info, fh, indent=2, default=str)
     print(f"\n[done] {out_dir} in {(time.time() - t0) / 60:.1f} min")

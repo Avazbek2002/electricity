@@ -399,6 +399,7 @@ SERVE_MODEL = "catboost"        # "catboost" | "xgboost": the model the register
 SERVING_HISTORY_DAYS = LOOKBACK  # days of consumption history the serving model needs per meter
 # promotion gate (see evaluate_gate): the candidate must not be worse than the champion by more than
 # GATE_TOLERANCE (relative sysWAPE) at ANY gate horizon, on the target days both were tested on
+COATO_MIN_HOUSEHOLDS = 10      # district-level sysWAPE: districts with fewer test households per target day are left out
 GATE_HORIZONS = (7, 14, 30)
 GATE_TOLERANCE = 0.02
 GATE_MIN_COMMON_DAYS = 30
@@ -2228,6 +2229,56 @@ def sys_report(name, pred, y, origin_days, horizons=(1, 7, 14, 30, 60)):
     return out
 
 
+def coato_sys_report(preds: dict, y, origin_days, coato, horizons=(1, 7, 14, 30, 60), min_households=10, title=""):
+    """District-level system error. Per model, horizon h and district (coato_code): sum the forecasts and the actuals of
+    all test households of that district landing on target day d = origin + h (observed target days only), then
+      sysWAPE_c = sum_d |P_cd - A_cd| / sum_d A_cd          bias_c = sum_d (P_cd - A_cd) / sum_d A_cd
+    Summary over districts with >= min_households households per target day on average (smaller sums are mostly noise,
+    and the guide's disclosure rule asks for aggregates of >= 10 customers):
+      median / mean / p90 of sysWAPE_c across districts, and pooled = sum_c sum_d |P - A| / sum_c sum_d A
+      (energy-weighted: big districts count more).
+    -> (per-district DataFrame, summary DataFrame); prints the pooled and median tables."""
+    coato = np.asarray(coato).astype(str)
+    per = []
+    for name, P in preds.items():
+        for h in horizons:
+            p, a = np.asarray(P[:, h - 1], dtype=float), np.asarray(y[:, h - 1], dtype=float)
+            v = np.isfinite(p) & np.isfinite(a)
+            if not v.any():
+                continue
+            g = (pd.DataFrame({"coato": coato[v], "day": origin_days[v] + h, "p": p[v], "a": a[v]})
+                 .groupby(["coato", "day"]).agg(p=("p", "sum"), a=("a", "sum"), n=("p", "size")).reset_index())
+            g["e"] = (g["p"] - g["a"]).abs()
+            g["s"] = g["p"] - g["a"]
+            c = g.groupby("coato").agg(abs_err=("e", "sum"), signed=("s", "sum"), actual=("a", "sum"), days=("day", "size"),
+                                       households_per_day=("n", "mean")).reset_index()
+            c["sys_wape"] = c["abs_err"] / c["actual"].where(c["actual"] > 0)
+            c["bias"] = c["signed"] / c["actual"].where(c["actual"] > 0)
+            c["model"], c["horizon"] = name, h
+            per.append(c)
+    if not per:
+        return pd.DataFrame(), pd.DataFrame()
+    per = pd.concat(per, ignore_index=True)
+    ok = per[per["households_per_day"] >= min_households]
+    summ = (ok.groupby(["model", "horizon"])
+            .apply(lambda d: pd.Series({"pooled": d["abs_err"].sum() / d["actual"].sum(), "median": d["sys_wape"].median(),
+                                        "mean": d["sys_wape"].mean(), "p90": d["sys_wape"].quantile(0.9),
+                                        "districts": int(len(d)), "households_per_day": d["households_per_day"].median()}),
+                   include_groups=False)
+            .reset_index())
+    n_all, n_ok = per["coato"].nunique(), ok["coato"].nunique()
+    print(f"\n=== {title}district (coato) system WAPE: {n_ok} of {n_all} districts with >= {min_households} test households per "
+          f"target day (median {ok['households_per_day'].median() if len(ok) else float('nan'):.0f}) ===")
+    if summ.empty:
+        print("  no district has enough test households per day: score more test windows (more customers / a larger test share)")
+        return per, summ
+    order = list(preds)
+    for col, lab in (("pooled", "pooled over districts (energy-weighted)"), ("median", "median district")):
+        t = summ.pivot(index="model", columns="horizon", values=col).reindex(order)
+        print(f"-- {lab}\n" + t.map(lambda x: f"{x:6.1%}").to_string())
+    return per, summ
+
+
 # =============================================================================
 # One fold: segments, priors, features, CatBoost + XGBoost, evaluation
 # =============================================================================
@@ -2410,6 +2461,22 @@ def fit_and_evaluate(pdf, kin, ktg, ktg_raw, clim, fc_grid, fc_grid_mm, train_cu
     sys_daily = pd.concat([system_daily_frame(n, preds[n], y_test, origin_days_test)
                            for n in ("persistence30", "thermal", "catboost", "xgboost")], ignore_index=True)
     sys_daily["is_serve"] = (sys_daily["model"] == SERVE_MODEL).astype(int)
+
+    # district-level system error (each coato's households summed per target day)
+    coato_per, coato_summ = coato_sys_report(
+        {k: preds[k] for k in ("persistence30", "persistence7", "thermal", "catboost", "xgboost")}, y_test,
+        origin_days_test, meta.loc[test, "coato_code"].to_numpy(), min_households=COATO_MIN_HOUSEHOLDS,
+        title=f"[{label}] ")
+    try:
+        os.makedirs(OUTPUT_DIR, exist_ok=True)
+        tag = "" if label == "primary" else "_" + re.sub(r"[^A-Za-z0-9_-]+", "_", str(label))
+        coato_per.to_csv(os.path.join(OUTPUT_DIR, f"metrics_by_coato{tag}.csv"), index=False)
+        coato_summ.to_csv(os.path.join(OUTPUT_DIR, f"metrics_by_coato_summary{tag}.csv"), index=False)
+    except OSError as e:
+        print(f"[coato] could not write the district metrics: {e}")
+    for _, r in coato_summ.iterrows():
+        metrics[f"test/{r['model']}/coato_sysWAPE_pooled_t{r['horizon']}"] = float(r["pooled"])
+        metrics[f"test/{r['model']}/coato_sysWAPE_median_t{r['horizon']}"] = float(r["median"])
 
     cb_imp = pd.DataFrame({"feature": feature_cols, "importance": cb_model.get_feature_importance()})
     xgb_imp = pd.DataFrame({"feature": feature_cols, "importance": xgb_model.feature_importances_})
