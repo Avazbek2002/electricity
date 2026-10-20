@@ -14,7 +14,7 @@ for _p in (os.path.join(os.path.dirname(HERE), "core"), os.path.dirname(HERE)):
         sys.path.insert(0, _p)
 
 from harness.contract import HORIZON, Panel                                 # noqa: E402
-from harness.data import MISSING, read_district, scrub_credentials           # noqa: E402
+from harness.data import MISSING, read_district, restore_credentials, scrub_credentials  # noqa: E402
 
 REFERENCE = "persistence30_ref"                     # scored next to every model, on the same households and days
 
@@ -62,6 +62,7 @@ def district_worker(code, cfg):
     import whole_pipeline_v8 as wp
     from household_nlinear import _quiet
     L, H = wp.LOOKBACK, HORIZON
+    restore_credentials()                                           # this worker may have hidden them for an earlier district
     D = read_district(code, cfg["roots"], cfg["start"], cfg["end"], cfg["labels"])
     res = dict(code=str(code), customers=int(len(D["keys"])), windows=0, gaps=0, seconds=0.0)
     if not len(D["keys"]):

@@ -26,11 +26,20 @@ def load_env_file(path):
             os.environ[k.strip()] = vals[0]
 
 
+_HIDDEN = {}
+
+
 def scrub_credentials():
-    """Remove every S3 credential from this process's environment (before a model's predict runs)."""
+    """Remove every S3 credential from this process's environment (before a model's predict runs). They are kept in
+    this module, so the next district in the same worker process can read again (restore_credentials)."""
     for k in list(os.environ):
         if k.endswith(CRED_SUFFIXES):
-            os.environ.pop(k, None)
+            _HIDDEN[k] = os.environ.pop(k)
+
+
+def restore_credentials():
+    """Put back the credentials scrub_credentials removed (start of each district: worker processes are reused)."""
+    os.environ.update(_HIDDEN)
 
 
 def read_district(code, roots, start, end, labels):
