@@ -437,4 +437,7 @@ def report(results, models, args, out):
 
 
 if __name__ == "__main__":
-    main()
+    from mlflow_utils import run_script, table_metrics
+    run_script(main, "electricity/analysis", stage="node_syswape",
+               metrics_from=lambda d: table_metrics(os.path.join(d, "node_syswape_summary.csv"),
+                                                    ["level", "model", "horizon"], ["pooled", "median", "bias"]))

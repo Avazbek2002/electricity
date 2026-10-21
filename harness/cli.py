@@ -36,7 +36,9 @@ def main(argv=None):
     p.add_argument("--out-dir", default=None)
     p.add_argument("--refit", action="store_true", help="fit again even if this commit + cutoff was fitted before")
     p.add_argument("--allow-dirty", action="store_true", help="validate / dev-test with uncommitted changes (tagged dirty)")
-    p.add_argument("--register", action="store_true", help="holdout only: register the model in MLflow as 'challenger'")
+    p.add_argument("--register", action="store_true",
+                   help="register the fitted model in the MLflow registry as electricity_household_<model> (aliases: "
+                        "best_<mode>, or 'challenger' on the holdout); see harness/registry.py")
     p.add_argument("--no-mlflow", action="store_true")
     args = p.parse_args(argv)
     cfg = yaml.safe_load(open(args.config))
@@ -156,7 +158,8 @@ def main(argv=None):
     tags = dict(model_family=model_config.get("family", args.model), model=args.model, git_commit=git["commit"],
                 git_branch=git["branch"], dirty=str(git["dirty"]).lower(), mode=args.mode, cutoff=mode["cutoff"],
                 holdout_period=mode.get("period", ""), data_version=os.path.basename(dev["uri"].rstrip("/")),
-                districts="all" if not args.coatos else args.coatos)
+                districts="all" if not args.coatos else args.coatos,
+                origins=f"{origin_dates[0].date()}..{origin_dates[-1].date()}/{mode['origins']['step']}d")
     params = {**{f"model.{k}": v for k, v in model_config.items()},
               "origins": f"{origin_dates[0].date()}..{origin_dates[-1].date()} every {mode['origins']['step']} days",
               "n_origins": len(origins), "headline": json.dumps(sc_cfg["headline"])}
@@ -170,7 +173,8 @@ def main(argv=None):
                                                             headline=sc["headline"], metrics=metrics))
     run_id = tracking.mlflow_log_safe(mlcfg, tags, params, dict(fit_seconds=fit_seconds, predict_seconds=predict_seconds),
                                  metrics, list(files.values()) + [os.path.join(out, "run.json")], args.model,
-                                 register=args.register, artifacts_dir=art)
+                                 register=args.register, artifacts_dir=art, model_dir=model_dir,
+                                 model_config=model_config, headline=sc["headline"][args.model])
     row = dict(time=time.strftime("%Y-%m-%d %H:%M:%S"), model=args.model, commit=git["commit"], mode=args.mode,
                holdout_period=mode.get("period", ""), status="done", headline=sc["headline"][args.model],
                reference_headline=sc["headline"][REFERENCE], run_dir=out, mlflow_run=run_id or "")

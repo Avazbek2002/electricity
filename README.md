@@ -14,6 +14,7 @@ harness/               the evaluation harness
   runner.py              per district: as-of panels per origin -> predict -> node sums (worker processes)
   scoring.py             system WAPE per level, household MAE, headline
   tracking.py            git guard, vault look budget, MLflow + local CSVs
+  registry.py            model registry: pyfunc wrapper, versions + aliases, list / promote
   cli.py                 the evaluate.py command line
 models/<name>/         one folder per model: model.py (class Model), config.yaml, NOTES.md
   nlinear_x/             NLinear with weather inputs (trains through core/household_nlinear.py)
@@ -22,12 +23,14 @@ models/<name>/         one folder per model: model.py (class Model), config.yaml
 core/                  shared code (imported by everything else)
   whole_pipeline_v8.py   features, weather, CatBoost / XGBoost household pipeline
   enriched_io.py         bounded reads of the enriched dataset
+  mlflow_utils.py        experiment tracking for every entry point (Tracker, run_script)
   household_nlinear.py   NLinear training on every customer (also a CLI)
   node_syswape.py        bottom-up system WAPE per transformer / feeder / substation (also a CLI)
   transformer_forecast.py, process_raw.py   transformer-level pipeline, raw-data processing
 scripts/analysis/      EDA and checks (hierarchy, feeders, autocorrelation, ...)
 scripts/transformer/   transformer-level experiments
-tests/                 harness tests (a probe model checks what predict can see)
+scripts/mlflow_check.py  end-to-end check of an MLflow server
+tests/                 harness and tracking tests (a probe model checks what predict can see)
 ```
 
 ## The evaluation harness
@@ -83,20 +86,53 @@ loads it.
 
 ### MLflow
 
-| Experiment | Contents | Written by |
-|---|---|---|
-| `electricity/eval` | every evaluate.py run: parent run `<model> @ <commit>`, child runs `fit` and `<mode>` | evaluate.py only |
-| `electricity/training` | CatBoost / XGBoost pipeline runs | core/whole_pipeline_v8.py |
-| `electricity/data-prep` | data builds | core/process_raw.py |
-| `electricity/monitoring` | production checks | core/whole_pipeline_v8.py |
+Every entry point records its runs through one module, `core/mlflow_utils.py`. It never stops a job: if the server
+is unreachable it prints one warning and the job runs untracked.
 
-- Tags: `model_family`, `model`, `git_commit`, `dirty`, `mode`, `cutoff`, `holdout_period`, `data_version`.
-- Metrics: `<level>/syswape_h<h>`, `<level>/syswape_median_h<h>`, `<level>/bias_h<h>`, `household/mae_h<h>`,
-  `headline`; the persistence reference under `ref/...`. Per-node results are a CSV artifact, never metrics.
-- `--register` (holdout only) registers the fitted model as `electricity_household_forecast` with alias `challenger`;
-  promotion to `champion` stays with the gate in core/whole_pipeline_v8.py.
-- Tracking server: `MLFLOW_TRACKING_URI`; without it, a local SQLite store in `~/work/eval/mlflow.db`.
-- Leaderboard: filter `tags.mode = "validate"` in the `electricity/eval` experiment and sort by `headline`.
+**Setup (once):**
+```bash
+cp configs/mlflow_env.example.sh ~/work/mlflow_env.sh && chmod 600 ~/work/mlflow_env.sh   # fill in user + password
+source ~/work/mlflow_env.sh
+python scripts/mlflow_check.py        # credentials, runs, artifact upload, model logging, registry, load-back
+```
+Credentials only in the environment (`MLFLOW_TRACKING_USERNAME` / `MLFLOW_TRACKING_PASSWORD`), never in the repo or
+the URI; they are masked in every log and tag. Without `MLFLOW_TRACKING_URI`, evaluate.py uses a local SQLite store
+(`~/work/eval/mlflow.db`) and the other scripts run untracked. `--no-mlflow` on any script turns it off;
+`MLFLOW_DISABLE=1` turns it off everywhere.
+
+| Experiment | Runs | Written by |
+|---|---|---|
+| `electricity/eval` | parent `<model> @ <commit>`, children `fit` (fitted files, pyfunc) and `<mode>` (scores) | evaluate.py |
+| `electricity/training` | CatBoost / XGBoost pipeline; household NLinear training | core/whole_pipeline_v8.py, core/household_nlinear.py |
+| `electricity/transformer-forecast` | transformer-level forecasts and NLinear | core/transformer_forecast.py, scripts/transformer/transformer_nlinear.py |
+| `electricity/data-prep` | data builds, transformer panels and audits | core/process_raw.py, scripts/transformer/* |
+| `electricity/analysis` | EDA and checks, node-level system WAPE | scripts/analysis/*, core/node_syswape.py |
+| `electricity/monitoring` | live accuracy of the production model | core/whole_pipeline_v8.py monitor |
+
+- Each script run records the command line (params), `git_commit` / `dirty` / host / conda env (tags), the
+  printed log, and the files in its `--out-dir` (tables, figures, reports) as artifacts. Training scripts also log
+  their result table as metrics (`<model>/mae_h7`, `<level>/<model>/pooled_h30`, ...).
+- evaluate.py metrics: `<level>/syswape_h<h>`, `<level>/syswape_median_h<h>`, `<level>/bias_h<h>`,
+  `household/mae_h<h>`, `headline`; the persistence reference under `ref/...`. Per-node results are a CSV artifact.
+- **Data rule:** a table whose header has a customer key (`customer_key`, `series_key`, `meter_id`, ...) is never
+  uploaded; rows of node tables with fewer than 10 households are dropped from the uploaded copy.
+- Leaderboard: in `electricity/eval`, filter `tags.mode = "validate"` and sort by `headline`.
+
+### Model registry
+
+```bash
+python evaluate.py --model gam --mode validate --register        # every mode can register
+python -m harness.registry list                                   # versions, headlines, aliases
+python -m harness.registry promote --model gam --version 3 --to-production
+```
+
+| Registered model | Versions | Aliases |
+|---|---|---|
+| `electricity_household_<model>` (one per models/ folder) | fitted model as a loadable pyfunc (its code travels with it) + evaluation evidence as version tags (`mode`, `cutoff`, `origins`, `headline`, `national/syswape_h<h>`, commit, run ids) | `best_validate` / `best_dev_test`: lowest headline among full runs on the same dates and data (moved automatically; quick `--coatos` runs never take it); `challenger`: latest holdout version; `champion`: set by `promote` only |
+| `electricity_household_forecast` | the production line: whole_pipeline_v8 serving model, or a harness version copied by `promote --to-production` | `challenger`, `champion` |
+
+`promote` requires the version to hold `challenger` (scored on the holdout), unless `--force`. Load any version:
+`mlflow.pyfunc.load_model("models:/electricity_household_gam@champion").predict(panel)` returns `(n, 60)` kWh.
 
 ## Other entry points
 
@@ -115,8 +151,8 @@ pip install -r requirements.txt
 EVAL_TEST_CONFIG=<config pointing at a synthetic copy> python -m pytest tests -q
 ```
 
-`core/whole_pipeline_v8.py` and `core/process_raw.py` import `mlflow_utils.py` and `electricity_pyfunc.py` when present;
-those two files are not in the repository yet; put them in `core/`.
+`core/whole_pipeline_v8.py` logs its serving model only when `core/electricity_pyfunc.py` is present; that file is not
+in the repository yet, so until it is added the pipeline tracks its runs but registers no serving model.
 
 Data rules (from the analytical datasets guide): credentials only from the environment; customer keys stay inside the
 authorised environment; only aggregates of at least 10 customers leave it; never read the whole `_staging` parent.

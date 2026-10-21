@@ -697,4 +697,7 @@ def run(wp, args, out_dir, variants):
 
 
 if __name__ == "__main__":
-    main()
+    from mlflow_utils import run_script, table_metrics
+    run_script(main, "electricity/training", stage="train_household_nlinear", model_files=True,
+               metrics_from=lambda d: table_metrics(os.path.join(d, "metrics.csv"), ["model", "horizon"],
+                                                    ["mae", "wape", "sys_wape", "bias"], where={"set": "all_test_sample"}))

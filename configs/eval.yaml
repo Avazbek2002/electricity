@@ -40,9 +40,10 @@ budget:                                  # holdout looks
 
 mlflow:
   enabled: true
-  uri: null                              # null: MLFLOW_TRACKING_URI, else a local store at ~/work/eval/mlruns
+  uri: null                              # null: MLFLOW_TRACKING_URI, else a local SQLite store ~/work/eval/mlflow.db
   experiment: electricity/eval
-  registered_model: electricity_household_forecast
+  registered_model: electricity_household_forecast   # production name; --register writes electricity_household_<model>
+                                                      # (see harness/registry.py; promote --to-production copies here)
 
 run:
   out_dir: ~/work/eval

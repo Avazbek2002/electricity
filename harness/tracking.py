@@ -48,50 +48,43 @@ def append_csv(path, row):
     df.to_csv(path, index=False)
 
 
-def mlflow_log(cfg, tags, params, fit_info, metrics_by_model, artifacts, model_name, register=False, artifacts_dir=None):
-    """Parent run '<model> @ <commit>' with child runs 'fit' and '<mode>'. Returns the mode run id, or None if MLflow
-    is off or not installed."""
+def mlflow_log(cfg, tags, params, fit_info, metrics_by_model, artifacts, model_name, register=False, artifacts_dir=None,
+               model_dir=None, model_config=None, headline=None):
+    """Parent run '<model> @ <commit>' with child runs 'fit' (params, fitted files, and with register the loadable
+    pyfunc) and '<mode>' (scores, tables). With register: a new registry version + aliases (harness/registry.py).
+    Returns the mode run id, or None if MLflow is off or unreachable."""
     if not cfg.get("enabled", True):
         return None
-    try:
-        import mlflow
-    except ImportError:
-        print("[mlflow] not installed: logged to the local CSVs only")
-        return None
+    from mlflow_utils import Tracker
+    from harness import registry
     uri = os.getenv("MLFLOW_TRACKING_URI") or cfg.get("uri")
-    if uri:
-        mlflow.set_tracking_uri(os.path.expanduser(uri) if uri.startswith("~") else uri)
-    mlflow.set_experiment(cfg.get("experiment", "electricity/eval"))
-    with mlflow.start_run(run_name=f"{model_name} @ {tags['git_commit'][:7]}", tags=tags):
-        with mlflow.start_run(run_name="fit", nested=True, tags={**tags, "step": "fit"}):
-            mlflow.log_params({k: str(v)[:500] for k, v in params.items()})
-            mlflow.log_metrics({k: float(v) for k, v in fit_info.items() if isinstance(v, (int, float))})
+    tr = Tracker(cfg.get("experiment", "electricity/eval"), uri=uri, enabled=True)
+    if not tr.enabled:
+        return None
+    model_uri = fit_run = None
+    sys_tags = {k: v for k, v in tr.system_tags().items() if k not in tags}
+    with tr.run(f"{model_name} @ {tags['git_commit'][:7]}", tags={**tags, **sys_tags}):
+        with tr.run("fit", nested=True, tags={**tags, "step": "fit"}) as fit_run:
+            tr.params(params)
+            tr.metrics(fit_info)
             if artifacts_dir and os.path.isdir(artifacts_dir):
-                mlflow.log_artifacts(artifacts_dir, artifact_path="model")
-            fit_run = mlflow.active_run().info.run_id
-        with mlflow.start_run(run_name=tags["mode"], nested=True, tags={**tags, "step": "score"}) as run:
-            mlflow.log_params({k: str(v)[:500] for k, v in params.items()})
+                tr.artifacts_dir(artifacts_dir, subdir="model", everything=True, max_total_mb=5000)
+            if register and model_dir:
+                model_uri = registry.log_pyfunc(tr, model_name, model_dir, artifacts_dir, model_config or {},
+                                                evidence={"tags": tags, "headline": headline})
+        with tr.run(tags["mode"], nested=True, tags={**tags, "step": "score"}) as run_id:
+            tr.params(params)
             for m, md in metrics_by_model.items():                 # the reference model's metrics under ref/...
-                mlflow.log_metrics({(k if m == model_name else f"ref/{k}"): v for k, v in md.items()})
+                tr.metrics({(k if m == model_name else f"ref/{k}"): v for k, v in md.items()})
             for a in artifacts:
-                if os.path.exists(a):
-                    mlflow.log_artifact(a)
-            run_id = run.info.run_id
-    if register and tags["mode"] == "holdout":
-        try:
-            name = cfg.get("registered_model", "electricity_household_forecast")
-            client = mlflow.MlflowClient()
-            try:
-                client.create_registered_model(name)
-            except Exception:                                        # noqa: BLE001  (already exists)
-                pass
-            src = client.get_run(fit_run).info.artifact_uri.rstrip("/") + "/model"
-            mv = client.create_model_version(name, source=src, run_id=fit_run, tags={"holdout_run": run_id, **tags})
-            client.set_registered_model_alias(name, "challenger", mv.version)
-            print(f"[mlflow] registered {name} version {mv.version} as 'challenger' (promote with the champion gate)")
-        except Exception as e:                                       # noqa: BLE001
-            print(f"[mlflow] WARNING: registration failed ({type(e).__name__}: {str(e)[:200]})")
-    print(f"[mlflow] logged to {mlflow.get_tracking_uri()} experiment {cfg.get('experiment', 'electricity/eval')}")
+                tr.artifact(a)
+    if register:
+        if model_uri:
+            registry.register_eval(tr, model_name, model_uri, fit_run, run_id, tags,
+                                   metrics_by_model.get(model_name, {}), headline)
+        else:
+            print("[registry] not registered: the model was not logged as a loadable pyfunc (see the warning above)")
+    print(f"[mlflow] logged to experiment {cfg.get('experiment', 'electricity/eval')} (run {run_id})")
     return run_id
 
 

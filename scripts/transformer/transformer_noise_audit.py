@@ -580,4 +580,7 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
-    main()
+    import sys as _sys
+    _sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "core"))
+    from mlflow_utils import run_script
+    run_script(main, "electricity/data-prep", stage="transformer_audit")
