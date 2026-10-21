@@ -24,6 +24,7 @@ from concurrent.futures import ProcessPoolExecutor
 
 import numpy as np
 import pandas as pd
+import pyarrow.fs as pafs
 import pyarrow.parquet as pq
 
 HERE = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "core"))
@@ -54,17 +55,51 @@ def pick(names, options, what):
 
 
 # ---------------------------------------------------------------- weather side
+def show_dir(fs, path, depth=1):
+    """List one or two levels of a folder (names and sizes), no recursion beyond that."""
+    for info in fs.get_file_info(pafs.FileSelector(path, allow_not_found=True)):
+        size = f"{info.size / 1e6:,.1f} MB" if info.type == pafs.FileType.File else "<dir>"
+        print(f"    {info.path}   {size}")
+        if depth > 1 and info.type == pafs.FileType.Directory:
+            show_dir(fs, info.path, depth - 1)
+
+
+def weather_files(fs, path):
+    """The weather source as a list of parquet files: one file, or every *.parquet under a folder.
+    If the path is missing, show what its parent folders hold and stop."""
+    info = fs.get_file_info(path)
+    if info.type == pafs.FileType.File:
+        return [path]
+    if info.type == pafs.FileType.Directory:
+        files = sorted(i.path for i in fs.get_file_info(pafs.FileSelector(path, recursive=True))
+                       if i.type == pafs.FileType.File and i.path.endswith(".parquet"))
+        if files:
+            return files
+        print(f"[weather] {path} is a folder with no .parquet files")
+    else:
+        print(f"[weather] not found: {path}")
+    parent = path.rsplit("/", 1)[0]
+    for p in (parent, parent.rsplit("/", 1)[0]):
+        if fs.get_file_info(p).type == pafs.FileType.Directory:
+            print(f"[weather] contents of {p}/ :")
+            show_dir(fs, p, depth=2 if p == parent else 1)
+            break
+    raise SystemExit("[weather] pass the right file or folder with --weather s3://...")
+
+
 def read_weather(uri, tz, cols):
     fs, path = eio.open_root(uri)
-    pf = pq.ParquetFile(fs.open_input_file(path))
-    names = pf.schema_arrow.names
+    files = weather_files(fs, path)
+    names = pq.ParquetFile(fs.open_input_file(files[0])).schema_arrow.names
     c = cols["coato"] or pick(names, ("coato_id", "coato_code", "coato"), "coato")
     t = cols["time"] or pick(names, ("timestamp", "time", "datetime", "date"), "time")
     v = cols["temp"] or pick(names, ("temperature_2m", "t2m", "temperature", "temp"), "temp")
-    raw_type = str(pf.schema_arrow.field(c).type)
-    print(f"[weather] {pf.metadata.num_rows:,} rows, {pf.num_row_groups} row groups; using {c} ({raw_type}), {t}, {v}")
+    raw_type = str(pq.ParquetFile(fs.open_input_file(files[0])).schema_arrow.field(c).type)
+    print(f"[weather] {len(files)} file(s) under {path}; columns {names}; using {c} ({raw_type}), {t}, {v}")
     parts, raw_codes = [], set()
-    for b in pf.iter_batches(batch_size=1_000_000, columns=[c, t, v]):
+    batches = (b for f in files
+               for b in pq.ParquetFile(fs.open_input_file(f)).iter_batches(batch_size=1_000_000, columns=[c, t, v]))
+    for b in batches:
         df = b.to_pandas()
         raw_codes.update(df[c].astype(str).unique())
         ts = pd.to_datetime(df[t])
