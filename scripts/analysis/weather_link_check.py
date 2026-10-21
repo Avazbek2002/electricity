@@ -47,6 +47,23 @@ def norm(code):
     return s.zfill(5) if s.isdigit() else s
 
 
+def name_key(s):
+    """Lower-case Latin letters only, minus common suffixes, for a rough name comparison."""
+    import re
+    s = re.sub(r"[ʻʼ'`‘’\-]", "", str(s).lower())
+    for w in ("tumani", "tuman", "shahri", "shahar", "tumanі", "res", "eltarmoq", "elektr", "filiali", "korxonasi"):
+        s = s.replace(w, " ")
+    return " ".join(sorted(re.sub(r"[^a-z ]", " ", s).split()))
+
+
+def name_agree(a, b):
+    ka, kb = name_key(a), name_key(b)
+    if not ka or not kb:
+        return np.nan
+    ta, tb = set(ka.split()), set(kb.split())
+    return bool(ta & tb) or ka in kb or kb in ka
+
+
 def pick(names, options, what):
     for o in options:
         if o in names:
@@ -96,12 +113,17 @@ def read_weather(uri, tz, cols):
     v = cols["temp"] or pick(names, ("temperature_2m", "t2m", "temperature", "temp"), "temp")
     raw_type = str(pq.ParquetFile(fs.open_input_file(files[0])).schema_arrow.field(c).type)
     print(f"[weather] {len(files)} file(s) under {path}; columns {names}; using {c} ({raw_type}), {t}, {v}")
-    parts, raw_codes = [], set()
+    nm = "district_name" if "district_name" in names else None
+    rcols = [c, t, v] + ([nm] if nm else [])
+    parts, raw_codes, wnames = [], set(), {}
     batches = (b for f in files
-               for b in pq.ParquetFile(fs.open_input_file(f)).iter_batches(batch_size=1_000_000, columns=[c, t, v]))
+               for b in pq.ParquetFile(fs.open_input_file(f)).iter_batches(batch_size=1_000_000, columns=rcols))
     for b in batches:
         df = b.to_pandas()
         raw_codes.update(df[c].astype(str).unique())
+        if nm:
+            for code, name in df[[c, nm]].drop_duplicates(c).itertuples(index=False):
+                wnames.setdefault(norm(code), name)
         ts = pd.to_datetime(df[t])
         if tz:
             ts = (ts.dt.tz_localize("UTC") if ts.dt.tz is None else ts).dt.tz_convert(tz).dt.tz_localize(None)
@@ -112,7 +134,7 @@ def read_weather(uri, tz, cols):
     g = pd.concat(parts).groupby(level=[0, 1]).agg({"sum": "sum", "count": "sum", "min": "min", "max": "max"})
     g["t"] = g["sum"] / g["count"]
     g = g.reset_index().rename(columns={"count": "hours", "min": "tmin", "max": "tmax"})
-    return g[["code", "d", "t", "tmin", "tmax", "hours"]], raw_type, raw_codes
+    return g[["code", "d", "t", "tmin", "tmax", "hours"]], raw_type, raw_codes, wnames
 
 
 # ---------------------------------------------------------------- consumption side (one worker per district)
@@ -235,7 +257,7 @@ def main():
     out = os.path.expanduser(a.out_dir)
     os.makedirs(out, exist_ok=True)
 
-    wd, raw_type, raw_codes = read_weather(a.weather, a.tz, {"coato": a.coato_col, "time": a.time_col, "temp": a.temp_col})
+    wd, raw_type, raw_codes, wnames = read_weather(a.weather, a.tz, {"coato": a.coato_col, "time": a.time_col, "temp": a.temp_col})
     fs, r = eio.open_root(a.root)
     codes = eio.finished_districts(fs, r, set(a.coatos) if a.coatos else None)
     cons, conflicts, colcodes = {}, {}, {}
@@ -267,6 +289,10 @@ def main():
             lmap = dict(zip(loc["location_id"], lc["code"]))
             key["branch_location_code"] = key["location_id"].map(lmap)
             key["branch_code_eq_location_code"] = key["branch_location_code"] == key["code"]
+    key["weather_name"] = key["code"].map(wnames)
+    if "branch_name" in key:
+        key["names_agree"] = [name_agree(w, b) if isinstance(w, str) and isinstance(b, str) else np.nan
+                              for w, b in zip(key["weather_name"], key["branch_name"])]
     key["column_codes_in_folder"] = key["code"].map(lambda c: ",".join(colcodes.get(c, [])) if c in colcodes else "")
     key.to_csv(os.path.join(out, "weather_link_codes.csv"), index=False)
 
@@ -295,6 +321,14 @@ def main():
         diff = both[both["branch_code_eq_location_code"] == False]  # noqa: E712
         p(f"  linked districts whose branch code differs from its location's geographic code: {len(diff)}"
           f" {diff['code'].tolist()[:20]}")
+    if "names_agree" in key:
+        both = key[key.in_weather & key.in_consumption & key["names_agree"].notna()]
+        bad = both[both["names_agree"] == False]  # noqa: E712
+        p(f"  linked codes whose weather district_name and branch name agree: {int((both['names_agree'] == True).sum())}"  # noqa: E712
+          f"/{len(both)}")
+        if len(bad):
+            p("  names that do NOT agree (check by eye):")
+            p(bad[["code", "weather_name", "branch_name"]].head(40).to_string(index=False))
     mism = [c for c, cc in colcodes.items() if cc and any(norm(x) != norm(c) for x in cc)]
     p(f"  districts whose coato_code column disagrees with the folder name: {len(mism)} {mism[:20]}")
     p(f"  districts with different t_mean values on the same day (should be 0): "
