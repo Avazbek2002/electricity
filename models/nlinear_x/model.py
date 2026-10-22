@@ -38,8 +38,22 @@ class Model(BaseModel):
                 "--val-start", spec.val_start, "--val-end", spec.val_end, "--end", spec.data_end,
                 "--variants", self.variant, "--workers", str(spec.workers), "--test-sample", "0",
                 "--cache-dir", os.path.join(artifacts_dir, "cache")] + [str(x) for x in self.config.get("train_args") or []]
+        prev = self._earlier_fit(artifacts_dir)
+        if prev:                                     # used only if this refit has no validation windows (2024 label hole)
+            argv += ["--fallback-penalty", prev]
         hn.main(argv)
         shutil.rmtree(os.path.join(artifacts_dir, "cache"), ignore_errors=True)   # holds customer keys: not kept
+
+    @staticmethod
+    def _earlier_fit(artifacts_dir):
+        """nlinear_info.json of the latest earlier refit of the same run (sibling folder refit-<date>), or None."""
+        here = os.path.basename(os.path.normpath(artifacts_dir))
+        root = os.path.dirname(os.path.normpath(artifacts_dir))
+        if not here.startswith("refit-") or not os.path.isdir(root):
+            return None
+        older = sorted(d for d in os.listdir(root) if d.startswith("refit-") and d < here
+                       and os.path.exists(os.path.join(root, d, "nlinear_info.json")))
+        return os.path.join(root, older[-1], "nlinear_info.json") if older else None
 
     def load(self, artifacts_dir):
         import whole_pipeline_v8 as wp

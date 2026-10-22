@@ -30,7 +30,7 @@ core/                  shared code (imported by everything else)
   household_nlinear.py   NLinear training on every customer (also a CLI)
   node_syswape.py        bottom-up system WAPE per transformer / feeder / substation (also a CLI)
   transformer_forecast.py, process_raw.py   transformer-level pipeline, raw-data processing
-scripts/analysis/      EDA and checks (hierarchy, feeders, autocorrelation, ...)
+scripts/analysis/      EDA and checks (hierarchy, feeders, autocorrelation, bottom-up oracle, ...)
 scripts/transformer/   transformer-level experiments
 scripts/mlflow_check.py  end-to-end check of an MLflow server
 scripts/test_set/      build_test_set.py (once), score_test.py (the common scorer)

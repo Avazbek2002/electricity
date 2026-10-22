@@ -417,6 +417,9 @@ def main(argv=None):
                    "0 = train only (the evaluation harness scores the model itself)")
     p.add_argument("--end", default=wp.ENRICHED_END, help="last day of data read (default: the dataset's last day); the "
                    "evaluation harness sets cutoff + 60 days so training never sees later days")
+    p.add_argument("--fallback-penalty", default=None, help="nlinear_info.json of an earlier run: its chosen penalty per "
+                   "variant is used when this run has NO validation windows (e.g. household labels missing for the "
+                   "validation block, as in May - mid-August 2024); the run is marked in nlinear_info.json")
     p.add_argument("--val-sample", type=float, default=0.1, help="share of validation windows kept to choose the penalty")
     p.add_argument("--catboost-test-share", type=float, default=0.01,
                    help="the household CatBoost run's ENRICHED_TEST_SAMPLE: that subset is scored separately")
@@ -582,35 +585,50 @@ def run(wp, args, out_dir, variants):
           f"{tot['candidates']:,}, pass the input/target rules {tot['passed']:,} ({tot['passed'] / max(tot['candidates'], 1):.1%}) | "
           f"TRAINING on {tot['train']:,} windows (fit {tot['fit']:,}, validation {tot['val']:,}, embargo "
           f"{tot['train'] - tot['fit'] - tot['val']:,}) | test windows kept {tot['test']:,}")
-    if "fit" not in acc or not vs or (not tsamp and args.test_sample > 0):
-        raise SystemExit("no fit windows, validation sample or test sample: check the dates against the data")
+    fallback = None
+    if not vs and args.fallback_penalty and "fit" in acc:
+        prev = json.load(open(os.path.expanduser(args.fallback_penalty)))
+        fallback = {v: prev["variants"][v]["chosen_lambda"] for v in variants if v in prev.get("variants", {})}
+        if set(fallback) != set(variants):
+            raise SystemExit(f"--fallback-penalty {args.fallback_penalty} has no penalty for "
+                             f"{sorted(set(variants) - set(fallback))}")
+        print(f"[penalty] WARNING: no validation windows in ({args.val_start}, {args.val_end}] (no household labels "
+              f"there): penalty taken from {args.fallback_penalty}: {fallback}")
+    if "fit" not in acc or (not vs and fallback is None) or (not tsamp and args.test_sample > 0):
+        raise SystemExit("no fit windows, validation sample or test sample: check the dates against the data"
+                         + ("" if vs else " (no validation windows: --fallback-penalty <earlier nlinear_info.json> "
+                                          "reuses an earlier run's penalty)"))
 
     n_hist = wp.LOOKBACK
     p_all = n_hist + len(names) + 1
     cols_of = {v: (list(range(p_all)) if v.endswith("_x") else list(range(n_hist)) + [p_all - 1]) for v in variants}
     fit, rest = acc["fit"], acc.get("rest")
     tr = {k: fit[k] + (rest[k] if rest else 0) for k in fit}
-    Vx = np.concatenate([v["X"] for v in vs]).astype("float64")
-    Vy = np.concatenate([v["y"] for v in vs]).astype("float64")
-    Vb = np.concatenate([v["b"] for v in vs]).astype("float64")
-    Vl = np.concatenate([v["l"] for v in vs]).astype("float64")
-    Vok = np.isfinite(Vl) & (Vl > args.min_level)
-    print(f"[penalty] validation sample {len(Vx):,} windows ({Vok.mean():.1%} above the level floor)")
+    if vs:
+        Vx = np.concatenate([v["X"] for v in vs]).astype("float64")
+        Vy = np.concatenate([v["y"] for v in vs]).astype("float64")
+        Vb = np.concatenate([v["b"] for v in vs]).astype("float64")
+        Vl = np.concatenate([v["l"] for v in vs]).astype("float64")
+        Vok = np.isfinite(Vl) & (Vl > args.min_level)
+        print(f"[penalty] validation sample {len(Vx):,} windows ({Vok.mean():.1%} above the level floor)")
     info = dict(data=tot, features=dict(history=n_hist, exogenous=names), variants={}, config={k: v for k, v in cfg.items()
                                                                                                  if k not in ("here",)})
+    if fallback is not None:
+        info["penalty_fallback"] = dict(source=os.path.abspath(os.path.expanduser(args.fallback_penalty)), **fallback)
     Wfinal = {}
     for v in variants:
         cols = cols_of[v]
         R = "Rs" if v.startswith("thermal") else "Rr"
         Tm_fit = standardiser(fit["s1"], fit["s2"], fit["n"], cols, n_hist)
         search = []
-        for lam in LAMBDAS:
+        for lam in (LAMBDAS if fallback is None else []):
             Ws = solve_all(fit["G0"], fit["Gm"], fit[R], cols, Tm_fit, lam)
             Z = (Vx[:, cols] @ Tm_fit) @ Ws
             P = to_kwh(v, Z, np.where(Vok, Vl, 0.0), Vb)
             P = np.where(Vok[:, None], P, Vb if v.startswith("thermal") else np.nan_to_num(Vl)[:, None])
             search.append(dict(lam=lam, val_wape=wape(P, Vy)))
-        best = min(search, key=lambda s: s["val_wape"] if np.isfinite(s["val_wape"]) else np.inf)
+        best = (dict(lam=fallback[v], val_wape=np.nan) if fallback is not None else
+                min(search, key=lambda s: s["val_wape"] if np.isfinite(s["val_wape"]) else np.inf))
         Tm = standardiser(tr["s1"], tr["s2"], tr["n"], cols, n_hist)
         Ws = solve_all(tr["G0"], tr["Gm"], tr[R], cols, Tm, best["lam"])
         Wraw = Tm @ Ws                                               # raw inputs @ Wraw = standardised inputs @ Ws
