@@ -29,7 +29,10 @@ def _date(d):
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--model", required=True, help="folder name under models/")
-    p.add_argument("--mode", required=True, choices=["validate", "dev-test", "holdout"])
+    p.add_argument("--mode", required=True, choices=["validate", "dev-test", "holdout", "test"],
+                   help="test = the fixed test set (configs/test_set.yaml): 4 seasonal folds, daily origins")
+    p.add_argument("--test-set", default=os.path.join(REPO, "configs", "test_set.yaml"))
+    p.add_argument("--test-dir", default=None, help="built test set (default ~/work/test_set/<version>)")
     p.add_argument("--config", default=os.path.join(REPO, "configs", "eval.yaml"))
     p.add_argument("--coatos", default=None, help="comma list of districts (quick runs; not allowed for holdout)")
     p.add_argument("--workers", type=int, default=None)
@@ -42,7 +45,6 @@ def main(argv=None):
     p.add_argument("--no-mlflow", action="store_true")
     args = p.parse_args(argv)
     cfg = yaml.safe_load(open(args.config))
-    mode = cfg["modes"][args.mode]
     run_cfg, sc_cfg, data = cfg["run"], cfg["scoring"], cfg["data"]
     out_root = os.path.expanduser(args.out_dir or run_cfg["out_dir"])
     workers = args.workers or int(run_cfg["workers"])
@@ -59,6 +61,10 @@ def main(argv=None):
     mcfg_path = os.path.join(model_dir, "config.yaml")
     model_config = yaml.safe_load(open(mcfg_path)) if os.path.exists(mcfg_path) else {}
     runs_csv = os.path.join(out_root, "runs.csv")
+    if args.mode == "test":
+        from harness.test_mode import run_test
+        return run_test(args, cfg, git, model_dir, model_config, tracking, scoring)
+    mode = cfg["modes"][args.mode]
 
     # ---- data roots and origins
     dev = data["dev"]

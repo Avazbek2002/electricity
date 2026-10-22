@@ -15,6 +15,8 @@ harness/               the evaluation harness
   scoring.py             system WAPE per level, household MAE, headline
   tracking.py            git guard, vault look budget, MLflow + local CSVs
   registry.py            model registry: pyfunc wrapper, versions + aliases, list / promote
+  testset.py             the fixed test set: definition checks, panels, node sums, scoring, report
+  test_mode.py           evaluate.py --mode test (per-fold fits, daily origins, forecast CSVs)
   cli.py                 the evaluate.py command line
 models/<name>/         one folder per model: model.py (class Model), config.yaml, NOTES.md
   nlinear_x/             NLinear with weather inputs (trains through core/household_nlinear.py)
@@ -30,6 +32,8 @@ core/                  shared code (imported by everything else)
 scripts/analysis/      EDA and checks (hierarchy, feeders, autocorrelation, ...)
 scripts/transformer/   transformer-level experiments
 scripts/mlflow_check.py  end-to-end check of an MLflow server
+scripts/test_set/      build_test_set.py (once), score_test.py (the common scorer)
+docs/TEST_SET.md       the fixed test set: design, scores, how to submit
 tests/                 harness and tracking tests (a probe model checks what predict can see)
 ```
 
@@ -48,6 +52,7 @@ python evaluate.py --model persistence30 --mode dev-test --coatos 03202 --allow-
 | `validate` | 2025-01-31 | 2025-04-01 .. 2025-06-30, every 14 days | unlimited |
 | `dev-test` | 2025-09-01 | 2025-10-31 .. 2026-04-30, every 14 days | unlimited, logged |
 | `holdout` | 2026-04-30 | the vault (next data release), every 7 days | 1 per commit, 2 per month |
+| `test` | four seasonal folds | the **fixed test set** (180 days, daily origins): see [docs/TEST_SET.md](docs/TEST_SET.md) | logged |
 
 What a run does:
 1. **Guard**: records the git commit; holdout refuses uncommitted changes and checks the look budget (`runs.csv`).
@@ -60,6 +65,18 @@ What a run does:
    `leaderboard.csv`, and MLflow.
 
 Headline metric (fixed in `configs/eval.yaml`): feeder system WAPE, pooled, mean of 7 and 30 days.
+
+### The fixed test set
+
+All models are compared on one frozen test set ([docs/TEST_SET.md](docs/TEST_SET.md), `configs/test_set.yaml`): four
+45-day seasonal blocks (summer, autumn, winter, spring; one fit each), daily origins, a fixed household panel per
+fold, coverage-adjusted node actuals, and one scorer (`scripts/test_set/score_test.py`) that also checks the ТЗ
+thresholds and runs the bias audit.
+```bash
+python scripts/test_set/build_test_set.py --workers 16          # once per test-set version
+python evaluate.py --model gam --mode test --workers 16           # harness models
+python scripts/test_set/score_test.py --template ~/work/my_fc     # other models: rows to fill, then --forecasts
+```
 
 ### Adding a model
 
