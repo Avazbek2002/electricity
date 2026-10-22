@@ -9,7 +9,12 @@
   - A substitution test (guide part 5) runs first: inputs after a day T are randomised; forecasts issued up to T + 1
     must not change.
   - The district forecasts are written in the common format and scored by the common scorer against T2, with B0 on
-    the same rows. Supplementary: bottom-up matched sums at substation / feeder level.
+    the same rows. Supplementary: bottom-up matched sums at substation / feeder / transformer level and household
+    errors (observed target days of the forecast households).
+  - Scaling (configs/eval.yaml run.scaling): the district forecast is multiplied by
+        c(o) = mean T2 per customer over the last `days` days up to o - 1 / the fresh households' observed mean there
+    (fresh households use more than the average customer, ~ +10 %; bottom_up_oracle.py). The unscaled forecast is
+    written as <model>_unscaled and scored next to it.
 """
 import concurrent.futures as cf
 import json
@@ -27,7 +32,8 @@ from harness.data import read_district, restore_credentials, scrub_credentials
 from harness.runner import load_model, persistence30
 from harness.weather import climate_asof, district_weather, issue_index, no_forecast
 
-NETWORK_LEVELS = ("substation", "feeder")
+NETWORK_LEVELS = ("substation", "feeder", "transformer")
+NODE_FILES = ("substation", "feeder")          # per-node files; every level is also summarised per district and day
 
 
 # ----------------------------------------------------------------------------- worker: one district, every issue date
@@ -66,6 +72,10 @@ def test_worker(code, cfg):
         _, grid_all, grid_mm_all = district_weather(code, wt, dates, cfg["seed"], wp)
     groups = ts.groups(D["network"], cfg["network_levels"]) if cfg["network_levels"] else {}
     ctrl = np.asarray(spec["control_horizons"]) - 1
+    sc = cfg.get("scaling") or {}
+    pc = cfg.get("per_customer", {}).get(str(code))                  # T2 per customer per day (test set), or None
+    sdays = int(sc.get("days", 28))
+    lo_c, hi_c = (sc.get("clip") or [0.5, 2.0])
     scrub_credentials()                                             # from here on nothing can read S3
 
     cnt = np.zeros((len(D["keys"]), T + 1), dtype=np.int32)
@@ -74,6 +84,9 @@ def test_worker(code, cfg):
     issues = [o for _, os_ in cfg["blocks"] for o in os_]
     nI = len(issues)
     F = np.full((nI, H), np.nan)                                     # district forecast per issue date and horizon
+    F_raw = np.full((nI, H), np.nan)                                 # unscaled (present x mean forecast)
+    scale = np.full(nI, np.nan)
+    HH = np.zeros((nI, len(ctrl), 4))                                # household: sum|P-A|, sum A, sum(P-A), n observed
     n_present = np.zeros(nI, int)
     n_fresh = np.zeros(nI, int)
     net = {lv: dict(names=nm, FO=np.zeros((len(nm), nI, len(ctrl))), AO=np.zeros((len(nm), nI, len(ctrl))),
@@ -125,6 +138,13 @@ def test_worker(code, cfg):
                 P = np.where(bad, ref[:, None], P)
                 tot += P.sum(0)
                 res["windows"] += len(r)
+                Ah = M[r][:, o + 1:o + 1 + H][:, ctrl].astype(np.float64)   # household level, observed days only
+                ob_h = np.isfinite(Ah)
+                e = np.where(ob_h, P[:, ctrl] - np.nan_to_num(Ah), 0.0)
+                HH[k, :, 0] += np.abs(e).sum(0)
+                HH[k, :, 1] += np.where(ob_h, Ah, 0.0).sum(0)
+                HH[k, :, 2] += e.sum(0)
+                HH[k, :, 3] += ob_h.sum(0)
                 if groups:                                           # supplementary: matched, observed households only
                     A = M[r][:, o + 1:o + 1 + H][:, ctrl].astype(np.float64)
                     ob = np.isfinite(A)
@@ -133,32 +153,92 @@ def test_worker(code, cfg):
                         net[lv]["FO"][:, k, :] += ts.bincount2(gb, np.where(ob, P[:, ctrl], 0.0), K)
                         net[lv]["AO"][:, k, :] += ts.bincount2(gb, np.where(ob, A, 0.0), K)
                         net[lv]["NO"][:, k, :] += ts.bincount2(gb, ob.astype(np.float64), K)
-            F[k] = present * tot / len(fresh)
+            F_raw[k] = present * tot / len(fresh)
+            c = 1.0
+            if sc.get("method", "ratio") == "ratio" and pc is not None:
+                w0 = max(0, last + 1 - sdays)
+                win = M[fresh, w0:last + 1]
+                n_obs = np.isfinite(win).sum()
+                fm = float(np.nansum(win) / n_obs) if n_obs else np.nan
+                pm = float(np.nanmean(pc[w0:last + 1])) if np.isfinite(pc[w0:last + 1]).any() else np.nan
+                if np.isfinite(fm) and np.isfinite(pm) and fm > 0:
+                    c = float(np.clip(pm / fm, lo_c, hi_c))
+            scale[k] = c
+            F[k] = F_raw[k] * c
             k += 1
         for n in getattr(model, "notes", []) or []:
             if n not in res["notes"]:
                 res["notes"].append(n)
-    res.update(F=F.astype(np.float32), n_present=n_present, n_fresh=n_fresh, issues=issues, net=net,
+    # every network level summarised per issue date and control horizon (node-days with >= min households observed);
+    # per-node arrays are kept only for NODE_FILES (the transformer level would be too large to return)
+    mh = int(spec["scoring"]["min_households_network"])
+    net_sum = {}
+    for lv, e in net.items():
+        ok = e["NO"] >= mh
+        net_sum[lv] = np.stack([np.where(ok, np.abs(e["FO"] - e["AO"]), 0).sum(0), np.where(ok, e["AO"], 0).sum(0),
+                                np.where(ok, e["FO"] - e["AO"], 0).sum(0), ok.sum(0)], axis=-1)   # (nI, nctrl, 4)
+    net = {lv: e for lv, e in net.items() if lv in NODE_FILES}
+    res.update(F=F.astype(np.float32), F_raw=F_raw.astype(np.float32), scale=scale, HH=HH, net_sum=net_sum,
+               n_present=n_present, n_fresh=n_fresh, issues=issues, net=net,
                seconds=time.time() - t0, peak_bytes=ts.peak_rss_bytes())
     return res
 
 
+def per_customer_series(test_dir, spec, codes):
+    """{district: T2 per customer per day (day index of the data start), NaN on artefact days} for the scaling."""
+    t = pd.read_csv(os.path.join(test_dir, "targets", "district.csv.gz"), dtype={"node": str}, parse_dates=["date"],
+                    usecols=["node", "date", "n_obs", "n_est", "kwh_obs", "kwh_est", "artefact"])
+    t = t[t["node"].isin(set(codes))]
+    T = ts.day_index(spec, spec["data"]["end"]) + 1
+    out = {}
+    for node, g in t.groupby("node"):
+        nc = g["n_obs"].fillna(0) + g["n_est"].fillna(0)
+        v = (g["kwh_obs"].fillna(0) + g["kwh_est"].fillna(0)) / nc.where(nc > 0)
+        v = v.where(~g["artefact"].astype(str).str.lower().isin(("true", "1")))
+        a = np.full(T, np.nan)
+        i = ((g["date"] - pd.Timestamp(spec["data"]["start"])).dt.days).to_numpy()
+        ok = (i >= 0) & (i < T)
+        a[i[ok]] = v.to_numpy()[ok]
+        out[str(node)] = a
+    return out
+
+
 # ----------------------------------------------------------------------------- writing
-def district_frame(results):
+def district_frame(results, key="F"):
     parts = []
     H = np.arange(1, HORIZON + 1)
     for r in results:
-        if "F" not in r:
+        if key not in r:
             continue
         nI = len(r["issues"])
         parts.append(pd.DataFrame({"node": r["code"], "origin": np.repeat(pd.DatetimeIndex(r["issues"]).date, HORIZON),
-                                   "horizon": np.tile(H, nI), "forecast": r["F"].ravel()}))
+                                   "horizon": np.tile(H, nI), "forecast": r[key].ravel()}))
     return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(columns=["node", "origin", "horizon", "forecast"])
+
+
+def write_levels(fdir, spec, results):
+    """levels.csv.gz: per district, issue date and control horizon, the error sums of the household level (observed
+    target days of the forecast households) and of every network level (node-days with >= min households observed):
+    abs_err = sum |F - A|, actual = sum A, err = sum (F - A), n = household-days or node-days. District sums only."""
+    ctrl = list(spec["control_horizons"])
+    rows = []
+    for r in results:
+        if "HH" not in r:
+            continue
+        nI = len(r["issues"])
+        base = dict(node=r["code"], origin=np.repeat(pd.DatetimeIndex(r["issues"]).date, len(ctrl)),
+                    horizon=np.tile(ctrl, nI))
+        for lv, A in [("household", r["HH"])] + list(r.get("net_sum", {}).items()):
+            rows.append(pd.DataFrame({**base, "level": lv, "abs_err": A[..., 0].ravel(), "actual": A[..., 1].ravel(),
+                                      "err": A[..., 2].ravel(), "n": A[..., 3].ravel().astype(int)}))
+    if rows:
+        df = pd.concat(rows, ignore_index=True)
+        df[df["n"] > 0].to_csv(os.path.join(fdir, "levels.csv.gz"), index=False, float_format="%.6f")
 
 
 def write_network(fdir, spec, results):
     ctrl = list(spec["control_horizons"])
-    for lv in NETWORK_LEVELS:
+    for lv in NODE_FILES:
         acc = {}
         for r in results:
             e = r.get("net", {}).get(lv)
@@ -263,7 +343,9 @@ def run_test(args, cfg, git, model_dir, model_config, tracking, scoring=None):
     wcfg = dict(spec=spec, blocks=blocks, labels=cfg["data"]["labels"], model_name=args.model, model_dir=model_dir,
                 model_config=model_config, artifacts=arts, seed=wp.SEED, weather=weather,
                 history_days=int(cfg["data"]["history_days"]), block=int(run_cfg["block"]),
-                network_levels=() if args.no_network else NETWORK_LEVELS)
+                network_levels=() if args.no_network else NETWORK_LEVELS,
+                scaling=run_cfg.get("scaling") or {"method": "ratio"},
+                per_customer=per_customer_series(test_dir, spec, codes))
     thr = max(1, (os.cpu_count() or 4) // workers)
     for v in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
         os.environ[v] = str(thr)
@@ -311,13 +393,29 @@ def run_test(args, cfg, git, model_dir, model_config, tracking, scoring=None):
     os.makedirs(fdir, exist_ok=True)
     district_frame(results).to_csv(os.path.join(fdir, "district.csv.gz"), index=False, float_format="%.6f")
     write_network(fdir, spec, results)
+    write_levels(fdir, spec, results)
+    sc = run_cfg.get("scaling") or {"method": "ratio"}
+    others = {}
+    if sc.get("method", "ratio") != "none":                         # the unscaled forecast, scored next to it
+        udir = os.path.join(out, "forecasts", f"{args.model}_unscaled")
+        os.makedirs(udir, exist_ok=True)
+        district_frame(results, "F_raw").to_csv(os.path.join(udir, "district.csv.gz"), index=False, float_format="%.6f")
+        json.dump(dict(model=f"{args.model}_unscaled", test_set_sha256=spec["_sha256"], target="T2"),
+                  open(os.path.join(udir, "forecast_meta.json"), "w"))
+        others[f"{args.model}_unscaled"] = udir
+        allc = np.concatenate([r["scale"] for r in results if "scale" in r])
+        allc = allc[np.isfinite(allc)]
+        if len(allc):
+            print(f"[scaling] district factor c(o) = T2 per customer / fresh households' mean over the last "
+                  f"{sc.get('days', 28)} days: median {np.median(allc):.3f} (5-95 %: {np.percentile(allc, 5):.3f} .. "
+                  f"{np.percentile(allc, 95):.3f})")
     meta = dict(model=args.model, test_set_version=spec["version"], test_set_sha256=spec["_sha256"], target="T2",
                 weather=weather, level="client (bottom-up)", git_commit=git["commit"], dirty=git["dirty"], scope=scope,
                 districts=codes if scope != "national" else "all", splits=splits, substitution_test=sub, notes=notes,
                 household_forecasts=sum(r["windows"] for r in results),
-                gaps_filled_with_persistence=sum(r["gaps"] for r in results))
+                gaps_filled_with_persistence=sum(r["gaps"] for r in results), scaling=sc)
     json.dump(meta, open(os.path.join(fdir, "forecast_meta.json"), "w"), indent=2, default=str)
-    res = ts.score(fdir, test_dir, spec)
+    res = ts.score(fdir, test_dir, spec, others=others)
     text = ts.report(res, spec)
     print("\n" + text)
     ts.save_scores(res, os.path.join(out, "scores"), text)
@@ -325,6 +423,7 @@ def run_test(args, cfg, git, model_dir, model_config, tracking, scoring=None):
     try:
         from harness import plots
         plots.metrics_by_horizon(res, os.path.join(out, "scores"))
+        plots.levels(res, os.path.join(out, "scores"))
         n_win = len(plots.window_samples(res, os.path.join(out, "scores")))
         charts = {k: os.path.join(out, "scores", k) for k in ("figures", "windows")}
         print(f"[charts] {os.path.join(out, 'scores')}: metrics by horizon, {n_win} window charts")
@@ -342,7 +441,8 @@ def run_test(args, cfg, git, model_dir, model_config, tracking, scoring=None):
               "n_issue_dates": n_issue, "refits": len(blocks), "weather": weather}
     metrics = {args.model: {**ts.metrics_for_mlflow(res), "headline": headline}}
     files = [os.path.join(out, "scores", f) for f in ("scores.csv", "spec_check.csv", "bias_audit.csv", "report.txt",
-                                                      "national_daily.csv")]
+                                                      "national_daily.csv", "levels.csv")
+             if os.path.exists(os.path.join(out, "scores", f))]
     mlcfg = dict(cfg.get("mlflow", {}))
     if args.no_mlflow:
         mlcfg["enabled"] = False

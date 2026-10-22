@@ -67,6 +67,7 @@ def main():
     try:
         from harness import plots
         plots.metrics_by_horizon(res, out)
+        plots.levels(res, out)
         print(f"[charts] {out}: metrics by horizon, {len(plots.window_samples(res, out))} window charts")
     except Exception as e:                                         # noqa: BLE001
         print(f"[charts] WARNING: not drawn ({type(e).__name__}: {e})")

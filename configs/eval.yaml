@@ -41,3 +41,7 @@ run:
   out_dir: ~/work/eval
   workers: 4
   block: 20000                           # households per predict call
+  scaling:                               # district forecast = present x mean household forecast x c(o)
+    method: ratio                        # ratio: c(o) = T2 per customer / fresh households' observed mean, last `days`
+    days: 28                             #   days up to o - 1 (fresh households use ~10 % more); none: c = 1
+    clip: [0.5, 2.0]

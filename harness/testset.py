@@ -362,7 +362,8 @@ def score(forecast_dir, test_dir, spec, target="T2", reference=True, others=None
             for mname in models:
                 rows.append(dict(split=split, model=mname, horizon=h, sysmape=_sm(q, mname), bias=_bias(q, mname),
                                  mae=_mae(q, mname), days=int(len(q)), district_sysmape=_sm(qd, mname),
-                                 district_mae=_mae(qd, mname), district_rows=int(len(qd))))
+                                 district_mae=_mae(qd, mname), district_bias=_bias(qd, mname),
+                                 district_rows=int(len(qd))))
         res["splits"][split] = dict(scores=pd.DataFrame(rows), expected_rows=p["expected_rows"], missing=p["missing"],
                                     panel=p)
     # ТЗ 4.2.4 on test, national
@@ -396,7 +397,43 @@ def score(forecast_dir, test_dir, spec, target="T2", reference=True, others=None
         ba["passed"] = ba["ratio"] <= float(spec["scoring"]["bias_audit_ratio"])
     res["bias_audit"] = ba
     res["network"] = score_network(forecast_dir, spec)
+    res["levels"] = score_levels(forecast_dir, spec, res)
     return res
+
+
+LEVELS = ("household", "transformer", "feeder", "substation", "district", "national")
+
+
+def score_levels(forecast_dir, spec, res):
+    """MAE, WAPE and bias of the model at every level, per split and control horizon.
+    household / transformer / feeder / substation: bottom-up, observed days of the forecast households only (from
+    levels.csv.gz, written by the harness; MAE per household-day / node-day, kWh). district / national: the standard
+    scores (district rows and the national sum of the common panel; national WAPE = sysWAPE)."""
+    rows = []
+    df = _read(os.path.join(forecast_dir, "levels.csv"))
+    if df is not None:
+        df["origin"] = pd.to_datetime(df["origin"])
+        df["date"] = df["origin"] + pd.to_timedelta(df["horizon"], unit="D")
+        for split in spec["splits"]:
+            q = split_rows(spec, split, df)
+            for (lv, h), g in q.groupby(["level", "horizon"]):
+                a, n = g["actual"].sum(), g["n"].sum()
+                rows.append(dict(split=split, level=lv, horizon=int(h), n=int(n),
+                                 mae=float(g["abs_err"].sum() / n) if n else np.nan,
+                                 wape=float(g["abs_err"].sum() / a) if a > 0 else np.nan,
+                                 bias=float(g["err"].sum() / a) if a > 0 else np.nan))
+    for split, sp in res["splits"].items():
+        t = sp["scores"]
+        t = t[(t["model"] == res["model"]) & t["horizon"].isin(res["ctrl"])]
+        for r in t.to_dict("records"):
+            rows.append(dict(split=split, level="district", horizon=int(r["horizon"]), n=int(r["district_rows"]),
+                             mae=r["district_mae"], wape=r["district_sysmape"], bias=r["district_bias"]))
+            rows.append(dict(split=split, level="national", horizon=int(r["horizon"]), n=int(r["days"]),
+                             mae=r["mae"], wape=r["sysmape"], bias=r["bias"]))
+    out = pd.DataFrame(rows, columns=["split", "level", "horizon", "n", "mae", "wape", "bias"])
+    out["level"] = pd.Categorical(out["level"], [x for x in LEVELS if x in set(out["level"])] +
+                                  sorted(set(out["level"]) - set(LEVELS)), ordered=True)
+    return out.sort_values(["split", "level", "horizon"]).reset_index(drop=True)
 
 
 def score_network(forecast_dir, spec):
@@ -484,8 +521,20 @@ def report(res, spec):
     p("")
     p(f"district level (pooled over the district rows of the common panel), {sp}:")
     p(dd.map(lambda x: f"{x:6.2%}").to_string())
+    lv = res.get("levels")
     nw = res["network"]
-    if len(nw):
+    if lv is not None and len(lv) and set(lv["level"].astype(str)) - {"district", "national"}:
+        q = lv[lv["split"] == sp]
+        p("")
+        p(f"{m} at every level, {sp}: WAPE (bias) | household .. substation: bottom-up over the observed days of the "
+          "forecast households (supplementary)")
+        w = q.pivot(index="level", columns="horizon", values="wape")
+        b = q.pivot(index="level", columns="horizon", values="bias")
+        p(pd.DataFrame({h: [f"{w.loc[i, h]:6.2%} ({b.loc[i, h]:+5.1%})" for i in w.index] for h in w.columns},
+                       index=w.index).to_string())
+        p(f"MAE, kWh per household-day / node-day / district-day / national day, {sp}:")
+        p(q.pivot(index="level", columns="horizon", values="mae").map(lambda x: f"{x:10.1f}").to_string())
+    elif len(nw):
         p("")
         p(f"supplementary, not the standard: bottom-up matched sysMAPE at network levels, {sp}:")
         q = nw[(nw["split"] == sp) & nw["horizon"].isin(ctrl)].pivot(index="level", columns="horizon", values="sysmape")
@@ -514,6 +563,12 @@ def metrics_for_mlflow(res):
             if r.model == res["model"]:
                 out[f"{split}/days_h{r.horizon}"] = r.days
         out[f"{split}/headline"] = headline(res, split)
+    lv = res.get("levels")
+    if lv is not None:
+        for r in lv.to_dict("records"):
+            for k in ("wape", "mae", "bias"):
+                if np.isfinite(r[k]):
+                    out[f"{r['split']}/level/{r['level']}/{k}_h{r['horizon']}"] = r[k]
     for r in res["spec_check"].to_dict("records"):
         out[f"test/spec_pass_h{r['horizon']}"] = float(r["passed"])
     out["test/spec_pass_all"] = float(res["spec_check"]["passed"].all())
@@ -539,6 +594,13 @@ def curves_for_mlflow(res):
             g = g.sort_values("horizon")
             for key, col in CURVES.items():
                 out[pre + key] = [(int(h), float(v)) for h, v in zip(g["horizon"], g[col]) if np.isfinite(v)]
+    lv = res.get("levels")
+    if lv is not None:                                                # control horizons only, per level
+        for (split, level), g in lv.groupby(["split", "level"], observed=True):
+            g = g.sort_values("horizon")
+            for k, name in (("wape", "WAPE"), ("mae", "MAE"), ("bias", "bias")):
+                out[f"{split}/level/{level}/{name}"] = [(int(h), float(v)) for h, v in zip(g["horizon"], g[k])
+                                                        if np.isfinite(v)]
     return out
 
 
@@ -549,6 +611,8 @@ def save_scores(res, out_dir, text):
     res["bias_audit"].to_csv(os.path.join(out_dir, "bias_audit.csv"), index=False)
     if len(res["network"]):
         res["network"].to_csv(os.path.join(out_dir, "network_supplementary.csv"), index=False)
+    if res.get("levels") is not None and len(res["levels"]):
+        res["levels"].to_csv(os.path.join(out_dir, "levels.csv"), index=False)
     nat = [s["panel"]["national"].assign(split=split) for split, s in res["splits"].items()]
     pd.concat(nat).to_csv(os.path.join(out_dir, "national_daily.csv"), index=False, float_format="%.6f")
     open(os.path.join(out_dir, "report.txt"), "w").write(text + "\n")

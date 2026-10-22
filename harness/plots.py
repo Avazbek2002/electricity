@@ -1,6 +1,7 @@
 """Charts of an evaluation run (logged to MLflow with the scores):
 
     figures/metrics_by_horizon.png    sysWAPE, WAPE, MAE and bias over every horizon 1..60: the model vs B0
+    figures/levels.png                WAPE and bias of the model at every level (household .. national), h 1/7/14/30/60
     windows/<split>_<issue date>.png  window samples: the national (sum of districts) actual vs the model and B0 over
                                       the 60 days after the issue date, 12 issue dates per split (one per month)
     windows/overview_<split>.png      the same windows on one page
@@ -26,7 +27,7 @@ def _plt():
     return plt
 
 
-def _style(ax, title=None, pct=False):
+def _style(ax, title=None, pct=False, decimals=0):
     import matplotlib.ticker as mt
     ax.set_facecolor(SURFACE)
     for side in ("top", "right"):
@@ -37,7 +38,7 @@ def _style(ax, title=None, pct=False):
     ax.grid(axis="y", color=GRID, linewidth=0.8)
     ax.set_axisbelow(True)
     if pct:
-        ax.yaxis.set_major_formatter(mt.PercentFormatter(1.0, decimals=0))
+        ax.yaxis.set_major_formatter(mt.PercentFormatter(1.0, decimals=decimals))
     if title:
         ax.set_title(title, loc="left", fontsize=10, color=INK)
 
@@ -85,7 +86,7 @@ def metrics_by_horizon(res, out_dir):
                 ax.axhline(0, color=MUTED, linewidth=0.8)
             ax.set_xlabel("horizon (days)", fontsize=8, color=MUTED)
             ax.set_xlim(1, int(t["horizon"].max()))
-            _style(ax, f"{sp}: {title}", pct=pct)
+            _style(ax, f"{sp}: {title}", pct=pct, decimals=1 if col == "bias" else 0)
     h, lab = axes[0][0].get_legend_handles_labels()
     fig.legend(h, lab, loc="lower center", ncol=len(lab), fontsize=9, frameon=False)
     return _save(fig, os.path.join(out_dir, "figures", "metrics_by_horizon.png"), legend_rect=0.06)
@@ -165,3 +166,36 @@ def window_samples(res, out_dir, per_split=12):
         made.append(_save(fig, os.path.join(out_dir, "windows", f"overview_{sp}.png"), legend_rect=0.04,
                           top=0.95))
     return made
+
+
+LEVEL_COLOURS = {"household": "#2a78d6", "transformer": "#eb6834", "feeder": "#1baf7a", "substation": "#eda100",
+                 "district": "#e87ba4", "national": "#6250d6"}
+
+
+def levels(res, out_dir):
+    """Grouped bars: WAPE (top) and bias (bottom) per level at the control horizons, one column per split."""
+    lv = res.get("levels")
+    if lv is None or not len(lv):
+        return None
+    plt = _plt()
+    splits = [s for s in res["splits"] if (lv["split"] == s).any()]
+    names = [x for x in lv["level"].cat.categories if (lv["level"] == x).any()]
+    fig, axes = plt.subplots(2, len(splits), figsize=(7 * len(splits), 6.4), squeeze=False)
+    for j, sp in enumerate(splits):
+        q = lv[lv["split"] == sp]
+        hs = sorted(q["horizon"].unique())
+        x = np.arange(len(hs))
+        w = 0.8 / max(len(names), 1)
+        for i, (col, title) in enumerate((("wape", "WAPE (national: sysWAPE)"), ("bias", "bias"))):
+            ax = axes[i][j]
+            for k, nm in enumerate(names):
+                g = q[q["level"] == nm].set_index("horizon").reindex(hs)
+                ax.bar(x + (k - (len(names) - 1) / 2) * w, g[col].to_numpy(), w * 0.92, label=nm,
+                       color=LEVEL_COLOURS.get(nm, MUTED), edgecolor=SURFACE, linewidth=1)
+            if col == "bias":
+                ax.axhline(0, color=MUTED, linewidth=0.8)
+            ax.set_xticks(x, [f"h{h}" for h in hs])
+            _style(ax, f"{sp}: {res['model']} {title} by level", pct=True, decimals=0 if col == "wape" else 1)
+    h, lab = axes[0][0].get_legend_handles_labels()
+    fig.legend(h, lab, loc="lower center", ncol=len(lab), fontsize=9, frameon=False)
+    return _save(fig, os.path.join(out_dir, "figures", "levels.png"), legend_rect=0.05)
