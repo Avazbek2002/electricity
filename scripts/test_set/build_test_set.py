@@ -52,6 +52,7 @@ def build_district(code, cfg):
                       d["start"], d["end"], d["labels"])
     region = district_region(code, d["uri"], d.get("env_prefix", ""))
     out = dict(code=str(code), region=region, customers=int(len(D["keys"])), folds={}, seconds=0.0)
+    print(f"[build] {code}: read {len(D['keys']):,} households x {D['M'].shape[1]} days | {ts.memory_line()}", flush=True)
     if not len(D["keys"]):
         return out
     M = D["M"]
@@ -83,6 +84,7 @@ def build_district(code, cfg):
         out["folds"][f["name"]] = dict(panel=int(len(r)), levels=lv_out)
     out["T"] = T
     out["seconds"] = time.time() - t0
+    out["peak_bytes"] = ts.peak_rss_bytes()
     return out
 
 
@@ -114,7 +116,9 @@ def main():
     cfg = dict(spec=spec, out=out, levels=levels)
     acc = {f["name"]: {lv: ts.NodeSum() for lv in levels} for f in spec["folds"]}
     dist_rows, t0 = [], time.time()
-    with cf.ProcessPoolExecutor(a.workers) as ex:
+    print(f"[memory] at start: {ts.memory_line()}", flush=True)
+    import multiprocessing as mp
+    with cf.ProcessPoolExecutor(a.workers, mp_context=mp.get_context("spawn")) as ex:
         futs = {ex.submit(build_district, c, cfg): c for c in codes}
         for k, fu in enumerate(cf.as_completed(futs), 1):
             r = fu.result()
@@ -124,6 +128,8 @@ def main():
                 for lv, e in fr["levels"].items():
                     acc[fname][lv].add(e["names"], {k2: v for k2, v in e.items() if k2 != "names"})
             dist_rows.append(row)
+            print(f"[build] {r['code']}: {r['customers']:,} households, {r.get('seconds', 0):.0f} s | "
+                  f"{ts.memory_line(r.get('peak_bytes'))}", flush=True)
             if k % 10 == 0 or k == len(codes) or k <= 3:
                 el = time.time() - t0
                 print(f"[build] {k}/{len(codes)} districts, {el / 60:.1f} min, about {el / k * (len(codes) - k) / 60:.1f} min left",

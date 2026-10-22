@@ -165,6 +165,40 @@ class NodeSum:
         return np.stack([p[key] for p in self.parts]) if self.parts else np.zeros((0,))
 
 
+def _read_num(path):
+    try:
+        v = open(path).read().strip()
+        return None if v in ("max", "") else float(v)
+    except OSError:
+        return None
+
+
+def memory_line(worker_peak_bytes=None):
+    """'worker peak 1.2 GB | pod 5.3 of 16.0 GB, OOM kills 0': this process and the pod's memory (cgroup v2 or v1)."""
+    import resource
+    parts = []
+    if worker_peak_bytes is not None:
+        parts.append(f"worker peak {worker_peak_bytes / 1e9:.1f} GB")
+    else:
+        parts.append(f"this process peak {resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024 / 1e9:.1f} GB")
+    cur = _read_num("/sys/fs/cgroup/memory.current") or _read_num("/sys/fs/cgroup/memory/memory.usage_in_bytes")
+    lim = _read_num("/sys/fs/cgroup/memory.max") or _read_num("/sys/fs/cgroup/memory/memory.limit_in_bytes")
+    if cur is not None:
+        txt = f"pod {cur / 1e9:.1f}" + (f" of {lim / 1e9:.1f} GB" if lim and lim < 1e15 else " GB (no limit found)")
+        try:
+            ev = dict(line.split() for line in open("/sys/fs/cgroup/memory.events"))
+            txt += f", OOM kills so far {ev.get('oom_kill', '?')}"
+        except (OSError, ValueError):
+            pass
+        parts.append(txt)
+    return " | ".join(parts)
+
+
+def peak_rss_bytes():
+    import resource
+    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024
+
+
 def sha256_file(path, chunk=1 << 20):
     h = hashlib.sha256()
     with open(path, "rb") as fh:

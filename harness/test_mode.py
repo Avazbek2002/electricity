@@ -101,6 +101,7 @@ def test_worker(code, cfg):
                 res["windows"] += len(r)
         res["folds"][f["name"]] = acc
     res["seconds"] = time.time() - t0
+    res["peak_bytes"] = ts.peak_rss_bytes()
     return res
 
 
@@ -193,6 +194,7 @@ def run_test(args, cfg, git, model_dir, model_config, tracking, scoring):
     thr = max(1, (os.cpu_count() or 4) // workers)
     for v in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
         os.environ[v] = str(thr)
+    print(f"[memory] at start: {ts.memory_line()}", flush=True)
     merged = {f["name"]: {lv: ts.NodeSum() for lv in levels} for f in spec["folds"]}
     gaps = windows = 0
     t1 = time.time()
@@ -211,6 +213,7 @@ def run_test(args, cfg, git, model_dir, model_config, tracking, scoring):
                     for lv, e in acc.items():
                         merged[fname][lv].add(e["names"], {x: e[x] for x in ("N", "FO", "FR", "NO")})
                 gaps, windows = gaps + r["gaps"], windows + r["windows"]
+                print(f"[districts] {code}: {r['seconds']:.0f} s | {ts.memory_line(r.get('peak_bytes'))}", flush=True)
                 k += 1
                 if k % 10 == 0 or k == len(codes) or k <= 3:
                     el = time.time() - t1
