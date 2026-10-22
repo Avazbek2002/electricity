@@ -1,0 +1,71 @@
+# SUPPLEMENTARY SPLIT (not the standard; reported next to configs/test_set.yaml, as the ML guide allows: "experimenting
+# with the split is allowed, reported separately").
+#
+# Why: before 2024-08 the household data are recorded coarsely (readings in 4-5 day runs, whole-number kWh, only ~18 %
+# of customers with fresh history in 2024-H1; scripts/analysis/regime_audit.py), so the standard validation year 2024
+# is mostly the old regime, which production will never see. Here model choice and test are both in the new regime:
+#   - validation = issue dates 2025-01 .. 2025-06 (targets <= 2025-06-30): winter, spring, early summer
+#   - test       = issue dates 2025-07 .. 2025-12 (184 days >= the ТЗ's 180; targets to 2026-02-28)
+#   - quarterly refits 2025-01-01, 04-01, 07-01, 10-01; a model fitted at R sees only targets d <= R - 1
+#   - everything else (target T2, B0, 98 % national rule, no target-day weather, scoring) as the standard split.
+# The 2026 reserve (issue dates 2026) stays untouched for the final check of the chosen model.
+#
+version: copy it to a new `version` and rebuild (the builder records this file's hash in the
+# manifest; the scorer refuses targets or forecasts built from a different hash).
+#
+#   - Issue date o; history known up to o - 1; forecasts for d = o + h, h = 1..60.
+#   - Validation = issue dates 2024 (targets d <= 2024-12-31); test = issue dates 2025 (every target); 2026 = reserve,
+#     not touched. Model choice on validation; test only for the chosen variants.
+#   - Quarterly refits on fixed dates; a model trained at R sees only pairs with target d <= R - 1.
+#   - Target T2 per district; national (and region) = sum of districts on a common panel.
+#   - B0 (level x last-year seasonal ratio) always on the same rows. Standard runs use no target-day weather.
+
+version: ts-2026-10-22-v2-s25
+
+data:
+  uri: s3://phase1/electricity/_staging/household-enriched-v14-nat-b2c-20261017-8e1414/
+  env_prefix: ""
+  start: "2022-01-01"
+  end: "2026-06-29"
+
+# District target T2 (guide part 2):  T2(d) = n_rows x (kwh_obs + kwh_est) / (n_obs + n_est)
+target:
+  name: T2
+  min_known_client_days: 100     # a day is not used if obs + est client-days < 100, ...
+  exclude_right_edge: true       # ... if the district has open intervals at the end of history (is_right_edge), or no data
+  min_coverage: 0.5              # (n_obs + n_est) / n_rows below this: flagged (not a training target, not evaluated)
+  flag_columns: [crisis_context, data_interruption]   # Jan-Feb 2023, Aug 2024: flagged
+  experimental: T3               # T3 adds long-gap allocations; reported separately, never mixed with T2
+
+history_gap_days: 1              # on issue date o the data are known up to o - 1
+
+splits:
+  validation: {issue_start: "2025-01-01", issue_end: "2025-06-30", target_end: "2025-06-30"}
+  test:       {issue_start: "2025-07-01", issue_end: "2025-12-31"}
+  # reserve: issue dates 2026 -- not used
+
+# A model fitted at R forecasts the issue dates [R, next R); it may use only targets d <= R - 1.
+refits: ["2025-01-01", "2025-04-01", "2025-07-01", "2025-10-01"]
+
+horizons: 60
+control_horizons: [1, 7, 14, 30, 60]
+
+national:
+  min_district_share: 0.98       # a national (or region) (o, h) row needs >= 98 % of the districts present and clean
+
+reference_model: B0              # level x last-year ratio; computed by the scorer on the same rows
+weather: none                    # standard: no target-day weather (weather up to o - 1 and past climatology only)
+
+# The guide's sample for experiments (sum of 5 districts; noisier than national: a win there calls for a national run)
+sample_districts: ["03203", "10240", "22202", "26266", "33220"]
+
+scoring:
+  # ТЗ 4.2.4: sysMAPE_h = sum_d |P(d) - A(d)| / sum_d A(d); rejection if any is exceeded (checked on test, national)
+  spec_thresholds: {1: 0.08, 7: 0.11, 14: 0.15, 30: 0.18, 60: 0.20}
+  bias_audit_ratio: 1.5          # ТЗ: regions (and season / day-type groups) at most 1.5 x the national value
+  min_households_network: 10     # supplementary network levels (bottom-up harness runs): observed households per node-day
+
+notes:
+  - "SUPPLEMENTARY split (validation 2025-H1, test 2025-H2), reported next to the standard ts-2026-10-22-v2; target and rules from the ML experiments guide (2026-10-22, parts 2 and 4)."
+  - "Supplementary substation / feeder scores (bottom-up harness runs only) are not part of the standard and use the last-known network mapping."
+  - "The 2026 reserve is never scored here."

@@ -2,6 +2,7 @@ family: gam
 # training rows: household x origin x horizon (every day 1..60: the weekday pattern of each target day is learned)
 horizons: all                    # all | knots (1, 2, 3, 5, 7, 10, 14, 21, 30, 45, 60, linear in between: the old GAM)
 forecast: none                   # none: normals only (the standard run) | simulated: 10-day forecast (--weather simulated)
+regime_flag: true                # input regime_old (issue date < 2024-08-01): old winters read 10-17 % higher (regime_audit.py)
 household_share: 0.005           # stable hash share of households used for training (0.5% ~ 40k nationally)
 origin_step: 28                  # days between training origins (staggered across districts)
 max_rows: 8000000                # random cap on training rows

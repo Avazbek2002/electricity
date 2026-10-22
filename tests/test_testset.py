@@ -181,3 +181,13 @@ def test_curves_and_charts(tmp_path):
     assert "test/B0/WAPE" in c
     from harness import plots
     assert os.path.exists(plots.metrics_by_horizon(r, str(tmp_path / "out")))
+
+
+def test_supplementary_2025_split():
+    s = ts.load_spec(os.path.join(REPO, "configs", "test_set_2025.yaml"))
+    assert s["version"].endswith("-s25")
+    assert len(ts.issue_dates(s, "test")) == 184 >= 180                 # the ТЗ minimum
+    assert ts.issue_dates(s, "validation")[0] == pd.Timestamp("2025-01-01")
+    assert [str(r.date()) for r, _ in ts.refit_blocks(s, ["validation", "test"])] == [
+        "2025-01-01", "2025-04-01", "2025-07-01", "2025-10-01"]
+    assert pd.Timestamp(s["splits"]["validation"]["target_end"]) < pd.Timestamp(s["splits"]["test"]["issue_start"])

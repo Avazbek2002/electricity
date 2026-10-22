@@ -2,8 +2,13 @@ family: v8_boost
 variant: catboost
 forecast: none                  # the standard run: no target-day weather (normals only). See catboost_fc for the forecast run
 buckets: [0, 1, 2, 3, 4]        # customer_bucket values: each ~1 % of customers -> 5 %. null = every customer
-train_sample: null              # share of the trainable windows kept (stable hash); e.g. 0.2 with buckets: null
+train_sample: 0.2               # share of the trainable windows kept (stable hash): with >= 30 target days 5 % of
+                                # customers give ~1.3M windows (~15 s per CatBoost tree on 64 cores); 0.2 keeps ~260k
 max_window_gb: 40               # refuse if kin + ktg would need more (raise on a big pod)
 workers: null                   # districts read in parallel (null: evaluate.py --workers)
 wp:                             # other whole_pipeline_v8 settings (part of the shared fit), e.g. CATBOOST_PARAMS
   SEGMENT_USE_OLD: true         # segments + priors from all history: every 2024 refit has old-regime data only (v8: false)
+  TRAIN_MIN_TARGET_DAYS: 30     # train on windows with >= 30 of 60 target days observed (v8: 54, which keeps ~1 % of the
+                                # pre-2024-08 windows: regime_audit.py); a missing target day = residual 0 (no correction)
+  OLD_REGIME_FLAG: true         # feature regime_old = issue date before 2024-08-01: old winters read 10-17 % higher for the
+                                # same customers (regime_audit.py E); 1 for 2024 issue dates, 0 from 2024-08

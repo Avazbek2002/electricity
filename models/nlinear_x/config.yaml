@@ -3,4 +3,5 @@ variant: nlinear_x               # nlinear | nlinear_x | thermal_nlinear | therm
 forecast: none                   # none: normals only (the standard run) | simulated: 10-day forecast (--weather simulated)
 pretrained: []                   # earlier household_nlinear.py output folders, reused when cutoff, validation block and
                                  # forecast match
-train_args: []                   # extra household_nlinear.py flags, e.g. ["--stride", "30"]
+train_args: ["--train-min-target-days", "30"]   # extra household_nlinear.py flags, e.g. ["--stride", "30"]; 30 of 60
+                                 # observed target days instead of 54 (regime_audit.py: 54 keeps ~1 % of old windows)

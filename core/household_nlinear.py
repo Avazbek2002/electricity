@@ -411,6 +411,9 @@ def main(argv=None):
     p.add_argument("--threads-per-worker", type=int, default=None, help="BLAS threads in each worker (default: cores / workers)")
     p.add_argument("--stride", type=int, default=wp.WINDOW_STRIDE, help="days between a customer's origins (default as the "
                    "household model: 30; 10 = three times the windows)")
+    p.add_argument("--train-min-target-days", type=int, default=wp.TRAIN_MIN_TARGET_DAYS,
+                   help="a window is trained on (and validated) when this many of its 60 target days are observed "
+                        "(default 54; 30 keeps ~30x more pre-2024-08 windows: scripts/analysis/regime_audit.py)")
     p.add_argument("--cutoff", default=wp.TRAIN_CUTOFF)
     p.add_argument("--val-start", default=wp.VAL_START)
     p.add_argument("--val-end", default=wp.VAL_END)
@@ -486,7 +489,8 @@ def run(wp, args, out_dir, variants):
                weight=args.weight, prior_h=args.prior_h, prior_c=args.prior_c, prior_h_mm=args.prior_h_mm,
                prior_c_mm=args.prior_c_mm, block=args.block, chunk=args.chunk, seed=wp.SEED,
                wp=dict(INCLUDE_OLD=wp.INCLUDE_OLD, EXCLUDE_RANGES=list(wp.EXCLUDE_RANGES), EXCLUDE_MODE=wp.EXCLUDE_MODE,
-                       REGIME_CUTOFF=wp.REGIME_CUTOFF, OLD_START=wp.OLD_START, USE_MINMAX=wp.USE_MINMAX))
+                       REGIME_CUTOFF=wp.REGIME_CUTOFF, OLD_START=wp.OLD_START, USE_MINMAX=wp.USE_MINMAX,
+                       TRAIN_MIN_TARGET_DAYS=int(args.train_min_target_days)))
     lim = wp._memory_limit_gb()
     print(f"[config] customers {'ALL' if buckets is None else buckets} | stride {args.stride} | cutoff {args.cutoff} | "
           f"validation ({args.val_start}, {args.val_end}] | test sample {args.test_sample} (CatBoost subset "

@@ -58,15 +58,16 @@ class Model(BaseModel):
         if len(X) > cap:
             X = X.sample(cap, random_state=0).reset_index(drop=True)
         y, w = X.pop("y").to_numpy(), X.pop("w").to_numpy()
-        X = X[gf.FEATURES]
+        feats = gf.FEATURES + (["regime_old"] if c.get("regime_flag") else [])
+        X = X[feats]
         inter = [tuple(p) for p in c.get("interactions", [])] or int(c.get("auto_interactions", 10))
         ebm = ExplainableBoostingRegressor(
-            feature_names=gf.FEATURES, feature_types=["nominal" if f in gf.CATEGORICAL else "continuous" for f in gf.FEATURES],
+            feature_names=feats, feature_types=["nominal" if f in gf.CATEGORICAL else "continuous" for f in feats],
             interactions=inter, outer_bags=int(c.get("outer_bags", 4)), max_bins=int(c.get("max_bins", 256)),
             learning_rate=float(c.get("learning_rate", 0.015)), max_rounds=int(c.get("max_rounds", 5000)),
             validation_size=0.15, early_stopping_rounds=100, n_jobs=int(c.get("n_jobs", spec.workers)), random_state=0)
         t1 = time.time()
-        print(f"[gam] fitting EBM on {len(X):,} rows, {len(gf.FEATURES)} inputs, interactions {inter}")
+        print(f"[gam] fitting EBM on {len(X):,} rows, {len(feats)} inputs, interactions {inter}")
         import warnings
         with warnings.catch_warnings():                                  # NaN inputs are handled natively by EBM
             warnings.filterwarnings("ignore", message="Missing values detected")
@@ -76,7 +77,7 @@ class Model(BaseModel):
                                                                                                        ascending=False)
         imp.to_csv(os.path.join(artifacts_dir, "term_importance.csv"), index=False)
         json.dump(dict(rows=len(X), fit_minutes=(time.time() - t1) / 60, rows_minutes=(t1 - t0) / 60, config=c,
-                       knots=gf.KNOTS, features=gf.FEATURES, horizons=cfg["horizons"], forecast=cfg["forecast"]),
+                       knots=gf.KNOTS, features=feats, horizons=cfg["horizons"], forecast=cfg["forecast"]),
                   open(os.path.join(artifacts_dir, "gam_info.json"), "w"), indent=2)
         print(f"[gam] fitted in {(time.time() - t1) / 60:.1f} min; top terms:\n" + imp.head(12).to_string(index=False))
 
@@ -89,6 +90,7 @@ class Model(BaseModel):
         info = json.load(open(os.path.join(artifacts_dir, "gam_info.json")))
         self.forecast = info.get("forecast", "simulated")
         self.hz = gf.ALL_H if info.get("horizons") == "all" else gf.KNOTS
+        self.feats = info.get("features", gf.FEATURES)
         self.notes = [f"gam: horizons {'every day 1..60' if self.hz == gf.ALL_H else 'knots, linear in between'}, "
                       f"trained with forecast = {self.forecast}"]
         k = np.asarray(gf.KNOTS, dtype=float)
@@ -104,7 +106,7 @@ class Model(BaseModel):
             raise SystemExit("this GAM was trained with a simulated forecast: run it with --weather simulated")
         grid = panel.pipeline["fc_grid"] if self.forecast == "simulated" else None
         path, past30, nrm_dev = gf.origin_weather(panel.coato, panel.origin, panel.pipeline["clim"], grid, wp)
-        X = gf.rows(hh, path, past30, nrm_dev, panel.origin, panel.housing, self.hz, wp)[gf.FEATURES]
+        X = gf.rows(hh, path, past30, nrm_dev, panel.origin, panel.housing, self.hz, wp)[self.feats]
         f = np.clip(self.ebm.predict(X).reshape(n, len(self.hz)), 0, 5)
         lev = hh["level"]
         ok = np.isfinite(lev) & (lev > float(self.config.get("min_level", 0.2)))

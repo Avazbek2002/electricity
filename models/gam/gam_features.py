@@ -15,6 +15,7 @@ One row = household x origin x horizon h. Inputs, all known at the origin:
                known in advance; replaces the target day of year, which the 2024-01 refit had never seen in winter:
                there is no clean January-February target before 2024)
   dow          target day of week (category)
+  regime_old   1 when the issue date is before 2024-08-01 (old recording regime), used with config regime_flag: true
   ly_ratio     last year's same block / last year's level (block of h), 1 if unknown; ly_have 1/0
   housing      housing_type_id (category)
 Target: y / level (clipped 0..5); weight: level (so the loss counts kWh, as pooled WAPE does).
@@ -30,6 +31,7 @@ KNOTS = (1, 2, 3, 5, 7, 10, 14, 21, 30, 45, 60)
 FEATURES = ["h", "log_level", "r_last", "r7_30", "slope30", "cv30", "obs90", "temp", "temp_dev", "nrm_dev", "dow",
             "ly_ratio", "ly_have", "housing"]
 ALL_H = tuple(range(1, 61))
+REGIME_CUTOFF = "2024-08-01"     # old recording regime before it (coarse readings, winters 10-17 % higher)
 CATEGORICAL = ("dow", "housing")
 
 
@@ -105,7 +107,8 @@ def rows(hh, path, past30, nrm_dev, origin, housing, horizons, wp):
         "r7_30": rep(hh["r7_30"]), "slope30": rep(hh["slope30"]), "cv30": rep(hh["cv30"]), "obs90": rep(hh["obs90"]),
         "temp": til(path[hz - 1]), "temp_dev": til(path[hz - 1] - past30), "nrm_dev": til(nrm_dev[hz - 1]),
         "dow": til(tgt.dayofweek.astype(str).to_numpy()), "ly_ratio": np.where(np.isfinite(ly), ly, 1.0).ravel(),
-        "ly_have": np.isfinite(ly).astype(float).ravel(), "housing": np.repeat(hs, k)})
+        "ly_have": np.isfinite(ly).astype(float).ravel(), "housing": np.repeat(hs, k),
+        "regime_old": float(pd.Timestamp(origin) < pd.Timestamp(REGIME_CUTOFF))})
 
 
 def _excluded(o, dates, wp):

@@ -38,6 +38,25 @@ all up to o - 1) are forecast by the model; the district forecast is
 from weather up to o - 1. Existing models: persistence as is; GAM trains with the same one-day gap; NLinear (trained
 with history ending on its origin) is shifted by one day -- exact for h1..h59, h60 repeats step 60 (noted in the run).
 
+## Supplementary split: validation 2025-H1, test 2025-H2 (`configs/test_set_2025.yaml`)
+
+Before 2024-08 the household data are recorded coarsely: readings in 4-5 day runs between 2-3 day estimated intervals,
+88 % whole-number kWh, only ~7-34 % of customers with fresh history and ~1 % of windows with 54 of 60 observed target
+days, and winters 10-17 % higher for the same customers than in the new regime (`scripts/analysis/regime_audit.py`).
+The standard validation year 2024 is therefore mostly a regime production will never see. The supplementary split
+(`ts-2026-10-22-v2-s25`, reported next to the standard, as the guide allows) chooses and tests in the new regime:
+validation = issue dates 2025-01..06 (targets <= 2025-06-30), test = issue dates 2025-07..12 (184 days, targets to
+2026-02-28), refits 2025-01-01 / 04-01 / 07-01 / 10-01; everything else as the standard. The 2026 reserve stays untouched.
+
+```bash
+python scripts/test_set/build_test_set.py --spec configs/test_set_2025.yaml --sample --workers 5
+python evaluate.py --model catboost --mode validate --sample --test-set configs/test_set_2025.yaml --workers 8
+```
+
+Training changes that go with it (all models' configs): windows trained on with >= 30 of 60 observed target days
+(`TRAIN_MIN_TARGET_DAYS: 30`; v8 used 54) and an old-regime input (`regime_old` = issue date before 2024-08-01) for
+CatBoost / XGBoost (v8 `OLD_REGIME_FLAG`) and the GAM (`regime_flag`).
+
 ## Scaling and levels (harness runs)
 
 - **Scaling** (`configs/eval.yaml` `run.scaling`): the district forecast is multiplied by
