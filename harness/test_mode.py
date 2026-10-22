@@ -277,6 +277,8 @@ def run_test(args, cfg, git, model_dir, model_config, tracking, scoring):
         mlcfg["enabled"] = False
     if not os.getenv("MLFLOW_TRACKING_URI") and not mlcfg.get("uri"):
         mlcfg["uri"] = "sqlite:///" + os.path.join(out_root, "mlflow.db")
+        print("\n" + "!" * 100 + "\n[mlflow] WARNING: MLFLOW_TRACKING_URI is not set -> this run goes to the LOCAL store "
+              f"{mlcfg['uri']}, not the team server.\n          source ~/work/mlflow_env.sh before running.\n" + "!" * 100 + "\n")
     last = spec["folds"][-1]["name"]                                # the newest fit is the one registered
     run_id = tracking.mlflow_log_safe(mlcfg, tags, params, dict(fit_seconds=fit_seconds, predict_seconds=predict_seconds),
                                       metrics, files, args.model, register=args.register, artifacts_dir=arts[last],

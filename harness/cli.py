@@ -175,6 +175,8 @@ def main(argv=None):
         mlcfg["enabled"] = False
     if not os.getenv("MLFLOW_TRACKING_URI") and not mlcfg.get("uri"):
         mlcfg["uri"] = "sqlite:///" + os.path.join(out_root, "mlflow.db")
+        print("\n" + "!" * 100 + "\n[mlflow] WARNING: MLFLOW_TRACKING_URI is not set -> this run goes to the LOCAL store "
+              f"{mlcfg['uri']}, not the team server.\n          source ~/work/mlflow_env.sh before running.\n" + "!" * 100 + "\n")
     tracking.save_json(os.path.join(out, "run.json"), dict(tags=tags, params=params, data=sc["data"],
                                                             headline=sc["headline"], metrics=metrics))
     run_id = tracking.mlflow_log_safe(mlcfg, tags, params, dict(fit_seconds=fit_seconds, predict_seconds=predict_seconds),
