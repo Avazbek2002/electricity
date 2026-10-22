@@ -5,13 +5,20 @@ Files of a built test set (<test_dir> = ~/work/test_set/<version>/):
     districts.csv                       district -> region
     panel/<fold>/<district>.parquet     the fixed panel (customer_key): stays in the analytical environment
     actuals/<level>.csv[.gz]            fold, node, date, households, observed, coverage, actual_observed_sum, actual, scored
-    history/<fold>/<level>.csv.gz       coverage-adjusted daily node totals 2022.. for direct (node-level) models
+    history/<fold>/<level>.csv.gz       coverage-adjusted daily totals 2022.. (national, region, district) for direct models
+
+Scores per level (configs/test_set.yaml `levels`):
+    coverage_adjusted  national / region / district; district = N x mean of the observed panel households,
+                       region / national = the sum of their districts (build_from: district). Bottom-up or direct.
+    matched            substation / feeder / transformer (bottom-up only): sum of forecasts vs sum of actuals of the
+                       same observed panel households. Also reported for bottom-up forecasts at the coarse levels.
 
 Forecast submission (<forecast_dir>/):
     forecast_meta.json                  {"model": ..., "test_set_version": ..., "test_set_sha256": ...}
-    <level>.csv[.gz]                    fold, node, origin, horizon, forecast [, forecast_observed_sum]
-        forecast               the node's coverage-adjusted total for target day origin + horizon (every model)
-        forecast_observed_sum  bottom-up only: sum of the forecasts of the panel households observed on the target day
+    <level>.csv[.gz]                    fold, node, origin, horizon, forecast [, forecast_observed_sum, observed]
+        forecast               coverage-adjusted node total for target day origin + horizon (national/region/district)
+        forecast_observed_sum  bottom-up: sum of the forecasts of the panel households observed on the target day
+                               (required for substation / feeder / transformer)
 """
 import hashlib
 import json
@@ -61,6 +68,45 @@ def level_horizons(spec, level):
 def levels_of(spec, include_optional=False):
     return [lv for lv in LEVELS if lv in spec["levels"]
             and (include_optional or not spec["levels"][lv].get("optional"))]
+
+
+def level_score(spec, level):
+    return spec["levels"][level].get("score", "coverage_adjusted")
+
+
+def direct_levels(spec):
+    """Levels a direct (node-level) model may submit: those scored coverage-adjusted."""
+    return [lv for lv in levels_of(spec) if level_score(spec, lv) == "coverage_adjusted"]
+
+
+def built_from(spec, level):
+    return spec["levels"][level].get("build_from")
+
+
+def scored_mask(spec, level, N, n):
+    """A node-day is scored when the node has >= min_households panel households, >= min_households of them observed,
+    and the observed share reaches the level's min_coverage (0 if not set)."""
+    mn = int(spec["scoring"]["min_households"])
+    cov = float(spec["levels"][level].get("min_coverage", 0.0))
+    N = np.asarray(N, dtype=float)
+    n = np.asarray(n, dtype=float)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        return (N >= mn) & (n >= mn) & (n / np.where(N > 0, N, np.nan) >= cov)
+
+
+def roll_up(df, group_of, by, total_col, sum_cols=("households", "observed")):
+    """District rows -> region / national rows: `sum_cols` and `total_col` summed per group; the total is NaN if any
+    district's total is NaN. Adds `districts` and `min_district_observed` (when an `observed` column is given)."""
+    d = df.assign(group=df["node"].map(group_of))
+    d = d[d["group"].notna()]
+    g = d.groupby(list(by) + ["group"], sort=False)
+    out = g[list(sum_cols)].sum()
+    out[total_col] = g[total_col].sum(min_count=1)
+    out.loc[d[total_col].isna().groupby([d[c] for c in by] + [d["group"]], sort=False).sum() > 0, total_col] = np.nan
+    out["districts"] = g.size()
+    if "observed" in d:
+        out["min_district_observed"] = g["observed"].min()
+    return out.reset_index().rename(columns={"group": "node"})
 
 
 def level_file(level, compressed=None):
@@ -239,7 +285,8 @@ def load_forecasts(forecast_dir, spec, level):
     df = _read_level(os.path.join(forecast_dir, f"{level}.csv"))
     if df is None:
         return None
-    need = {"fold", "node", "origin", "horizon", "forecast"}
+    main = "forecast" if level_score(spec, level) == "coverage_adjusted" else "forecast_observed_sum"
+    need = {"fold", "node", "origin", "horizon", main}
     if need - set(df.columns):
         raise SystemExit(f"{level}: forecast file is missing columns {sorted(need - set(df.columns))}")
     df["origin"] = pd.to_datetime(df["origin"])
@@ -277,9 +324,10 @@ def join_level(forecast_dir, test_dir, spec, level):
     if miss.any():
         raise SystemExit(f"{level}: {int(miss.sum())} of {len(m)} required forecasts are missing, e.g.\n"
                          f"{m.loc[miss, key].head(5).to_string(index=False)}")
-    bad = ~np.isfinite(m["forecast"].astype(float))
+    main = "forecast" if level_score(spec, level) == "coverage_adjusted" else "forecast_observed_sum"
+    bad = ~np.isfinite(m[main].astype(float))
     if bad.any():
-        raise SystemExit(f"{level}: {int(bad.sum())} forecasts are not finite numbers")
+        raise SystemExit(f"{level}: {int(bad.sum())} values of {main} are not finite numbers")
     m = m.drop(columns="_merge")
     if "observed" in m:
         m = m.rename(columns={"observed": "observed_forecast"})
@@ -297,7 +345,9 @@ def write_template(test_dir, spec, out_dir, levels=None):
     """The exact rows a submission must contain, per level (forecast left empty): for models outside the harness."""
     os.makedirs(out_dir, exist_ok=True)
     written = {}
-    for lv in levels or levels_of(spec, include_optional=True):
+    for lv in levels or direct_levels(spec):
+        if level_score(spec, lv) != "coverage_adjusted":
+            raise SystemExit(f"{lv} is scored bottom-up only (matched): no template for direct forecasts")
         a = _read_level(os.path.join(test_dir, "actuals", f"{lv}.csv"))
         if a is None:
             continue
@@ -345,13 +395,20 @@ def score(forecast_dir, test_dir, spec, levels=None):
         if m is None:
             continue
         joined[lv] = m
-        matched = "forecast_observed_sum" in m and m["forecast_observed_sum"].notna().all()
-        variants = [("coverage_adjusted", "forecast", "actual")] + \
-                   ([("matched", "forecast_observed_sum", "actual_observed_sum")] if matched else [])
-        for name, fc, ac in variants:
-            for h, g in m.groupby("horizon"):
-                rows.append({"level": lv, "score": name, "horizon": int(h), **_stats(g, fc, ac),
-                             **_node_median(g, fc, ac)})
+        primary = level_score(spec, lv)
+        if primary == "matched":
+            variants = [("matched", "forecast_observed_sum", "actual_observed_sum", None)]
+        else:
+            matched = "forecast_observed_sum" in m and m["forecast_observed_sum"].notna().all()
+            sens = float(sc.get("sensitivity_min_coverage", 0.8))
+            variants = [("coverage_adjusted", "forecast", "actual", None)] + \
+                       ([("matched", "forecast_observed_sum", "actual_observed_sum", None)] if matched else []) + \
+                       [(f"coverage_adjusted_cov{int(round(sens * 100))}", "forecast", "actual", m["coverage"] >= sens)]
+        for name, fc, ac, keep in variants:
+            mm = m if keep is None else m[keep]
+            for h, g in mm.groupby("horizon"):
+                rows.append({"level": lv, "score": name, "headline": name == primary, "horizon": int(h),
+                             **_stats(g, fc, ac), **_node_median(g, fc, ac)})
                 for fo, gf in g.groupby("fold", sort=False):
                     fold_rows.append({"level": lv, "score": name, "fold": fo, "horizon": int(h), **_stats(gf, fc, ac)})
     if not joined:
@@ -423,18 +480,23 @@ def report(res, spec, reference=None):
     p("")
     bl = res["by_level"]
     ctrl = [int(h) for h in sc["control_horizons"]]
-    for name in ("coverage_adjusted", "matched"):
-        t = bl[(bl["score"] == name) & bl["horizon"].isin(ctrl)]
+    sens = f"coverage_adjusted_cov{int(round(float(sc.get('sensitivity_min_coverage', 0.8)) * 100))}"
+    tables = [("headline sysMAPE (pooled): coverage-adjusted for national / region / district, matched below", bl["headline"]),
+              ("bottom-up check: matched sysMAPE at the coverage-adjusted levels", (bl["score"] == "matched") & ~bl["headline"]),
+              (f"sensitivity: coverage-adjusted sysMAPE on days with >= {sc.get('sensitivity_min_coverage', 0.8):.0%} "
+               f"coverage only", bl["score"] == sens)]
+    for title, sel in tables:
+        t = bl[sel & bl["horizon"].isin(ctrl)]
         if t.empty:
             continue
-        p(f"{name} sysMAPE (pooled) by level and horizon:")
+        p(title + ":")
         piv = t.pivot(index="level", columns="horizon", values="sysmape").reindex([x for x in LEVELS if x in t["level"].values])
         p(piv.map(lambda x: f"{x:6.2%}").to_string())
         p("")
     if reference is not None:
         rb = reference["by_level"]
-        a = bl[(bl["score"] == "coverage_adjusted") & bl["horizon"].isin(ctrl)].set_index(["level", "horizon"])["sysmape"]
-        b = rb[(rb["score"] == "coverage_adjusted") & rb["horizon"].isin(ctrl)].set_index(["level", "horizon"])["sysmape"]
+        a = bl[bl["headline"] & bl["horizon"].isin(ctrl)].set_index(["level", "horizon"])["sysmape"]
+        b = rb[rb["headline"] & rb["horizon"].isin(ctrl)].set_index(["level", "horizon"])["sysmape"]
         rel = (a / b - 1).dropna().unstack("horizon")
         p(f"vs the reference {reference['meta'].get('model', '')} (relative change in sysMAPE; negative = better):")
         p(rel.reindex([x for x in LEVELS if x in rel.index]).map(lambda x: f"{x:+6.1%}").to_string())
@@ -455,11 +517,13 @@ def report(res, spec, reference=None):
 def metrics_for_mlflow(res, prefix="test"):
     out = {}
     for r in res["by_level"].itertuples():
-        if r.score == "coverage_adjusted":
+        if r.headline:                                            # the level's own score
             out[f"{prefix}/{r.level}/sysmape_h{r.horizon}"] = r.sysmape
             out[f"{prefix}/{r.level}/bias_h{r.horizon}"] = r.bias
-        else:
+        elif r.score == "matched":
             out[f"{prefix}/{r.level}/matched_sysmape_h{r.horizon}"] = r.sysmape
+        else:
+            out[f"{prefix}/{r.level}/{r.score.replace('coverage_adjusted_', 'sysmape_')}_h{r.horizon}"] = r.sysmape
     for r in res["spec_check"].to_dict("records"):
         out[f"{prefix}/spec_pass_h{r['horizon']}"] = float(r["pass"])
     out[f"{prefix}/spec_pass_all"] = float(res["spec_check"]["pass"].all())

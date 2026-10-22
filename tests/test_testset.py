@@ -39,7 +39,7 @@ def _tiny(tmp_path, observed_sum=True):
              cutoff="2025-04-30", train_val=["2025-01-01", "2025-04-30"])
     s["folds"] = [f]
     s["horizons"] = 2
-    s["levels"] = {"national": {"horizons": "all"}}
+    s["levels"] = {"national": {"horizons": "all", "min_coverage": 0.8}}
     s["scoring"]["spec_thresholds"] = {1: 0.08, 2: 0.11}
     s["scoring"]["control_horizons"] = [1, 2]
     s["holidays"] = {}

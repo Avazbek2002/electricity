@@ -7,6 +7,22 @@
 #     (training data ends before the block's first origin; roughly quarterly retraining, as the ТЗ requires).
 #   - Forecasts issued every day; every test day is scored at every horizon 1..60.
 #   - All eligible households. Fixed panel per fold = households eligible at the fold's first origin.
+#   - district: actual = N x (mean kWh of the panel households observed that day)       (coverage-adjusted)
+#     region / national: the sum of their districts' coverage-adjusted totals (a reporting outage in one district
+#     then only affects that district's estimate)
+#     -> national / region / district can be forecast bottom-up or directly (the template / history files).
+#   - substation / feeder / transformer: bottom-up only, matched score = sum of the forecasts vs sum of the actuals
+#     of the same observed panel households (outage days need no correction).
+#   - Every report adds a sensitivity line: coverage-adjusted scores on days with >= 80 % coverage only.
+
+version: copy it to a new `version` and rebuild (the builder records this file's hash in the
+# manifest, and the scorer refuses forecasts built from a different hash).
+#
+# Design (agreed 2026-10-22):
+#   - 180 test days = four seasonal blocks of 45 days; each block is one walk-forward fold with its own fit
+#     (training data ends before the block's first origin; roughly quarterly retraining, as the ТЗ requires).
+#   - Forecasts issued every day; every test day is scored at every horizon 1..60.
+#   - All eligible households. Fixed panel per fold = households eligible at the fold's first origin.
 #   - Node actual on day d = N x (mean kWh of the panel households observed on d)    (coverage-adjusted total)
 #     scored when N >= min_households and observed share >= min_coverage.
 #   - Bottom-up models also get the matched score: sum of forecasts vs sum of actuals over the same observed households.
@@ -61,21 +77,22 @@ folds:
 origin_step_days: 1
 horizons: 60
 
-# Levels and the horizons stored per level (finer levels only at the control horizons: file size)
+# Levels: horizons stored, the score, and the rule for a scored node-day (always: N >= min_households panel
+# households and >= min_households of them observed that day).
 levels:
-  national:    {horizons: all}
-  region:      {horizons: all}
-  district:    {horizons: all}
-  substation:  {horizons: [1, 7, 14, 30, 60]}
-  feeder:      {horizons: [1, 7, 14, 30, 60]}
-  transformer: {horizons: [1, 7, 14, 30, 60], optional: true}
+  national:    {horizons: all, score: coverage_adjusted, build_from: district}   # scored if every district qualifies
+  region:      {horizons: all, score: coverage_adjusted, build_from: district}
+  district:    {horizons: all, score: coverage_adjusted, min_coverage: 0.5}
+  substation:  {horizons: [1, 7, 14, 30, 60], score: matched}
+  feeder:      {horizons: [1, 7, 14, 30, 60], score: matched}
+  transformer: {horizons: [1, 7, 14, 30, 60], score: matched, optional: true}
 
 scoring:
-  min_households: 10             # node size N (panel households); smaller nodes are never written or scored
-  min_coverage: 0.8              # observed share of the panel on the target day
+  min_households: 10             # disclosure rule and minimum for a reliable total
+  sensitivity_min_coverage: 0.8  # extra report line: coverage-adjusted levels on high-coverage days only
   control_horizons: [1, 7, 14, 30, 60]
   primary_level: national        # the ТЗ's system-level sysMAPE
-  # ТЗ 4.2.4: sysMAPE = sum_d |P_d - A_d| / sum_d A_d over all test days; rejection if any is exceeded
+# ТЗ 4.2.4: sysMAPE = sum_d |P_d - A_d| / sum_d A_d over all test days; rejection if any is exceeded
   spec_thresholds: {1: 0.08, 7: 0.11, 14: 0.15, 30: 0.18, 60: 0.20}
   bias_audit_ratio: 1.5          # ТЗ bias audit: a group's sysMAPE may be at most 1.5 x the overall value
 
@@ -94,7 +111,8 @@ holidays:
 # Known limitations (repeated in every score report)
 notes:
   - Network mapping is last-known and applied retrospectively (data guide); feeder / substation totals assume today's network.
-  - Feeder / substation levels cover households with a complete network path only (~86%); district and above cover all.
+  - "Substation / feeder / transformer: bottom-up only (matched score), households with a complete network path only (~86%); district and above cover all."
+  - "Reporting outages: on some days a large share of meters do not report; region / national are summed from districts to limit the effect, and the 80 %-coverage sensitivity line shows how much these days matter."
   - Blocks 2-4 overlap the harness dev-test window already looked at during development; this is the fixed internal
     benchmark, not the customer-approved acceptance sample.
   - Tariff-group slices of the bias audit are not available (households are one tariff group in this dataset).

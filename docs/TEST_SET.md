@@ -11,9 +11,11 @@ Definition: [`configs/test_set.yaml`](../configs/test_set.yaml). Implementation:
 | Folds | one per block, each with its own fit | ТЗ walk-forward rule; about quarterly retraining |
 | Origins | every day; each test day scored at every horizon 1..60 | ТЗ sums over all days of the test sample |
 | Households | all eligible; fixed panel per fold (eligible at the fold's first origin) | same households for every model |
-| Node actual | N x mean kWh of the panel households observed that day | comparable for bottom-up and direct models |
-| Scored node-days | N >= 10 households and >= 80 % of the panel observed | disclosure rule; reliable totals |
-| Levels | national, region, district (all horizons); substation, feeder, transformer (h 1, 7, 14, 30, 60) | file size |
+| Levels | national, region, district (all horizons; bottom-up or direct); substation, feeder, transformer (h 1, 7, 14, 30, 60; bottom-up only) | direct feeder / substation models dropped (2026-10-22) |
+| District actual | N x mean kWh of the panel households observed that day | comparable for bottom-up and direct models |
+| Region / national actual | sum of their districts' actuals | a reporting outage in one district only affects that district |
+| Substation / feeder actual | sum over the observed panel households (matched to the forecast) | outage days need no correction |
+| Scored node-days | always N >= 10 and >= 10 observed; district >= 50 % observed; region / national: every district >= 10 observed | disclosure rule; every national day scored (ТЗ) |
 
 | Fold | Test days | Training cutoff | Inner validation | Daily origins | Covers |
 |---|---|---|---|---|---|
@@ -24,16 +26,24 @@ Definition: [`configs/test_set.yaml`](../configs/test_set.yaml). Implementation:
 
 Training data of a fold ends at `cutoff + 60 = first_origin`, so no training target is a test day of that fold.
 
-## Two scores
+## Scores
 
 For one node and target day: N panel households, n of them observed, P forecasts, A actuals.
 
-| Score | Forecast | Actual | For |
+| Score | Forecast | Actual | Headline for |
 |---|---|---|---|
-| **coverage-adjusted** (headline) | N x mean P over the n observed | N x mean A over the n observed | every model |
-| **matched** | sum P over the n observed | sum A over the n observed | bottom-up models |
+| **coverage-adjusted** | district: N x mean P over the n observed; region / national: sum of district forecasts | district: N x mean A over the n observed; region / national: sum of district actuals | national, region, district |
+| **matched** | sum P over the n observed | sum A over the n observed | substation, feeder, transformer (also shown for bottom-up models at the coarse levels) |
 
-Per day the two differ only by the factor N / n (1 .. 1.25 with the 80 % rule).
+Per day, at a district, the two differ only by the factor N / n.
+
+**Why region / national are summed from districts.** Coverage does not decay through a block: it drops on single
+days and recovers (trial on two districts: 0.91, 0.93, 0.69, 0.48, 0.85 through the autumn block). These are
+reporting outages, usually of whole areas; one national mean over the observed households would then shift with
+whichever district reported. Summing district estimates keeps an outage local.
+
+**Sensitivity line.** Every report repeats the coverage-adjusted scores on days with >= 80 % coverage only; a large
+gap to the headline means outage days are driving the result.
 
 ## Reported
 
@@ -51,7 +61,7 @@ python scripts/test_set/build_test_set.py --workers 16
 # a harness model: 4 fits, daily forecasts, forecast CSVs, scores, MLflow (alias best_test with --register)
 python evaluate.py --model gam --mode test --workers 16 --register
 
-# any other model (e.g. a direct feeder or substation model)
+# a direct national / region / district model (substation / feeder are bottom-up only)
 python scripts/test_set/score_test.py --template ~/work/my_forecasts        # the exact rows to fill in
 #   fill `forecast`; train each fold's model only on data up to its first_origin;
 #   a forecast for origin t may use history/<fold>/<level>.csv.gz rows with date <= t only
@@ -61,7 +71,7 @@ python scripts/test_set/score_test.py --forecasts ~/work/my_forecasts \
 
 Files in `~/work/test_set/<version>/`: `manifest.json` (hash of the spec, counts, file hashes), `districts.csv`,
 `panel/` (customer keys: stays in the analytical environment), `actuals/<level>.csv[.gz]`,
-`history/<fold>/<level>.csv.gz`.
+`history/<fold>/<level>.csv.gz` (national, region, district).
 
 ## Rules
 

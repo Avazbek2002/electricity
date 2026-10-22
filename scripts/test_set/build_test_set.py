@@ -26,7 +26,7 @@ from harness import testset as ts  # noqa: E402
 from harness.data import read_district  # noqa: E402
 import enriched_io as eio  # noqa: E402  (harness puts core/ on the path)
 
-HISTORY_LEVELS = ("national", "region", "district", "substation", "feeder")
+HISTORY_LEVELS = ("district",)          # region / national history is summed from it; network levels: bottom-up only
 
 
 def district_region(code, uri, env_prefix=""):
@@ -113,8 +113,9 @@ def main():
     fs, root = eio.open_root(d["uri"], d.get("env_prefix", ""))
     codes = eio.finished_districts(fs, root, set(a.coatos.split(",")) if a.coatos else None)
     print(f"[build] {spec['version']} ({spec['_sha256'][:12]}) | {len(codes)} districts | levels {levels} | -> {out}")
-    cfg = dict(spec=spec, out=out, levels=levels)
-    acc = {f["name"]: {lv: ts.NodeSum() for lv in levels} for f in spec["folds"]}
+    node_levels = [lv for lv in levels if not ts.built_from(spec, lv)]
+    cfg = dict(spec=spec, out=out, levels=node_levels)
+    acc = {f["name"]: {lv: ts.NodeSum() for lv in node_levels} for f in spec["folds"]}
     dist_rows, t0 = [], time.time()
     print(f"[memory] at start: {ts.memory_line()}", flush=True)
     import multiprocessing as mp
@@ -137,49 +138,69 @@ def main():
     dist = pd.DataFrame(dist_rows).sort_values("district")
     write_csv(dist, os.path.join(out, "districts.csv"))
 
-    # ---- actuals per level (all folds in one file) and history per fold and level
-    mn, cov = int(spec["scoring"]["min_households"]), float(spec["scoring"]["min_coverage"])
+    # ---- actuals per level (all folds in one file) and history per fold
+    mn = int(spec["scoring"]["min_households"])
     start = pd.Timestamp(d["start"])
-    counts = {}
+    up_levels = [lv for lv in levels if ts.built_from(spec, lv)]
+    group_of = {"national": {c: "national" for c in dist["district"]},
+                "region": dict(zip(dist["district"], dist["region"].astype(str)))}
+
+    def frame(f, ns, n_key, S_key, dates):
+        """All nodes of one fold-level as rows (no size filter yet)."""
+        names = np.asarray(ns.names())
+        N, n, S = ns.stack("N"), ns.stack(n_key), ns.stack(S_key)
+        K, Dn = len(names), len(dates)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            actual = np.where(n > 0, N[:, None] * S / n, np.nan)
+        return pd.DataFrame({"fold": f["name"], "node": np.repeat(names, Dn), "date": np.tile(dates.date, K),
+                             "households": np.repeat(N, Dn).astype(int), "observed": n.ravel().astype(int),
+                             "actual_observed_sum": S.ravel().astype(float), "actual": actual.ravel()})
+
+    def finish(df, lv):
+        with np.errstate(invalid="ignore", divide="ignore"):
+            df["coverage"] = df["observed"] / df["households"].where(df["households"] > 0)
+        sc = ts.scored_mask(spec, lv, df["households"], df["observed"]) & np.isfinite(df["actual"])
+        if "min_district_observed" in df:                          # region / national: every district must qualify
+            sc &= df["min_district_observed"] >= mn
+        df["scored"] = sc
+        cols = ["fold", "node", "date", "households", "observed", "coverage", "actual_observed_sum", "actual", "scored"]
+        cols += [c for c in ("districts", "min_district_observed") if c in df]
+        return df.loc[df["households"] >= mn, cols]
+
+    actual_all, hist_all, counts = {}, {}, {}
     os.makedirs(os.path.join(out, "actuals"), exist_ok=True)
-    for lv in levels:
+    for lv in [x for x in levels if x not in up_levels]:
         parts = []
         for f in spec["folds"]:
             ns = acc[f["name"]][lv]
-            names = ns.names()
-            if not names:
+            if not ns.names():
                 continue
-            N, n, S = ns.stack("N"), ns.stack("n_test"), ns.stack("S_test")
-            keep = N >= mn
-            test_idx, _ = ts.fold_days(spec, f)
-            dates = start + pd.to_timedelta(test_idx, unit="D")
-            K, Dn = int(keep.sum()), len(test_idx)
-            nk, Sk = n[keep], S[keep]
-            with np.errstate(invalid="ignore", divide="ignore"):
-                coverage = nk / N[keep][:, None]
-                actual = np.where(nk > 0, N[keep][:, None] * Sk / nk, np.nan)
-            parts.append(pd.DataFrame({
-                "fold": f["name"], "node": np.repeat(np.asarray(names)[keep], Dn), "date": np.tile(dates.date, K),
-                "households": np.repeat(N[keep], Dn).astype(int), "observed": nk.ravel().astype(int),
-                "coverage": coverage.ravel(), "actual_observed_sum": Sk.ravel(), "actual": actual.ravel(),
-                "scored": ((coverage >= cov) & (nk > 0)).ravel()}))
+            test_idx, origins = ts.fold_days(spec, f)
+            parts.append(frame(f, ns, "n_test", "S_test", start + pd.to_timedelta(test_idx, unit="D")))
             if lv in HISTORY_LEVELS:
-                hn, hS = ns.stack("n_hist"), ns.stack("S_hist")
-                hd = start + pd.to_timedelta(np.arange(hn.shape[1]), unit="D")
-                with np.errstate(invalid="ignore", divide="ignore"):
-                    ha = np.where(hn[keep] > 0, N[keep][:, None] * hS[keep] / hn[keep], np.nan)
-                hdir = os.path.join(out, "history", f["name"])
-                os.makedirs(hdir, exist_ok=True)
-                Hn = hn.shape[1]
-                write_csv(pd.DataFrame({
-                    "node": np.repeat(np.asarray(names)[keep], Hn), "date": np.tile(hd.date, K),
-                    "households": np.repeat(N[keep], Hn).astype(int), "observed": hn[keep].ravel().astype(int),
-                    "actual_observed_sum": hS[keep].ravel(), "actual": ha.ravel()}),
-                    os.path.join(hdir, ts.level_file(lv, compressed=True)))
-            counts.setdefault(lv, {})[f["name"]] = dict(nodes=int(len(names)), nodes_ge_min=K,
-                                                         scored_node_days=int(((coverage >= cov) & (nk > 0)).sum()))
-        if parts:
-            write_csv(pd.concat(parts, ignore_index=True), os.path.join(out, "actuals", ts.level_file(lv)))
+                hn = ns.stack("n_hist")
+                hist_all.setdefault(lv, {})[f["name"]] = frame(
+                    f, ns, "n_hist", "S_hist", start + pd.to_timedelta(np.arange(hn.shape[1]), unit="D"))
+        actual_all[lv] = pd.concat(parts, ignore_index=True)
+    for lv in up_levels:                                           # region / national = sums of district totals
+        src = actual_all[ts.built_from(spec, lv)]
+        actual_all[lv] = ts.roll_up(src, group_of[lv], ["fold", "date"], "actual",
+                                    ("households", "observed", "actual_observed_sum"))
+        for fname, h in hist_all.get(ts.built_from(spec, lv), {}).items():
+            hist_all.setdefault(lv, {})[fname] = ts.roll_up(h, group_of[lv], ["fold", "date"], "actual",
+                                                            ("households", "observed", "actual_observed_sum"))
+    for lv in levels:
+        a_lv = finish(actual_all[lv], lv)
+        write_csv(a_lv, os.path.join(out, "actuals", ts.level_file(lv)))
+        for f in spec["folds"]:
+            af = a_lv[a_lv["fold"] == f["name"]]
+            counts.setdefault(lv, {})[f["name"]] = dict(nodes=int(af["node"].nunique()), node_days=int(len(af)),
+                                                         scored_node_days=int(af["scored"].sum()))
+        for fname, h in hist_all.get(lv, {}).items():
+            hdir = os.path.join(out, "history", fname)
+            os.makedirs(hdir, exist_ok=True)
+            hh = finish(h.copy(), lv).drop(columns=["fold", "scored"])
+            write_csv(hh, os.path.join(hdir, ts.level_file(lv, compressed=True)))
 
     # ---- manifest
     files = {}
@@ -198,14 +219,16 @@ def main():
     json.dump(man, open(os.path.join(out, "manifest.json"), "w"), indent=2)
     print(f"\n[build] done in {(time.time() - t0) / 60:.1f} min -> {out}")
     print("  panel households per fold: " + ", ".join(f"{k} {v:,}" for k, v in man["panel_households"].items()))
-    ndays = {f["name"]: len(ts.fold_days(spec, f)[0]) for f in spec["folds"]}
     for lv, c in counts.items():
-        share = sum(v["scored_node_days"] for v in c.values()) / max(1, sum(v["nodes_ge_min"] * ndays[k] for k, v in c.items()))
-        print(f"  {lv:12s} nodes >= {mn} households: " + ", ".join(f"{k} {v['nodes_ge_min']}" for k, v in c.items())
-              + f" | node-days scored (coverage >= {cov:.0%}): {share:.1%}")
-        if lv in ("national", "region", "district") and share < 1:
-            print(f"  WARNING: {lv} loses {1 - share:.1%} of its test days to the coverage rule; the ТЗ scores every "
-                  f"day -- check the coverage in actuals/{ts.level_file(lv)} before releasing this test set")
+        share = sum(v["scored_node_days"] for v in c.values()) / max(1, sum(v["node_days"] for v in c.values()))
+        rule = (f"every district >= {mn} observed" if ts.built_from(spec, lv) else
+                f">= {mn} observed" + (f", coverage >= {spec['levels'][lv]['min_coverage']:.0%}"
+                                       if spec["levels"][lv].get("min_coverage") else ""))
+        print(f"  {lv:12s} nodes >= {mn} households: " + ", ".join(f"{k} {v['nodes']}" for k, v in c.items())
+              + f" | node-days scored ({rule}): {share:.1%}")
+        if lv == spec["scoring"]["primary_level"] and share < 1:
+            print(f"  WARNING: {lv} loses {1 - share:.1%} of its test days; the ТЗ scores every day -- check "
+                  f"actuals/{ts.level_file(lv)} (min_district_observed) before releasing this test set")
 
 
 if __name__ == "__main__":

@@ -106,11 +106,13 @@ def test_worker(code, cfg):
 
 
 # ----------------------------------------------------------------------------- writing forecasts
-def write_forecasts(fdir, spec, merged, model_label, meta, key):
-    """merged[fold][level] = NodeSum with N, FO/FR, NO -> <fdir>/<level>.csv[.gz] in the common format."""
+def write_forecasts(fdir, spec, merged, model_label, meta, key, levels, regions):
+    """merged[fold][level] = NodeSum with N, FO/FR, NO -> <fdir>/<level>.csv[.gz] in the common format.
+    Region / national (build_from: district) are the sums of the district forecasts, like their actuals."""
     os.makedirs(fdir, exist_ok=True)
     mn = int(spec["scoring"]["min_households"])
     start = pd.Timestamp(spec["data"]["start"])
+    frames = {}
     for lv in next(iter(merged.values())).keys():
         parts = []
         hz = np.asarray(ts.level_horizons(spec, lv))
@@ -121,7 +123,7 @@ def write_forecasts(fdir, spec, merged, model_label, meta, key):
                 continue
             N, FO, NO = ns.stack("N"), ns.stack(key), ns.stack("NO")
             test_idx, origins = ts.fold_days(spec, f)
-            keep = np.flatnonzero(N >= mn)
+            keep = np.arange(len(N))                                             # all nodes; size filter below
             o_grid, h_grid = np.meshgrid(origins, hz, indexing="ij")             # (nO, nh)
             tgt = o_grid + h_grid
             ok = (tgt >= test_idx[0]) & (tgt <= test_idx[-1])
@@ -135,10 +137,21 @@ def write_forecasts(fdir, spec, merged, model_label, meta, key):
             parts.append(pd.DataFrame({"fold": f["name"], "node": np.repeat(np.asarray(names)[keep], R),
                                        "origin": np.tile((start + pd.to_timedelta(oo, unit="D")).date, K),
                                        "horizon": np.tile(hh, K), "forecast": fc.ravel(),
-                                       "forecast_observed_sum": fo.ravel(), "observed": no.ravel().astype(int)}))
+                                       "forecast_observed_sum": fo.ravel(), "observed": no.ravel().astype(int),
+                                       "households": np.repeat(N[keep], R).astype(int)}))
         if parts:
-            pd.concat(parts, ignore_index=True).to_csv(os.path.join(fdir, ts.level_file(lv)), index=False,
-                                                       float_format="%.10g")
+            frames[lv] = pd.concat(parts, ignore_index=True)
+    group_of = {"national": {c: "national" for c in regions}, "region": {c: str(r) for c, r in regions.items()}}
+    for lv in levels:
+        src = ts.built_from(spec, lv)
+        if src and src in frames:
+            frames[lv] = ts.roll_up(frames[src], group_of[lv], ["fold", "origin", "horizon"], "forecast",
+                                    ("households", "observed", "forecast_observed_sum"))
+    for lv, df in frames.items():
+        if lv in levels:
+            out = df[df["households"] >= mn][["fold", "node", "origin", "horizon", "forecast", "forecast_observed_sum",
+                                               "observed"]]
+            out.to_csv(os.path.join(fdir, ts.level_file(lv)), index=False, float_format="%.10g")
     json.dump({**meta, "model": model_label}, open(os.path.join(fdir, "forecast_meta.json"), "w"), indent=2)
 
 
@@ -159,6 +172,11 @@ def run_test(args, cfg, git, model_dir, model_config, tracking, scoring):
     if args.coatos:
         codes = [c for c in codes if c in set(args.coatos.split(","))]
     levels = man["levels"]
+    if args.coatos and set(codes) != set(regions):                  # a subset of a full test set: totals would be partial
+        dropped = [lv for lv in levels if ts.built_from(spec, lv)]
+        levels = [lv for lv in levels if not ts.built_from(spec, lv)]
+        print(f"[test] --coatos on the full test set: {dropped} left out (their totals need every district)")
+    node_levels = [lv for lv in levels if not ts.built_from(spec, lv)]
 
     # ---- one fit per fold (cached per model, commit and cutoff)
     arts, fit_seconds = {}, 0.0
@@ -185,7 +203,7 @@ def run_test(args, cfg, git, model_dir, model_config, tracking, scoring):
         arts[f["name"]] = art
 
     # ---- forecast every fold, district by district
-    wcfg = dict(spec=spec, test_dir=test_dir, regions=regions, levels=levels, model_name=args.model,
+    wcfg = dict(spec=spec, test_dir=test_dir, regions=regions, levels=node_levels, model_name=args.model,
                 model_dir=model_dir, model_config=model_config, artifacts=arts, seed=wp.SEED,
                 history_days=int(cfg["data"]["history_days"]), block=int(run_cfg["block"]))
     n_or = sum(len(ts.fold_days(spec, f)[1]) for f in spec["folds"])
@@ -195,7 +213,7 @@ def run_test(args, cfg, git, model_dir, model_config, tracking, scoring):
     for v in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
         os.environ[v] = str(thr)
     print(f"[memory] at start: {ts.memory_line()}", flush=True)
-    merged = {f["name"]: {lv: ts.NodeSum() for lv in levels} for f in spec["folds"]}
+    merged = {f["name"]: {lv: ts.NodeSum() for lv in node_levels} for f in spec["folds"]}
     gaps = windows = 0
     t1 = time.time()
     with cf.ProcessPoolExecutor(max_workers=workers, mp_context=mp.get_context("spawn")) as ex:
@@ -227,8 +245,8 @@ def run_test(args, cfg, git, model_dir, model_config, tracking, scoring):
                 dirty=git["dirty"], districts="all" if not args.coatos else args.coatos,
                 gaps_filled_with_persistence=gaps, household_forecasts=windows)
     fdir, rdir = os.path.join(out, "forecasts", args.model), os.path.join(out, "forecasts", REFERENCE)
-    write_forecasts(fdir, spec, merged, args.model, meta, "FO")
-    write_forecasts(rdir, spec, merged, REFERENCE, meta, "FR")
+    write_forecasts(fdir, spec, merged, args.model, meta, "FO", levels, regions)
+    write_forecasts(rdir, spec, merged, REFERENCE, meta, "FR", levels, regions)
     res = ts.score(fdir, test_dir, spec)
     ref = ts.score(rdir, test_dir, spec)
     text = ts.report(res, spec, reference=ref)
@@ -237,11 +255,9 @@ def run_test(args, cfg, git, model_dir, model_config, tracking, scoring):
     ts.save_scores(ref, os.path.join(out, "scores", REFERENCE), ts.report(ref, spec))
     hl = cfg["scoring"]["headline"]
     bl = res["by_level"]
-    headline = float(bl[(bl["level"] == hl["level"]) & (bl["score"] == "coverage_adjusted")
-                        & bl["horizon"].isin(hl["horizons"])]["sysmape"].mean())
+    headline = float(bl[(bl["level"] == hl["level"]) & bl["headline"] & bl["horizon"].isin(hl["horizons"])]["sysmape"].mean())
     rbl = ref["by_level"]
-    ref_headline = float(rbl[(rbl["level"] == hl["level"]) & (rbl["score"] == "coverage_adjusted")
-                             & rbl["horizon"].isin(hl["horizons"])]["sysmape"].mean())
+    ref_headline = float(rbl[(rbl["level"] == hl["level"]) & rbl["headline"] & rbl["horizon"].isin(hl["horizons"])]["sysmape"].mean())
 
     tags = dict(model_family=model_config.get("family", args.model), model=args.model, git_commit=git["commit"],
                 git_branch=git["branch"], dirty=str(git["dirty"]).lower(), mode="test",
