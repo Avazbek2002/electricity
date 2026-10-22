@@ -18,6 +18,7 @@ harness/               the evaluation harness
   registry.py            model registry: pyfunc wrapper, versions + aliases, list / promote
   testset.py             the standard evaluation: T2 target, B0, calendar, common panel, scoring, report
   test_mode.py           evaluate.py --mode validate / test (refits, issue dates, district forecasts, substitution test)
+  plots.py               charts of a run: metrics over every horizon, window samples (logged to MLflow)
   cli.py                 the evaluate.py command line
 models/<name>/         one folder per model: model.py (class Model), config.yaml, NOTES.md
   nlinear_x/             NLinear with weather inputs (trains through core/household_nlinear.py)

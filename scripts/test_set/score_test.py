@@ -64,12 +64,22 @@ def main():
     out = os.path.expanduser(a.out_dir or os.path.join(fdir, "scores" if a.target == "T2" else f"scores_{a.target}"))
     ts.save_scores(res, out, text)
     print(f"\n[score] written to {out}")
+    try:
+        from harness import plots
+        plots.metrics_by_horizon(res, out)
+        print(f"[charts] {out}: metrics by horizon, {len(plots.window_samples(res, out))} window charts")
+    except Exception as e:                                         # noqa: BLE001
+        print(f"[charts] WARNING: not drawn ({type(e).__name__}: {e})")
     try:                                                           # metrics into the MLflow run run_script opened
         sys.path.insert(0, os.path.join(REPO, "core"))
         import mlflow_utils as mu
         tr = mu.Tracker("electricity/test", enabled=None)
         if tr.enabled and tr.mlflow.active_run():
             tr.metrics(ts.metrics_for_mlflow(res))
+            for key, pts in ts.curves_for_mlflow(res).items():     # step = horizon
+                tr.series(key, [(None, h, v) for h, v in pts])
+            for sub in ("figures", "windows"):
+                tr.artifacts_dir(os.path.join(out, sub), subdir=sub)
             tr.tags({"model": res["model"], "test_set_version": spec["version"], "target": a.target,
                      "weather": res["meta"].get("weather", "?"), "districts": str(len(res["districts"]))})
             for f in ("scores.csv", "spec_check.csv", "bias_audit.csv", "report.txt", "national_daily.csv"):

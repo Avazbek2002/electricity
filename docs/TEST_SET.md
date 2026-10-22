@@ -55,6 +55,15 @@ python scripts/test_set/score_test.py --template ~/work/my_forecasts --sample  #
 python scripts/test_set/score_test.py --forecasts ~/work/my_forecasts --compare gam=<run>/forecasts/gam
 ```
 
+Every scored run also draws and logs (MLflow run `<mode>`, and `scores/` in the run folder):
+- **per-horizon metrics, step = horizon 1..60**: `<split>/sysWAPE` (national), `<split>/WAPE` (district rows),
+  `<split>/MAE` (kWh per district-day), `<split>/national_MAE`, `<split>/bias`; B0 under `<split>/B0/...`. In MLflow
+  open the experiment's *Chart view*, select the runs of several models and add a line chart of e.g.
+  `validation/sysWAPE`: one line per model over the horizons.
+- `figures/metrics_by_horizon.png`: the four metrics over every horizon, the model vs B0.
+- `windows/`: window samples, 10-12 per split (one issue date per month, more where gaps leave fewer): national
+  actual vs the model and B0 over the 60 days after the issue date, one PNG each plus `overview_<split>.png`.
+
 A district-level model may use `targets/district.csv.gz` rows with date <= o - 1 as its history. The report follows
 the guide's part 7 table: model and B0 on the same days, validation and test, sysMAPE (bias), day counts, and the
 substitution test result.

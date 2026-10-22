@@ -321,6 +321,15 @@ def run_test(args, cfg, git, model_dir, model_config, tracking, scoring=None):
     text = ts.report(res, spec)
     print("\n" + text)
     ts.save_scores(res, os.path.join(out, "scores"), text)
+    charts = {}
+    try:
+        from harness import plots
+        plots.metrics_by_horizon(res, os.path.join(out, "scores"))
+        n_win = len(plots.window_samples(res, os.path.join(out, "scores")))
+        charts = {k: os.path.join(out, "scores", k) for k in ("figures", "windows")}
+        print(f"[charts] {os.path.join(out, 'scores')}: metrics by horizon, {n_win} window charts")
+    except Exception as e:                                          # noqa: BLE001  charts never stop a run
+        print(f"[charts] WARNING: not drawn ({type(e).__name__}: {e})")
     split_h = "validation" if args.mode == "validate" else "test"
     headline = ts.headline(res, split_h)
     tags = dict(model_family=model_config.get("family", args.model), model=args.model, git_commit=git["commit"],
@@ -344,7 +353,8 @@ def run_test(args, cfg, git, model_dir, model_config, tracking, scoring=None):
     lastR = str(blocks[-1][0].date())                                # the newest fit is the one registered
     run_id = tracking.mlflow_log_safe(mlcfg, tags, params, dict(fit_seconds=fit_seconds, predict_seconds=predict_seconds),
                                       metrics, files, args.model, register=args.register, artifacts_dir=arts[lastR],
-                                      model_dir=model_dir, model_config=model_config, headline=headline)
+                                      model_dir=model_dir, model_config=model_config, headline=headline,
+                                      curves=ts.curves_for_mlflow(res), artifact_dirs=charts)
     t = res["splits"][split_h]["scores"]
     row = dict(time=time.strftime("%Y-%m-%d %H:%M:%S"), model=args.model, commit=git["commit"], mode=args.mode,
                holdout_period=spec["version"], status="done", scope=scope, weather=weather, headline=headline,

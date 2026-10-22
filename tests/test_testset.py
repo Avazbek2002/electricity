@@ -170,3 +170,14 @@ def test_template_lists_every_issue_date_and_horizon(tmp_path):
     spec, td, fd = _tiny(tmp_path)
     n = ts.write_template(spec, str(tmp_path / "tpl"), ["d0", "d1"])
     assert n == 2 * (2 + 2)                                             # 2 districts x (1 issue date x 2 h) x 2 splits
+
+
+def test_curves_and_charts(tmp_path):
+    spec, td, fd = _tiny(tmp_path)
+    r = ts.score(fd, td, spec)
+    c = ts.curves_for_mlflow(r)
+    assert c["test/sysWAPE"] == [(1, pytest.approx(0.10)), (2, pytest.approx(0.10))]
+    assert c["test/MAE"][0][1] == pytest.approx(10.0)                  # |110 - 100| per district-day
+    assert "test/B0/WAPE" in c
+    from harness import plots
+    assert os.path.exists(plots.metrics_by_horizon(r, str(tmp_path / "out")))

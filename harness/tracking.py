@@ -49,7 +49,7 @@ def append_csv(path, row):
 
 
 def mlflow_log(cfg, tags, params, fit_info, metrics_by_model, artifacts, model_name, register=False, artifacts_dir=None,
-               model_dir=None, model_config=None, headline=None):
+               model_dir=None, model_config=None, headline=None, curves=None, artifact_dirs=None):
     """Parent run '<model> @ <commit>' with child runs 'fit' (params, fitted files, and with register the loadable
     pyfunc) and '<mode>' (scores, tables). With register: a new registry version + aliases (harness/registry.py).
     Returns the mode run id, or None if MLflow is off or unreachable."""
@@ -78,6 +78,10 @@ def mlflow_log(cfg, tags, params, fit_info, metrics_by_model, artifacts, model_n
                 tr.metrics({(k if m == model_name else f"ref/{k}"): v for k, v in md.items()})
             for a in artifacts:
                 tr.artifact(a)
+            for key, pts in (curves or {}).items():                # per-horizon curves: step = horizon
+                tr.series(key, [(None, h, v) for h, v in pts])
+            for sub, folder in (artifact_dirs or {}).items():       # charts (figures/, windows/)
+                tr.artifacts_dir(folder, subdir=sub)
     if register:
         if model_uri:
             registry.register_eval(tr, model_name, model_uri, fit_run, run_id, tags,

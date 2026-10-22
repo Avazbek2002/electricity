@@ -313,6 +313,10 @@ def _sm(q, m):
     return float((q[m] - q["y"]).abs().sum() / q["y"].sum()) if len(q) and q["y"].sum() > 0 else np.nan
 
 
+def _mae(q, m):
+    return float((q[m] - q["y"]).abs().mean()) if len(q) else np.nan
+
+
 def _bias(q, m):
     return float((q[m] - q["y"]).sum() / q["y"].sum()) if len(q) and q["y"].sum() > 0 else np.nan
 
@@ -357,7 +361,8 @@ def score(forecast_dir, test_dir, spec, target="T2", reference=True, others=None
             q, qd = nat[nat["horizon"] == h], dist[dist["horizon"] == h]
             for mname in models:
                 rows.append(dict(split=split, model=mname, horizon=h, sysmape=_sm(q, mname), bias=_bias(q, mname),
-                                 days=int(len(q)), district_sysmape=_sm(qd, mname), district_rows=int(len(qd))))
+                                 mae=_mae(q, mname), days=int(len(q)), district_sysmape=_sm(qd, mname),
+                                 district_mae=_mae(qd, mname), district_rows=int(len(qd))))
         res["splits"][split] = dict(scores=pd.DataFrame(rows), expected_rows=p["expected_rows"], missing=p["missing"],
                                     panel=p)
     # ТЗ 4.2.4 on test, national
@@ -505,6 +510,7 @@ def metrics_for_mlflow(res):
             out[f"{pre}national/sysmape_h{r.horizon}"] = r.sysmape
             out[f"{pre}national/bias_h{r.horizon}"] = r.bias
             out[f"{pre}district/sysmape_h{r.horizon}"] = r.district_sysmape
+            out[f"{pre}district/mae_h{r.horizon}"] = r.district_mae
             if r.model == res["model"]:
                 out[f"{split}/days_h{r.horizon}"] = r.days
         out[f"{split}/headline"] = headline(res, split)
@@ -513,6 +519,26 @@ def metrics_for_mlflow(res):
     out["test/spec_pass_all"] = float(res["spec_check"]["passed"].all())
     if len(res["bias_audit"]):
         out["test/bias_audit_fails"] = float((~res["bias_audit"]["passed"]).sum())
+    return out
+
+
+# MLflow names of the per-horizon metrics (logged with step = horizon, 1..60, so runs overlay in the chart view)
+CURVES = {"sysWAPE": "sysmape", "WAPE": "district_sysmape", "MAE": "district_mae", "bias": "bias",
+          "national_MAE": "mae"}
+
+
+def curves_for_mlflow(res):
+    """{key: [(step, value)]}: <split>/<metric> for the model, <split>/B0/<metric> for the reference, step = horizon.
+    sysWAPE = national (sum of districts) sum|P - A| / sum A; WAPE = the same pooled over district rows; MAE = mean
+    |P - A| per district-day (kWh); national_MAE = per national day (kWh); bias = sum(P - A) / sum A (national)."""
+    out = {}
+    for split, s in res["splits"].items():
+        t = s["scores"]
+        for mname, g in t.groupby("model"):
+            pre = f"{split}/" + ("" if mname == res["model"] else f"{mname}/")
+            g = g.sort_values("horizon")
+            for key, col in CURVES.items():
+                out[pre + key] = [(int(h), float(v)) for h, v in zip(g["horizon"], g[col]) if np.isfinite(v)]
     return out
 
 
