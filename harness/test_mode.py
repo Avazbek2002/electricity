@@ -285,6 +285,23 @@ def substitution_test(wcfg, code, spec):
 
 # ----------------------------------------------------------------------------- the command
 def run_test(args, cfg, git, model_dir, model_config, tracking, scoring=None):
+    """evaluate.py --mode validate / test. The W&B run opens before the first fit (training is logged live) and is
+    closed with a failure state if anything stops the run."""
+    holder = {}
+    try:
+        return _run_test(args, cfg, git, model_dir, model_config, tracking, holder)
+    except BaseException:
+        r = holder.get("run")
+        if r is not None:
+            try:
+                r.finish(exit_code=1)
+            except Exception:                                        # noqa: BLE001
+                pass
+        raise
+
+
+def _run_test(args, cfg, git, model_dir, model_config, tracking, holder):
+    from harness import wandb_log
     spec = ts.load_spec(args.test_set)
     scope = "sample" if args.sample else ("trial" if args.coatos else "national")
     default_dir = os.path.join("~/work/test_set", spec["version"] + {"sample": "-sample", "trial": "-trial"}.get(scope, ""))
@@ -316,12 +333,25 @@ def run_test(args, cfg, git, model_dir, model_config, tracking, scoring=None):
     blocks = ts.refit_blocks(spec, splits)
     weather = args.weather or spec.get("weather", "none")
     notes = [] if weather == "none" else [f"weather = {weather}: preliminary (not the standard no-weather run)"]
+    wcfg = dict(cfg.get("wandb") or {})
+    if getattr(args, "no_wandb", False):
+        wcfg["enabled"] = False
+    sc = run_cfg.get("scaling") or {"method": "ratio"}
+    wrun = holder["run"] = wandb_log.start(
+        wcfg, name=f"{args.model} | {args.mode} | {scope} | {git['short']}", group=f"{spec['version']} {scope} {weather}",
+        job_type=args.mode, tags=[args.model, args.mode, scope, f"weather-{weather}", model_config.get("family", "")],
+        config=dict(model=args.model, family=model_config.get("family", args.model), model_config=model_config,
+                    test_set=spec["version"], test_set_sha256=spec["_sha256"][:12], data_version=man["data_version"],
+                    scope=scope, districts="all" if scope == "national" else ",".join(codes), weather=weather,
+                    scaling=sc, commit=git["commit"], dirty=git["dirty"], splits=splits,
+                    refits=[str(R.date()) for R, _ in blocks], workers=workers))
 
     # ---- one fit per refit date
     arts, fit_seconds = {}, 0.0
     import whole_pipeline_v8 as wp
-    for R, _ in blocks:
+    for i_fit, (R, _) in enumerate(blocks):
         cutoff, data_end = ts.train_window(spec, R)
+        t_fit, reused = time.time(), False
         key = f"{args.model}/{git['short']}{'-dirty' if git['dirty'] else ''}/refit-{R.date()}"
         art = os.path.join(out_root, "artifacts", key)
         done = os.path.join(art, ".fit_done")
@@ -329,6 +359,7 @@ def run_test(args, cfg, git, model_dir, model_config, tracking, scoring=None):
             shutil.rmtree(art)
         if os.path.exists(done):
             print(f"[fit] refit {R.date()}: reusing {art}")
+            reused = True
         else:
             os.makedirs(art, exist_ok=True)
             spec_t = TrainSpec(roots=[dict(uri=d["uri"], env_prefix=d.get("env_prefix", ""))], start=d["start"],
@@ -341,6 +372,7 @@ def run_test(args, cfg, git, model_dir, model_config, tracking, scoring=None):
             open(done, "w").write(time.strftime("%Y-%m-%d %H:%M:%S"))
             fit_seconds += time.time() - t0
         arts[str(R.date())] = art
+        wandb_log.log_fit(wrun, i_fit, R.date(), art, time.time() - t_fit, reused)
 
     wcfg = dict(spec=spec, blocks=blocks, labels=cfg["data"]["labels"], model_name=args.model, model_dir=model_dir,
                 model_config=model_config, artifacts=arts, seed=wp.SEED, weather=weather,
@@ -422,7 +454,6 @@ def run_test(args, cfg, git, model_dir, model_config, tracking, scoring=None):
     text = ts.report(res, spec)
     print("\n" + text)
     ts.save_scores(res, os.path.join(out, "scores"), text)
-    from harness import wandb_log
     weather_daily = wandb_log.weather_frame(results)
     if weather_daily is not None:
         weather_daily.to_csv(os.path.join(out, "scores", "weather_daily.csv"), index=False, float_format="%.2f")
@@ -450,10 +481,7 @@ def run_test(args, cfg, git, model_dir, model_config, tracking, scoring=None):
     files = [os.path.join(out, "scores", f) for f in ("scores.csv", "spec_check.csv", "bias_audit.csv", "report.txt",
                                                       "national_daily.csv", "levels.csv")
              if os.path.exists(os.path.join(out, "scores", f))]
-    # ---- experiment tracking: Weights & Biases
-    wcfg = dict(cfg.get("wandb") or {})
-    if getattr(args, "no_wandb", False):
-        wcfg["enabled"] = False
+    # ---- experiment tracking: Weights & Biases (the run opened before the fits)
     wandb_url = wandb_log.log_run(
         wcfg, name=f"{args.model} | {args.mode} | {scope} | {git['short']}", group=f"{spec['version']} {scope} {weather}",
         job_type=args.mode, tags=[args.model, args.mode, scope, f"weather-{weather}", model_config.get("family", "")],
@@ -465,7 +493,8 @@ def run_test(args, cfg, git, model_dir, model_config, tracking, scoring=None):
                     predict_seconds=round(predict_seconds), run_dir=out),
         res=res, weather=weather_daily, out_dir=os.path.join(out, "scores"),
         extra_summary={"headline": headline, "substitution_test": tags["substitution_test"]},
-        files=files)
+        files=files, run=wrun)
+    holder["run"] = None                                             # finished by log_run
 
     # ---- model registry: MLflow (only with --register; tracking is in W&B)
     mlcfg = dict(cfg.get("mlflow", {}))

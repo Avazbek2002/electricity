@@ -93,7 +93,10 @@ loads it.
 
 ### Weights & Biases (experiment tracking)
 
-Every `evaluate.py --mode validate|test` run is tracked in W&B (`harness/wandb_log.py`, settings `wandb:` in
+Every `evaluate.py --mode validate|test` run is tracked in W&B from its first line: the run opens before the first fit,
+the whole console (fits and district workers) streams to its Logs tab, and each refit's training is logged as it
+finishes (`fit/*` per refit: windows, households, early-stopping and final trees or penalty, minutes; learning curves
+under `fit_curves/<refit>/...`; top features). After forecasting the same run gets the scores (`harness/wandb_log.py`, settings `wandb:` in
 `configs/eval.yaml`): sysWAPE, WAPE, MAE, bias over every horizon 1..60 with x = `horizon` (model and B0), every level
 (household .. national), window-sample charts (national actual vs model and B0, observed daily max / min temperature
 below), score tables, run config (model settings, test set, commit, scope, weather). Runs of different models overlay

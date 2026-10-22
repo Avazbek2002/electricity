@@ -40,21 +40,98 @@ def start(wcfg, name, group, job_type, config, tags):
     except ImportError:
         print("[wandb] not installed (pip install wandb plotly): this run is not tracked in W&B")
         return None
+    d = os.path.expanduser(wcfg.get("dir", "~/work/eval"))
+    os.makedirs(d, exist_ok=True)
+    kw = dict(project=wcfg.get("project", "electricity-forecast"), entity=wcfg.get("entity"), name=name, group=group,
+              job_type=job_type, config=config, tags=[str(t) for t in tags if t], dir=d)
     try:
-        run = wandb.init(project=wcfg.get("project", "electricity-forecast"), entity=wcfg.get("entity"), name=name,
-                         group=group, job_type=job_type, config=config, tags=[str(t) for t in tags if t],
-                         dir=os.path.expanduser(wcfg.get("dir", "~/work/eval")), reinit="create_new")
-    except TypeError:                                                   # older wandb: reinit=True
-        run = wandb.init(project=wcfg.get("project", "electricity-forecast"), entity=wcfg.get("entity"), name=name,
-                         group=group, job_type=job_type, config=config, tags=[str(t) for t in tags if t],
-                         dir=os.path.expanduser(wcfg.get("dir", "~/work/eval")), reinit=True)
+        # console="redirect": the whole console, including the worker processes (fits, districts), goes to the run's
+        # Logs tab while it runs
+        run = wandb.init(**kw, reinit="create_new", settings=wandb.Settings(console="redirect"))
+    except TypeError:                                                   # older wandb
+        try:
+            run = wandb.init(**kw, reinit=True, settings=wandb.Settings(console="redirect"))
+        except Exception as e:                                          # noqa: BLE001
+            print(f"[wandb] WARNING: not tracked ({type(e).__name__}: {str(e)[:200]})")
+            return None
     except Exception as e:                                              # noqa: BLE001
         print(f"[wandb] WARNING: not tracked ({type(e).__name__}: {str(e)[:200]})")
         return None
     for split in ("validation", "test"):                                # x axis of every per-horizon metric
         run.define_metric(f"{split}/*", step_metric="horizon")
     run.define_metric("horizon")
+    run.define_metric("refit_index")
+    run.define_metric("fit/*", step_metric="refit_index")                # one point per refit date
+    print(f"[wandb] tracking this run live: {getattr(run, 'url', None) or 'offline (wandb sync later)'}")
     return run
+
+
+# ----------------------------------------------------------------------------- training (one entry per refit)
+def fit_summary(art):
+    """What the model's fit wrote: {"metrics": {...}, "curves": {name: [values]}, "table": DataFrame or None}.
+    Reads boost.json (catboost / xgboost), nlinear_info.json, gam_info.json + term_importance.csv."""
+    import json
+    out = dict(metrics={}, curves={}, table=None)
+    p = os.path.join(art, "boost.json")
+    if os.path.exists(p):
+        j = json.load(open(p))
+        c = j.get("counts", {})
+        out["metrics"] = {"train_windows": c.get("train"), "fit_windows": c.get("fit"), "validation_windows": c.get("val"),
+                          "households": c.get("meters"), "features": c.get("features"),
+                          "catboost_best_iteration": j.get("catboost_best_iteration"),
+                          "catboost_trees": j.get("catboost_final_iterations"),
+                          "xgboost_best_iteration": j.get("xgboost_best_iteration"),
+                          "xgboost_trees": j.get("xgboost_final_iterations"), "fit_minutes": (j.get("seconds") or 0) / 60}
+        out["curves"] = j.get("curves") or {}
+        rows = [dict(model=m, feature=f, importance=v) for m, lst in (j.get("top_features") or {}).items() for f, v in lst]
+        out["table"] = pd.DataFrame(rows) if rows else None
+    p = os.path.join(art, "nlinear_info.json")
+    if os.path.exists(p):
+        j = json.load(open(p))
+        d = j.get("data", {})
+        out["metrics"] = {"train_windows": d.get("train"), "fit_windows": d.get("fit"), "validation_windows": d.get("val"),
+                          "households": d.get("customers")}
+        for v, info in (j.get("variants") or {}).items():
+            out["metrics"][f"{v}_penalty"] = info.get("chosen_lambda")
+            srch = info.get("search") or []
+            if srch:
+                out["curves"][f"{v}/validation_wape_by_penalty"] = [s_["val_wape"] for s_ in srch]
+        if j.get("penalty_fallback"):
+            out["metrics"]["penalty_from_earlier_refit"] = 1
+    p = os.path.join(art, "gam_info.json")
+    if os.path.exists(p):
+        j = json.load(open(p))
+        out["metrics"] = {"train_rows": j.get("rows"), "fit_minutes": j.get("fit_minutes"),
+                          "rows_minutes": j.get("rows_minutes")}
+        t = os.path.join(art, "term_importance.csv")
+        if os.path.exists(t):
+            out["table"] = pd.read_csv(t)
+    out["metrics"] = {k: float(v) for k, v in out["metrics"].items() if v is not None}
+    return out
+
+
+def log_fit(run, i, refit, art, seconds, reused):
+    """One refit's training: counts, tree / penalty choices, learning curves, top features. Logged as it finishes."""
+    if run is None:
+        return
+    import wandb
+
+    def go():
+        f = fit_summary(art)
+        tag = str(refit)
+        run.log({"refit_index": i, "fit/seconds": float(seconds), "fit/reused": float(bool(reused)),
+                 **{f"fit/{k}": v for k, v in f["metrics"].items()}})
+        for k, v in f["metrics"].items():
+            run.summary[f"fit/{tag}/{k}"] = v
+        for name, ys in f["curves"].items():
+            if ys:
+                xs = list(range(len(ys)))
+                run.log({f"fit_curves/{tag}/{name}": wandb.plot.line_series(
+                    xs=xs, ys=[ys], keys=[name], title=f"refit {tag}: {name}", xname="iteration")})
+        if f["table"] is not None and len(f["table"]):
+            run.log({f"fit_tables/{tag}": wandb.Table(dataframe=f["table"])})
+        print(f"[wandb] refit {tag}: training logged ({', '.join(f'{k} {v:g}' for k, v in list(f['metrics'].items())[:6])})")
+    _safe(f"refit {refit} training", go)
 
 
 def _safe(what, fn, *a, **k):
@@ -212,12 +289,14 @@ def log_windows(run, res, weather, per_split=12, out_dir=None):
 
 
 def log_run(wcfg, name, group, job_type, config, tags, res, weather=None, out_dir=None, extra_summary=None,
-            files=()):
-    """Everything of one scored run; returns the W&B run URL or None."""
-    run = start(wcfg, name, group, job_type, config, tags)
+            files=(), run=None):
+    """Everything of one scored run (into `run` if given, which is then finished); returns the run URL or None."""
+    run = run or start(wcfg, name, group, job_type, config, tags)
     if run is None:
         return None
     try:
+        if config:
+            _safe("config", run.config.update, config, allow_val_change=True)
         _safe("scores", log_scores, run, res, extra_summary)
         n = _safe("window charts", log_windows, run, res, weather, int((wcfg or {}).get("windows_per_split", 12)),
                   out_dir)

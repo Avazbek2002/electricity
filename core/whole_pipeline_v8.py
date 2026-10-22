@@ -2446,6 +2446,7 @@ def fit_and_evaluate(pdf, kin, ktg, ktg_raw, clim, fc_grid, fc_grid_mm, train_cu
             label=label, train_cutoff=train_cutoff, val_start=val_start, feature_cols=feature_cols, res_cols=res_cols,
             cb_model=cb_model, xgb_model=xgb_model, cb_best_iter=int(cb_best_iter),
             cb_final_iters=int(cb_final_iters), xgb_best_iter=int(xgb_best_iter), xgb_final_iters=int(xgb_final_iters),
+            cb_curves=cb_curves, xgb_curves=xgb_curves,
             xgb_categories=xgb_categories(Xg), meter_segment=meter_segment, segment_priors=segment_priors,
             pooled_prior=pooled_prior, segment_priors_mm=segment_priors_mm, pooled_prior_mm=pooled_prior_mm,
             cb_imp=pd.DataFrame({"feature": feature_cols, "importance": cb_model.get_feature_importance()}),

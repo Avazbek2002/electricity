@@ -80,6 +80,17 @@ def _settings(wp, spec, cfg):
     return s
 
 
+def _curves(fold):
+    """Early-stopping learning curves: {"catboost/learn": [...], "catboost/validation": [...], "xgboost/validation": ...}."""
+    out = {}
+    for name, ev in (("catboost", fold.cb_curves or {}), ("xgboost", fold.xgb_curves or {})):
+        for part, d in ev.items():
+            for metric, v in (d or {}).items():
+                tag = "validation" if part in ("validation", "validation_0") else part
+                out[f"{name}/{tag}_{metric}"] = [float(x) for x in v]
+    return out
+
+
 def train(spec, artifacts_dir, cfg):
     """One v8 fit for refit spec (shared by catboost / xgboost); copies the files into artifacts_dir."""
     sdir = shared_dir(artifacts_dir, cfg)
@@ -112,6 +123,7 @@ def train(spec, artifacts_dir, cfg):
                               (pd.Timestamp(wp.REGIME_CUTOFF) - pd.Timedelta(days=wp.LOOKBACK - 1)).date()),
             catboost_best_iteration=fold.cb_best_iter, catboost_final_iterations=fold.cb_final_iters,
             xgboost_best_iteration=fold.xgb_best_iter, xgboost_final_iterations=fold.xgb_final_iters,
+            curves=_curves(fold),
             counts=fold.counts, forecast=s["FORECAST_MODE"], wp_overrides=cfg.get("wp") or {},
             settings={k: v for k, v in s.items() if k != "ENRICHED_ROOT"},
             cutoff=spec.cutoff, data_end=spec.data_end, val=[spec.val_start, spec.val_end],
