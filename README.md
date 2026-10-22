@@ -91,7 +91,27 @@ The data owner builds the next enriched release into a separate prefix with its 
 `ec_env.sh`, and set `data.vault.uri` and `data.vault.end` in `configs/eval.yaml`. Only `evaluate.py --mode holdout`
 loads it.
 
-### MLflow
+### Weights & Biases (experiment tracking)
+
+Every `evaluate.py --mode validate|test` run is tracked in W&B (`harness/wandb_log.py`, settings `wandb:` in
+`configs/eval.yaml`): sysWAPE, WAPE, MAE, bias over every horizon 1..60 with x = `horizon` (model and B0), every level
+(household .. national), window-sample charts (national actual vs model and B0, observed daily max / min temperature
+below), score tables, run config (model settings, test set, commit, scope, weather). Runs of different models overlay
+in the project workspace; `scripts/compare_models.py --runs <run> <run> ...` puts several models on the same days in
+one run (one line per model, window charts with every model).
+
+```bash
+pip install wandb plotly && wandb login          # or WANDB_API_KEY in ~/work/ec_env.sh (never in the repo)
+python scripts/compare_models.py --runs ~/work/eval/runs/<a> ~/work/eval/runs/<b> --name "sample validation"
+```
+`--no-wandb` or `WANDB_MODE=disabled` turns it off; `WANDB_MODE=offline` keeps it local (`wandb sync` later);
+`WANDB_BASE_URL` points at a self-hosted server. Only district / national aggregates are sent (data rule: aggregates
+of >= 10 customers) -- check that the W&B host is approved for them.
+
+### MLflow (model registry)
+
+MLflow is used for the model registry: `evaluate.py ... --register` logs the fitted model as a pyfunc and registers it;
+without `--register` an evaluation does not touch MLflow. The other scripts below still record their runs in MLflow.
 
 Every entry point records its runs through one module, `core/mlflow_utils.py`. It never stops a job: if the server
 is unreachable it prints one warning and the job runs untracked.

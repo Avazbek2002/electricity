@@ -179,7 +179,8 @@ def test_worker(code, cfg):
         net_sum[lv] = np.stack([np.where(ok, np.abs(e["FO"] - e["AO"]), 0).sum(0), np.where(ok, e["AO"], 0).sum(0),
                                 np.where(ok, e["FO"] - e["AO"], 0).sum(0), ok.sum(0)], axis=-1)   # (nI, nctrl, 4)
     net = {lv: e for lv, e in net.items() if lv in NODE_FILES}
-    res.update(F=F.astype(np.float32), F_raw=F_raw.astype(np.float32), scale=scale, HH=HH, net_sum=net_sum,
+    res.update(tminmax=np.asarray(wt[1:3], dtype=np.float32), dates0=str(dates[0].date()),
+               F=F.astype(np.float32), F_raw=F_raw.astype(np.float32), scale=scale, HH=HH, net_sum=net_sum,
                n_present=n_present, n_fresh=n_fresh, issues=issues, net=net,
                seconds=time.time() - t0, peak_bytes=ts.peak_rss_bytes())
     return res
@@ -415,11 +416,16 @@ def run_test(args, cfg, git, model_dir, model_config, tracking, scoring=None):
                 districts=codes if scope != "national" else "all", splits=splits, substitution_test=sub, notes=notes,
                 household_forecasts=sum(r["windows"] for r in results),
                 gaps_filled_with_persistence=sum(r["gaps"] for r in results), scaling=sc)
+    meta["test_dir"] = test_dir
     json.dump(meta, open(os.path.join(fdir, "forecast_meta.json"), "w"), indent=2, default=str)
     res = ts.score(fdir, test_dir, spec, others=others)
     text = ts.report(res, spec)
     print("\n" + text)
     ts.save_scores(res, os.path.join(out, "scores"), text)
+    from harness import wandb_log
+    weather_daily = wandb_log.weather_frame(results)
+    if weather_daily is not None:
+        weather_daily.to_csv(os.path.join(out, "scores", "weather_daily.csv"), index=False, float_format="%.2f")
     charts = {}
     try:
         from harness import plots
@@ -444,8 +450,26 @@ def run_test(args, cfg, git, model_dir, model_config, tracking, scoring=None):
     files = [os.path.join(out, "scores", f) for f in ("scores.csv", "spec_check.csv", "bias_audit.csv", "report.txt",
                                                       "national_daily.csv", "levels.csv")
              if os.path.exists(os.path.join(out, "scores", f))]
+    # ---- experiment tracking: Weights & Biases
+    wcfg = dict(cfg.get("wandb") or {})
+    if getattr(args, "no_wandb", False):
+        wcfg["enabled"] = False
+    wandb_url = wandb_log.log_run(
+        wcfg, name=f"{args.model} | {args.mode} | {scope} | {git['short']}", group=f"{spec['version']} {scope} {weather}",
+        job_type=args.mode, tags=[args.model, args.mode, scope, f"weather-{weather}", model_config.get("family", "")],
+        config=dict(model=args.model, family=model_config.get("family", args.model), model_config=model_config,
+                    test_set=spec["version"], test_set_sha256=spec["_sha256"][:12], data_version=man["data_version"],
+                    scope=scope, districts=tags["districts"], weather=weather, scaling=sc, commit=git["commit"],
+                    dirty=git["dirty"], refits=[str(R.date()) for R, _ in blocks], issue_dates=n_issue, splits=splits,
+                    substitution_test=tags["substitution_test"], fit_seconds=round(fit_seconds),
+                    predict_seconds=round(predict_seconds), run_dir=out),
+        res=res, weather=weather_daily, out_dir=os.path.join(out, "scores"),
+        extra_summary={"headline": headline, "substitution_test": tags["substitution_test"]},
+        files=files)
+
+    # ---- model registry: MLflow (only with --register; tracking is in W&B)
     mlcfg = dict(cfg.get("mlflow", {}))
-    if args.no_mlflow:
+    if args.no_mlflow or not args.register:
         mlcfg["enabled"] = False
     if mlcfg.get("enabled", True) and not os.getenv("MLFLOW_TRACKING_URI") and not mlcfg.get("uri"):
         mlcfg["uri"] = "sqlite:///" + os.path.join(out_root, "mlflow.db")
@@ -460,7 +484,7 @@ def run_test(args, cfg, git, model_dir, model_config, tracking, scoring=None):
     row = dict(time=time.strftime("%Y-%m-%d %H:%M:%S"), model=args.model, commit=git["commit"], mode=args.mode,
                holdout_period=spec["version"], status="done", scope=scope, weather=weather, headline=headline,
                reference_headline=float(t[(t["model"] == "B0") & t["horizon"].isin(res["ctrl"])]["sysmape"].mean()),
-               substitution_test=tags["substitution_test"], run_dir=out, mlflow_run=run_id or "",
+               substitution_test=tags["substitution_test"], run_dir=out, mlflow_run=run_id or "", wandb_run=wandb_url or "",
                spec_pass=bool(res["spec_check"]["passed"].all()) if args.mode == "test" else "")
     tracking.append_csv(os.path.join(out_root, "runs.csv"), row)
     tracking.append_csv(os.path.join(out_root, "test_leaderboard.csv"),

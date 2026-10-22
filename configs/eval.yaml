@@ -30,7 +30,13 @@ budget:                                  # holdout looks
   per_commit: 1
   per_month: 2
 
-mlflow:
+wandb:                                   # experiment tracking (evaluate.py validate / test, compare_models.py)
+  enabled: true                          # also off with --no-wandb or WANDB_MODE=disabled; key: `wandb login` / WANDB_API_KEY
+  project: electricity-forecast
+  entity: null                           # team / user; null = the logged-in default
+  windows_per_split: 12                  # window-sample charts per split (at least 10 where the data allow)
+  dir: ~/work/eval                       # local W&B files (offline runs: wandb sync)
+mlflow:                                  # model registry only (evaluate.py --register, python -m harness.registry)
   enabled: true
   uri: null                              # null: MLFLOW_TRACKING_URI, else a local SQLite store ~/work/eval/mlflow.db
   experiment: electricity/eval

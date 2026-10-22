@@ -4,6 +4,8 @@ pyarrow
 pyyaml
 matplotlib
 mlflow
+wandb
+plotly
 catboost
 xgboost
 scikit-learn

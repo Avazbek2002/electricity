@@ -50,7 +50,8 @@ def main(argv=None):
     p.add_argument("--register", action="store_true",
                    help="register the fitted model in the MLflow registry as electricity_household_<model> (aliases: "
                         "best_<mode>, or 'challenger' on the holdout); see harness/registry.py")
-    p.add_argument("--no-mlflow", action="store_true")
+    p.add_argument("--no-mlflow", action="store_true", help="no MLflow at all (it is only used with --register)")
+    p.add_argument("--no-wandb", action="store_true", help="no Weights & Biases tracking for this run")
     args = p.parse_args(argv)
     cfg = yaml.safe_load(open(args.config))
     run_cfg, sc_cfg, data = cfg["run"], cfg["scoring"], cfg["data"]
