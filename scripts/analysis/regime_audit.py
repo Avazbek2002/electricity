@@ -109,12 +109,13 @@ def worker(code, cfg):
     if not len(S):
         return out
     dates = d0 + pd.to_timedelta(np.arange(T), unit="D")
-    mon = (dates.year - d0.year) * 12 + dates.month - d0.month           # month index per day
+    mon = np.asarray((dates.year - d0.year) * 12 + dates.month - d0.month, dtype=np.int64)   # month index per day
+    # (a plain array: a pandas Index inside np.add.at fails on newer pandas)
     nM = int(mon.max()) + 1
     obs = S == 1
     rows = []
     # ---- A, C, F per month
-    dow = dates.dayofweek.to_numpy()
+    dow = np.asarray(dates.dayofweek, dtype=np.int64)
     for m in range(nM):
         sl = np.flatnonzero(mon == m)
         s, k, a, o = S[:, sl], K[:, sl], A[:, sl], obs[:, sl]
@@ -168,7 +169,7 @@ def worker(code, cfg):
     anyr = np.zeros((len(S), T + 1), np.int32)
     np.cumsum(S > 0, axis=1, out=anyr[:, 1:])
     erows = []
-    for o in np.flatnonzero(dates.day == 15):
+    for o in np.flatnonzero(np.asarray(dates.day) == 15):
         last = o - 1
         if last + 1 - 90 < 0 or o + 60 > T - 1:
             continue
