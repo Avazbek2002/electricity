@@ -1819,6 +1819,11 @@ def assign_meter_segments(meter_features: pd.DataFrame, k: int = SEGMENT_K, seed
     name_map = {c: ("weather_responsive_winter_peaked" if c == weather_cluster
                     else "stable_baseload_low_seasonality") for c in cluster_score.index}
     labels.loc[complete.index] = [name_map[c] for c in raw_labels]
+    # the fitted clustering, so a new meter can be assigned from its own history (evaluation harness, serving)
+    sc = StandardScaler().fit(complete[cols])
+    labels.attrs["kmeans"] = dict(cols=cols, mean=sc.mean_.tolist(), scale=sc.scale_.tolist(),
+                                  centers=km.cluster_centers_.tolist(),
+                                  names=[name_map[c] for c in range(len(km.cluster_centers_))])
 
     print(f"[segmentation] {labels.loc[complete.index].value_counts().to_dict()}, "
           f"{(labels == 'unclassified').sum():,} unclassified")
@@ -1920,12 +1925,19 @@ def nm(a):
     return np.nanmean(a, axis=1)
 
 
-def build_features(pdf, kin, ktg, clim, future_mode=FUTURE_MODE, normal_mode=NORMAL_MODE,
+def build_features(pdf, kin, ktg, clim, future_mode=None, normal_mode=None,
                     beta_h_prior=BETA_H_PRIOR, beta_c_prior=BETA_C_PRIOR,
-                    forecast_mode=FORECAST_MODE, fc_grid=None, use_prev_year=USE_PREV_YEAR_FEATURES,
+                    forecast_mode=None, fc_grid=None, use_prev_year=None,
                     meter_segment: pd.Series = None,
                     beta_h_prior_mm=None, beta_c_prior_mm=None, fc_grid_mm: dict = None,
-                    use_minmax: bool = USE_MINMAX):
+                    use_minmax: bool = None):
+    # None = the module setting at CALL time (a default written as FORECAST_MODE etc. would freeze the value at import,
+    # so --set / programmatic changes of these settings were silently ignored by unchunked calls)
+    future_mode = FUTURE_MODE if future_mode is None else future_mode
+    normal_mode = NORMAL_MODE if normal_mode is None else normal_mode
+    forecast_mode = FORECAST_MODE if forecast_mode is None else forecast_mode
+    use_prev_year = USE_PREV_YEAR_FEATURES if use_prev_year is None else use_prev_year
+    use_minmax = USE_MINMAX if use_minmax is None else use_minmax
     N = len(pdf)
     t_obs, t_nrm, t_prev = lookup_weather(pdf, clim, normal_mode)
 
@@ -2095,7 +2107,7 @@ def build_features_chunked(pdf, kin, ktg, clim, fc_grid=None, fc_grid_mm=None, c
     if n <= chunk:
         return build_features(pdf, kin, ktg, clim, fc_grid=fc_grid, fc_grid_mm=fc_grid_mm, **kw)
     mode = kw.pop("forecast_mode", FORECAST_MODE)
-    if mode == "simulated" and kw.get("future_mode", FUTURE_MODE) != "actual":
+    if mode == "simulated" and (kw.get("future_mode") or FUTURE_MODE) != "actual":
         u = pdf[["coato_code", "origin_date"]].copy()
         u["coato_code"] = u["coato_code"].astype(str)
         u = u.drop_duplicates().reset_index(drop=True)              # first-appearance order = simulate_forecast's draw order
@@ -2313,11 +2325,13 @@ def system_daily_frame(model, pred, y, origin_days, horizons=HORIZONS_REPORTED):
 
 
 def fit_and_evaluate(pdf, kin, ktg, ktg_raw, clim, fc_grid, fc_grid_mm, train_cutoff, val_start,
-                     test_end=None, label="primary", val_end=None):
+                     test_end=None, label="primary", val_end=None, train_only=False, fallback_iters=None):
     """Everything that depends on the train cutoff, for ONE fold: behaviour segments and priors (training
     history only), features, the CatBoost / XGBoost fits with early stopping on the validation slice, the
     final refits on the whole training period, and the test evaluation against RAW targets.
-    The primary fold uses TRAIN_CUTOFF; backtest folds (BACKTEST_CUTOFFS) call this with their own cutoff."""
+    The primary fold uses TRAIN_CUTOFF; backtest folds (BACKTEST_CUTOFFS) call this with their own cutoff.
+    train_only=True (evaluation harness): no test split is needed and nothing is evaluated; if the validation slice is
+    empty, fallback_iters = (catboost, xgboost) final tree counts (e.g. from the previous refit) replace early stopping."""
     from types import SimpleNamespace
     print(f"\n===== fold '{label}': train cutoff {train_cutoff} | validation after {val_start} | "
           f"test origins {'until ' + str(test_end) if test_end else 'to the last available date'} =====")
@@ -2365,17 +2379,25 @@ def fit_and_evaluate(pdf, kin, ktg, ktg_raw, clim, fc_grid, fc_grid_mm, train_cu
     print(f"origin months  fit {om[fit].min()}..{om[fit].max()} ({om[fit].nunique()}) | val {om[val].min()}..{om[val].max()} "
           f"({om[val].nunique()}) | test {om[test].min()}..{om[test].max()} ({om[test].nunique()})" if fit.any() and val.any()
           and test.any() else "origin months: a split is empty")
-    if not test.any() or not fit.any() or not val.any():
+    no_val = not val.any()
+    if train_only and no_val and fallback_iters and train.any():
+        print(f"[fold '{label}'] WARNING: no validation windows: early stopping skipped, final trees "
+              f"{tuple(fallback_iters)} (catboost, xgboost) from an earlier fit")
+    elif train_only and (not fit.any() or no_val):
+        raise ValueError(f"fold '{label}': empty fit / validation split (fit {fit.sum()}, val {val.sum()}); pass "
+                         f"fallback_iters to train without validation")
+    if not train_only and (not test.any() or not fit.any() or not val.any()):
         raise ValueError(f"fold '{label}': empty split (fit {fit.sum()}, val {val.sum()}, test {test.sum()}); "
                          f"check the cutoffs against the available origin dates "
                          f"({meta['origin_date'].min().date()} .. {meta['origin_date'].max().date()})")
     regime_report("train target days", t_fut_actual[train])
-    regime_report("test target days", t_fut_actual[test])
+    if test.any():
+        regime_report("test target days", t_fut_actual[test])
     is_old = (meta["origin_date"] < pd.Timestamp(REGIME_CUTOFF)).values
     print(f"[old regime] windows by split  fit {int((fit & is_old).sum()):,} old / {int((fit & ~is_old).sum()):,} new | "
           f"val {int((val & is_old).sum()):,} / {int((val & ~is_old).sum()):,} | "
           f"test {int((test & is_old).sum()):,} / {int((test & ~is_old).sum()):,}   (old rows must be 0 in val and test)")
-    assert not (is_old & (val | test)).any(), "old-regime rows leaked into validation / test"
+    assert train_only or not (is_old & (val | test)).any(), "old-regime rows leaked into validation / test"
     if is_old.any():
         regime_report("old-regime target days", t_fut_actual[is_old])
         regime_report("new-regime train target days", t_fut_actual[train & ~is_old])
@@ -2387,11 +2409,14 @@ def fit_and_evaluate(pdf, kin, ktg, ktg_raw, clim, fc_grid, fc_grid_mm, train_cu
     # -------------------------------------------------------------------
     # CatBoost
     # -------------------------------------------------------------------
-    cb_model = CatBoostRegressor(cat_features=CAT_FEATURES, **CATBOOST_PARAMS)
-    cb_model.fit(X[fit], Y[fit], eval_set=(X[val], Y[val]), early_stopping_rounds=CATBOOST_EARLY_STOPPING_ROUNDS,
-                 sample_weight=sw(fit))
-    cb_best_iter = cb_model.get_best_iteration()
-    cb_curves = cb_model.get_evals_result()                  # learning curves of the early-stopping fit
+    if no_val and fallback_iters:
+        cb_best_iter, cb_curves = int(fallback_iters[0]), {}
+    else:
+        cb_model = CatBoostRegressor(cat_features=CAT_FEATURES, **CATBOOST_PARAMS)
+        cb_model.fit(X[fit], Y[fit], eval_set=(X[val], Y[val]), early_stopping_rounds=CATBOOST_EARLY_STOPPING_ROUNDS,
+                     sample_weight=sw(fit))
+        cb_best_iter = cb_model.get_best_iteration()
+        cb_curves = cb_model.get_evals_result()              # learning curves of the early-stopping fit
     cb_final_iters = max(min(cb_best_iter, MAX_FINAL_ITERATIONS), 10)
     print(f"[catboost] best iteration on validation: {cb_best_iter} -> using {cb_final_iters} for the final fit "
           f"(capped at MAX_FINAL_ITERATIONS={MAX_FINAL_ITERATIONS})")
@@ -2403,16 +2428,30 @@ def fit_and_evaluate(pdf, kin, ktg, ktg_raw, clim, fc_grid, fc_grid_mm, train_cu
     # -------------------------------------------------------------------
     # XGBoost
     # -------------------------------------------------------------------
-    xgb_model = xgb.XGBRegressor(early_stopping_rounds=XGB_EARLY_STOPPING_ROUNDS, **XGB_PARAMS)
-    xgb_model.fit(Xg[fit], Y[fit], eval_set=[(Xg[val], Y[val])], sample_weight=sw(fit), verbose=100)
-    xgb_best_iter = xgb_model.best_iteration
-    xgb_curves = xgb_model.evals_result()
+    if no_val and fallback_iters:
+        xgb_best_iter, xgb_curves = int(fallback_iters[1]), {}
+    else:
+        xgb_model = xgb.XGBRegressor(early_stopping_rounds=XGB_EARLY_STOPPING_ROUNDS, **XGB_PARAMS)
+        xgb_model.fit(Xg[fit], Y[fit], eval_set=[(Xg[val], Y[val])], sample_weight=sw(fit), verbose=100)
+        xgb_best_iter = xgb_model.best_iteration
+        xgb_curves = xgb_model.evals_result()
     xgb_final_iters = max(min(xgb_best_iter, MAX_FINAL_ITERATIONS), 10)
     print(f"[xgboost] best iteration on validation: {xgb_best_iter} -> using {xgb_final_iters} for the final fit")
 
     xgb_final_params = dict(XGB_PARAMS, n_estimators=xgb_final_iters)
     xgb_model = xgb.XGBRegressor(**xgb_final_params)
     xgb_model.fit(Xg[train], Y[train], sample_weight=sw(train), verbose=False)
+    if train_only:                                             # evaluation harness: the fitted pieces, no test scoring
+        return SimpleNamespace(
+            label=label, train_cutoff=train_cutoff, val_start=val_start, feature_cols=feature_cols, res_cols=res_cols,
+            cb_model=cb_model, xgb_model=xgb_model, cb_best_iter=int(cb_best_iter),
+            cb_final_iters=int(cb_final_iters), xgb_best_iter=int(xgb_best_iter), xgb_final_iters=int(xgb_final_iters),
+            xgb_categories=xgb_categories(Xg), meter_segment=meter_segment, segment_priors=segment_priors,
+            pooled_prior=pooled_prior, segment_priors_mm=segment_priors_mm, pooled_prior_mm=pooled_prior_mm,
+            cb_imp=pd.DataFrame({"feature": feature_cols, "importance": cb_model.get_feature_importance()}),
+            xgb_imp=pd.DataFrame({"feature": feature_cols, "importance": xgb_model.feature_importances_}),
+            counts=dict(train=int(train.sum()), fit=int(fit.sum()), val=int(val.sum()), features=len(feature_cols),
+                        meters=int(meta["meter_id"].nunique())))
 
     # -------------------------------------------------------------------
     # Evaluation - scored against RAW (unrepaired) targets

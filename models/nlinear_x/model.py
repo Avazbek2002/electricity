@@ -26,7 +26,8 @@ class Model(BaseModel):
             info_p, w_p = os.path.join(d, "nlinear_info.json"), os.path.join(d, f"weights_{self.variant}.npz")
             if os.path.exists(info_p) and os.path.exists(w_p):
                 c = json.load(open(info_p))["config"]
-                if _same(c["cutoff"], spec.cutoff) and _same(c["val_start"], spec.val_start) and _same(c["val_end"], spec.val_end):
+                if (_same(c["cutoff"], spec.cutoff) and _same(c["val_start"], spec.val_start) and _same(c["val_end"], spec.val_end)
+                        and c.get("forecast", "simulated") == self.config.get("forecast", "none")):
                     shutil.copy(info_p, artifacts_dir)
                     shutil.copy(w_p, artifacts_dir)
                     print(f"[nlinear_x] reusing the pretrained run {d} (same cutoff and validation block)")
@@ -37,6 +38,7 @@ class Model(BaseModel):
         argv = ["--out-dir", artifacts_dir, "--root", spec.roots[0]["uri"], "--cutoff", spec.cutoff,
                 "--val-start", spec.val_start, "--val-end", spec.val_end, "--end", spec.data_end,
                 "--variants", self.variant, "--workers", str(spec.workers), "--test-sample", "0",
+                "--forecast", self.config.get("forecast", "none"),
                 "--cache-dir", os.path.join(artifacts_dir, "cache")] + [str(x) for x in self.config.get("train_args") or []]
         prev = self._earlier_fit(artifacts_dir)
         if prev:                                     # used only if this refit has no validation windows (2024 label hole)
@@ -79,10 +81,19 @@ class Model(BaseModel):
         pdf = pd.DataFrame({"meter_id": panel.keys.astype(str), "consumer_id": np.nan, "origin_date": last,
                             "coato_code": panel.coato, "housing_type_id": ht})
         pp = panel.pipeline
+        fmode = self.cfg.get("forecast", "simulated")
+        g = gm = None
+        if fmode == "simulated":
+            if pp.get("weather_mode") != "simulated":
+                raise SystemExit("this NLinear was trained with a simulated forecast: run it with --weather simulated "
+                                 "(or set forecast: none in its config.yaml and refit)")
+            from harness.weather import grid_at_last_day
+            g, gm = grid_at_last_day(panel)
         with hn._quiet():
             _, feats, base, _ = wp.build_features_chunked(
-                pdf, kin, np.full((n, HORIZON), np.nan), pp["clim"], fc_grid=pp["fc_grid"], fc_grid_mm=pp["fc_grid_mm"],
-                chunk=self.cfg.get("chunk", 50000), forecast_mode="archive", normal_mode="loyo",
+                pdf, kin, np.full((n, HORIZON), np.nan), pp["clim"], fc_grid=g, fc_grid_mm=gm,
+                chunk=self.cfg.get("chunk", 50000), forecast_mode="archive" if fmode == "simulated" else "none",
+                normal_mode="loyo",
                 beta_h_prior=self.cfg["prior_h"], beta_c_prior=self.cfg["prior_c"],
                 beta_h_prior_mm=self.cfg["prior_h_mm"], beta_c_prior_mm=self.cfg["prior_c_mm"], meter_segment=None)
         o = np.full(n, panel.kwh.shape[1] - 1)

@@ -61,15 +61,16 @@ def test_worker(code, cfg):
     res = dict(code=str(code), seconds=0.0, gaps=0, windows=0, notes=[])
     if not len(D["keys"]):
         return res
+    simulated = cfg["weather"] == "simulated"
+    if simulated:                  # the simulated forecast archive is an outside input known on its issue date: it is
+        # drawn from the unperturbed weather, so the substitution test checks the household data and observed weather
+        _, grid_all, grid_mm_all = district_weather(code, D["wt"].copy(), D["dates"], cfg["seed"], wp)
     if cfg.get("perturb_after") is not None:
         D = _perturb(D, ts.day_index(spec, cfg["perturb_after"]))
     M, wt, dates = D["M"], D["wt"], D["dates"]
     T = M.shape[1]
     L, H = wp.LOOKBACK, HORIZON
     gap = int(spec["history_gap_days"])
-    simulated = cfg["weather"] == "simulated"
-    if simulated:
-        _, grid_all, grid_mm_all = district_weather(code, wt, dates, cfg["seed"], wp)
     groups = ts.groups(D["network"], cfg["network_levels"]) if cfg["network_levels"] else {}
     ctrl = np.asarray(spec["control_horizons"]) - 1
     sc = cfg.get("scaling") or {}

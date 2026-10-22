@@ -1,0 +1,9 @@
+family: v8_boost
+variant: catboost
+forecast: none                  # the standard run: no target-day weather (normals only). See catboost_fc for the forecast run
+buckets: [0, 1, 2, 3, 4]        # customer_bucket values: each ~1 % of customers -> 5 %. null = every customer
+train_sample: null              # share of the trainable windows kept (stable hash); e.g. 0.2 with buckets: null
+max_window_gb: 40               # refuse if kin + ktg would need more (raise on a big pod)
+workers: null                   # districts read in parallel (null: evaluate.py --workers)
+wp:                             # other whole_pipeline_v8 settings (part of the shared fit), e.g. CATBOOST_PARAMS
+  SEGMENT_USE_OLD: true         # segments + priors from all history: every 2024 refit has old-regime data only (v8: false)

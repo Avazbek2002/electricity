@@ -260,7 +260,8 @@ def district_worker(code, cfg):
                             "origin_date": origin, "coato_code": str(code), "housing_type_id": ht})
         with _quiet():
             meta, feats, base, _ = wp.build_features_chunked(
-                pdf, kin, ktg, clim, fc_grid=grid, fc_grid_mm=grid_mm, chunk=cfg["chunk"], forecast_mode="archive",
+                pdf, kin, ktg, clim, fc_grid=grid, fc_grid_mm=grid_mm, chunk=cfg["chunk"],
+                forecast_mode="archive" if cfg.get("forecast", "simulated") == "simulated" else "none",
                 normal_mode="loyo", beta_h_prior=cfg["prior_h"], beta_c_prior=cfg["prior_c"],
                 beta_h_prior_mm=cfg["prior_h_mm"], beta_c_prior_mm=cfg["prior_c_mm"], meter_segment=None)
         ly = year_ago(M, r, o, wp.BLOCKS)
@@ -426,6 +427,9 @@ def main(argv=None):
     p.add_argument("--coato-min-households", type=int, default=10,
                    help="district-level sysWAPE: leave out districts with fewer test households per target day")
     p.add_argument("--variants", default=",".join(VARIANTS))
+    p.add_argument("--forecast", default="simulated", choices=("simulated", "none"),
+                   help="weather of the target days in the features: the simulated 10-day forecast + normals, or normals "
+                        "only (the ML guide's standard run, which has no target-day weather)")
     p.add_argument("--norm-days", type=int, default=7)
     p.add_argument("--min-level", type=float, default=0.2, help="kWh/day: lower levels are not trained on (fallback forecast)")
     p.add_argument("--weight", choices=["kwh", "sqrt", "none"], default="kwh")
@@ -476,7 +480,7 @@ def run(wp, args, out_dir, variants):
     import pickle
     import enriched_io as eio
     buckets = None if str(args.buckets).lower() == "all" else [int(b) for b in str(args.buckets).split(",")]
-    cfg = dict(here=HERE, root=args.root, start=wp.ENRICHED_START, end=args.end, labels=list(wp.ENRICHED_LABELS),
+    cfg = dict(here=HERE, forecast=args.forecast, root=args.root, start=wp.ENRICHED_START, end=args.end, labels=list(wp.ENRICHED_LABELS),
                buckets=buckets, stride=args.stride, cutoff=args.cutoff, val_start=args.val_start, val_end=args.val_end,
                test_sample=args.test_sample, val_sample=args.val_sample, norm_days=args.norm_days, min_level=args.min_level,
                weight=args.weight, prior_h=args.prior_h, prior_c=args.prior_c, prior_h_mm=args.prior_h_mm,

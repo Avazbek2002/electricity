@@ -11,7 +11,10 @@ One row = household x origin x horizon h. Inputs, all known at the origin:
   obs90        share of the last 90 days observed
   temp         target-day temperature: issued forecast for days 1-10; normal + the day 8-10 anomaly x exp(-(h-10)/5) after
   temp_dev     temp - the mean temperature of the last 30 days
-  doy, dow     target day of year, target day of week (category)
+  nrm_dev      the target day's climate normal - the mean normal of the last 30 days (the seasonal swing still to come,
+               known in advance; replaces the target day of year, which the 2024-01 refit had never seen in winter:
+               there is no clean January-February target before 2024)
+  dow          target day of week (category)
   ly_ratio     last year's same block / last year's level (block of h), 1 if unknown; ly_have 1/0
   housing      housing_type_id (category)
 Target: y / level (clipped 0..5); weight: level (so the loss counts kWh, as pooled WAPE does).
@@ -24,8 +27,9 @@ import numpy as np
 import pandas as pd
 
 KNOTS = (1, 2, 3, 5, 7, 10, 14, 21, 30, 45, 60)
-FEATURES = ["h", "log_level", "r_last", "r7_30", "slope30", "cv30", "obs90", "temp", "temp_dev", "doy", "dow",
+FEATURES = ["h", "log_level", "r_last", "r7_30", "slope30", "cv30", "obs90", "temp", "temp_dev", "nrm_dev", "dow",
             "ly_ratio", "ly_have", "housing"]
+ALL_H = tuple(range(1, 61))
 CATEGORICAL = ("dow", "housing")
 
 
@@ -63,12 +67,14 @@ def household_block(kwh, wp):
 
 
 def origin_weather(coato, origin, clim, grid, wp, gap=1):
-    """-> (temperature path for target days origin + 1..60, mean observed temperature of the 30 days before the gap:
-    on issue date o the weather is known up to o - gap)."""
+    """-> (temperature path for target days origin + 1..60, mean observed temperature of the 30 days before the gap,
+    normal of the target days minus the mean normal of those 30 days): on issue date o the weather is known up to
+    o - gap. grid None = no forecast issued (normals only)."""
     L, H = wp.LOOKBACK, wp.HORIZON
     pdf = pd.DataFrame({"coato_code": [str(coato)], "origin_date": [pd.Timestamp(origin)]})
     t_obs, t_nrm, _ = wp.lookup_weather(pdf, clim, "loyo")
-    t_fc = wp.lookup_forecast_archive(pdf, clim, grid)[0]
+    t_fc = (wp.lookup_forecast_archive(pdf, clim, grid)[0] if grid is not None
+            else np.full(wp.FORECAST_DAYS, np.nan))
     nrm = t_nrm[0, L:L + H].astype(float)
     path = nrm.copy()
     if np.isfinite(t_fc).all():
@@ -79,10 +85,12 @@ def origin_weather(coato, origin, clim, grid, wp, gap=1):
         path[K:] = nrm[K:] + anom * np.exp(-(h - K) / 5.0)
     w = t_obs[0, L - 30 - gap:L - gap]
     past30 = float(np.nanmean(w)) if np.isfinite(w).any() else np.nan
-    return path, past30
+    wn = t_nrm[0, L - 30 - gap:L - gap]
+    nrm_dev = nrm - (float(np.nanmean(wn)) if np.isfinite(wn).any() else np.nan)
+    return path, past30, nrm_dev
 
 
-def rows(hh, path, past30, origin, housing, horizons, wp):
+def rows(hh, path, past30, nrm_dev, origin, housing, horizons, wp):
     """Cross households x horizons -> DataFrame of FEATURES (n * len(horizons) rows, household-major)."""
     n, k = len(hh["level"]), len(horizons)
     hz = np.asarray(horizons)
@@ -95,7 +103,7 @@ def rows(hh, path, past30, origin, housing, horizons, wp):
     return pd.DataFrame({
         "h": til(hz.astype(float)), "log_level": rep(hh["log_level"]), "r_last": rep(hh["r_last"]),
         "r7_30": rep(hh["r7_30"]), "slope30": rep(hh["slope30"]), "cv30": rep(hh["cv30"]), "obs90": rep(hh["obs90"]),
-        "temp": til(path[hz - 1]), "temp_dev": til(path[hz - 1] - past30), "doy": til(tgt.dayofyear.to_numpy(float)),
+        "temp": til(path[hz - 1]), "temp_dev": til(path[hz - 1] - past30), "nrm_dev": til(nrm_dev[hz - 1]),
         "dow": til(tgt.dayofweek.astype(str).to_numpy()), "ly_ratio": np.where(np.isfinite(ly), ly, 1.0).ravel(),
         "ly_have": np.isfinite(ly).astype(float).ravel(), "housing": np.repeat(hs, k)})
 
@@ -122,6 +130,8 @@ def district_rows(code, cfg):
     M, dates = D["M"], D["dates"]
     T, L, H = M.shape[1], wp.LOOKBACK, wp.HORIZON
     clim, grid, _ = district_weather(code, D["wt"], dates, cfg["seed"], wp)
+    if cfg.get("forecast", "none") == "none":                             # the standard run: no target-day forecast
+        grid = None
     u = np.array([zlib.crc32(str(k).encode()) for k in D["keys"]], dtype=np.uint64) % 1_000_000 / 1e6
     keep = np.flatnonzero(u < cfg["household_share"])
     if not len(keep):
@@ -131,7 +141,7 @@ def district_rows(code, cfg):
     np.cumsum(np.isfinite(Mk), axis=1, out=cnt[:, 1:])
     cut = int((pd.Timestamp(cfg["cutoff"]) - dates[0]).days)
     W = int(cfg["history_days"])
-    hz = np.asarray(KNOTS)
+    hz = np.asarray(ALL_H if cfg.get("horizons", "all") == "all" else KNOTS)
     parts = []
     step = int(cfg["origin_step"])
     first = L + zlib.crc32(str(code).encode()) % step                     # origins staggered across districts
@@ -150,8 +160,8 @@ def district_rows(code, cfg):
             continue
         r = r[ok]
         hh = {k: v[ok] for k, v in hh.items()}
-        path, past30 = origin_weather(code, dates[o], clim, grid, wp)
-        X = rows(hh, path, past30, dates[o], D["housing"][keep][r], hz, wp)
+        path, past30, nrm_dev = origin_weather(code, dates[o], clim, grid, wp)
+        X = rows(hh, path, past30, nrm_dev, dates[o], D["housing"][keep][r], hz, wp)
         y = Mk[r][:, o + hz].astype(float)
         X["y"] = np.clip(y / hh["level"][:, None], 0, 5).ravel()
         X["w"] = np.repeat(hh["level"], len(hz))

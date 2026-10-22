@@ -1,8 +1,10 @@
 family: gam
-# training rows: household x origin x knot horizon (1, 2, 3, 5, 7, 10, 14, 21, 30, 45, 60)
+# training rows: household x origin x horizon (every day 1..60: the weekday pattern of each target day is learned)
+horizons: all                    # all | knots (1, 2, 3, 5, 7, 10, 14, 21, 30, 45, 60, linear in between: the old GAM)
+forecast: none                   # none: normals only (the standard run) | simulated: 10-day forecast (--weather simulated)
 household_share: 0.005           # stable hash share of households used for training (0.5% ~ 40k nationally)
 origin_step: 28                  # days between training origins (staggered across districts)
-max_rows: 4000000                # random cap on training rows
+max_rows: 8000000                # random cap on training rows
 history_days: 730
 min_level: 0.2                   # kWh/day: lower levels are not trained on; predict persistence for them
 fit_coatos: []                   # [] = every district; a list for quick runs
@@ -11,7 +13,7 @@ interactions:                    # explicit pairs; [] -> auto_interactions stron
   - [temp, log_level]
   - [temp, housing]
   - [temp, h]
-  - [doy, h]
+  - [nrm_dev, h]
   - [r7_30, h]
 auto_interactions: 10
 outer_bags: 4

@@ -1,5 +1,6 @@
 family: nlinear
 variant: nlinear_x               # nlinear | nlinear_x | thermal_nlinear | thermal_nlinear_x
-pretrained: [~/work/hh_nlinear]  # earlier household_nlinear.py output folders; reused when cutoff and validation block match
-                                 # e.g. [~/work/hh_nlinear] (cutoff 2025-09-01: the dev-test mode)
+forecast: none                   # none: normals only (the standard run) | simulated: 10-day forecast (--weather simulated)
+pretrained: []                   # earlier household_nlinear.py output folders, reused when cutoff, validation block and
+                                 # forecast match
 train_args: []                   # extra household_nlinear.py flags, e.g. ["--stride", "30"]

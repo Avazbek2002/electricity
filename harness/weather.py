@@ -57,3 +57,19 @@ def no_forecast(n_days, K):
     """The forecast grid of a run without target-day weather: no forecast issued (models fall back to normals)."""
     g = np.full((1, n_days, K), np.nan)
     return g, dict(min=g.copy(), max=g.copy())
+
+
+def grid_at_last_day(panel):
+    """For models whose window origin is the last history day (o - 1): the forecast issued on o, moved to issue day
+    o - 1 with leads shifted by one (window lead k + 1 = forecast lead k; window lead 1 = day o has no forecast).
+    -> (grid, grid_mm) for whole_pipeline_v8.lookup_forecast_archive with origin_date = o - 1."""
+    pp = panel.pipeline
+    clim, g, gm = pp["clim"], pp["fc_grid"], pp.get("fc_grid_mm") or {}
+    gi = issue_index(clim, panel.origin)
+
+    def shift(a):
+        out = np.full_like(a, np.nan)
+        if 1 <= gi < a.shape[1]:
+            out[:, gi - 1, 1:] = a[:, gi, :-1]
+        return out
+    return shift(g), {k: shift(v) for k, v in gm.items()}

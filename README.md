@@ -21,6 +21,9 @@ harness/               the evaluation harness
   plots.py               charts of a run: metrics over every horizon, window samples (logged to MLflow)
   cli.py                 the evaluate.py command line
 models/<name>/         one folder per model: model.py (class Model), config.yaml, NOTES.md
+  catboost/, xgboost/    Baseline + CatBoost / XGBoost from whole_pipeline_v8 (one shared fit; core/boost_harness.py)
+  catboost_fc/, xgboost_fc/  the same with the simulated 10-day forecast (--weather simulated, preliminary)
+  gam/                   GAM (EBM): every horizon 1..60, no day-of-year input
   nlinear_x/             NLinear with weather inputs (trains through core/household_nlinear.py)
   persistence30/         baseline: mean of the last 30 observed days
   persistence7/          baseline: mean of the last 7 observed days

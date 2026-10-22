@@ -38,6 +38,17 @@ all up to o - 1) are forecast by the model; the district forecast is
 from weather up to o - 1. Existing models: persistence as is; GAM trains with the same one-day gap; NLinear (trained
 with history ending on its origin) is shifted by one day -- exact for h1..h59, h60 repeats step 60 (noted in the run).
 
+## Scaling and levels (harness runs)
+
+- **Scaling** (`configs/eval.yaml` `run.scaling`): the district forecast is multiplied by
+  c(o) = mean T2 per customer over the last 28 days up to o - 1 / the fresh households' observed mean over those days.
+  Households with fresh history use ~10 % more than the average customer (`scripts/analysis/bottom_up_oracle.py`);
+  the unscaled forecast is scored next to it as `<model>_unscaled`.
+- **Levels** (`scores/levels.csv`, report, `figures/levels.png`, MLflow `<split>/level/<level>/{wape,mae,bias}_h<h>`):
+  national (sysWAPE, the standard) and district (T2); substation, feeder, transformer (bottom-up matched sums over the
+  observed target days of the forecast households, node-days with >= 10 households) and household (MAE per
+  household-day, WAPE) -- supplementary: no official totals exist below the district.
+
 ## How to use it
 
 ```bash
