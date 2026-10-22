@@ -83,9 +83,8 @@ def panel_rows(M, origin, spec):
     """Households eligible at `origin` (day index): the fixed panel of a fold."""
     p = spec["panel"]
     L, R = int(p["lookback_days"]), int(p["recent_days"])
-    obs = np.isfinite(M)
-    n_in = obs[:, max(0, origin - L + 1):origin + 1].sum(1)
-    n_rec = obs[:, max(0, origin - R + 1):origin + 1].sum(1)
+    n_in = np.isfinite(M[:, max(0, origin - L + 1):origin + 1]).sum(1)      # only the window: no full-matrix copy
+    n_rec = np.isfinite(M[:, max(0, origin - R + 1):origin + 1]).sum(1)
     return np.flatnonzero((n_in >= int(p["min_input_days"])) & (n_rec >= int(p["min_recent_days"])))
 
 
@@ -107,6 +106,30 @@ def groups(network, code, region, levels):
             gi = np.full(n, -1, np.int64)
             gi[ok] = g
             out[lv] = (gi, [str(int(x)) for x in u])
+    return out
+
+
+def indicator(g, K):
+    """Sparse (K, n) 0/1 matrix: row k sums the households in group k (g < 0 = in no group). Memory ~ n, not n x days."""
+    from scipy import sparse
+    m = np.flatnonzero(g >= 0)
+    return sparse.csr_matrix((np.ones(len(m)), (g[m], m)), shape=(K, len(g)))
+
+
+def column_sums(M_rows, cols, ops, chunk=64):
+    """For each level: (observed count, observed kWh sum) per node and column of `cols`, read `chunk` days at a time.
+    M_rows: (n, T) kWh with NaN = not observed; ops: {level: indicator matrix}. Returns {level: (n (K, C), S (K, C))}."""
+    cols = np.asarray(cols)
+    out = {lv: (np.zeros((I.shape[0], len(cols))), np.zeros((I.shape[0], len(cols)))) for lv, I in ops.items()}
+    for a in range(0, len(cols), chunk):
+        c = cols[a:a + chunk]
+        X = M_rows[:, c].astype(np.float64)                                 # (n, <= chunk)
+        obs = np.isfinite(X)
+        X[~obs] = 0.0
+        O = obs.astype(np.float64)
+        for lv, I in ops.items():
+            out[lv][0][:, a:a + len(c)] = I @ O
+            out[lv][1][:, a:a + len(c)] = I @ X
     return out
 
 

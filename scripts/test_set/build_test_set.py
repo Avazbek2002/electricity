@@ -64,22 +64,22 @@ def build_district(code, cfg):
         pdir = os.path.join(cfg["out"], "panel", f["name"])
         os.makedirs(pdir, exist_ok=True)
         pq.write_table(pa.table({"customer_key": pa.array(D["keys"][r].astype(str))}), os.path.join(pdir, f"{code}.parquet"))
-        Mp = M[r]
-        obs = np.isfinite(Mp)
-        X = np.where(obs, Mp, 0.0).astype(np.float64)
+        Mp = M[r]                                                  # the panel's rows (one copy, float32)
         G = ts.groups(D["network"][r], code, region, cfg["levels"])
+        ops = {lv: ts.indicator(g, len(names)) for lv, (g, names) in G.items()}
+        test = ts.column_sums(Mp, test_idx, ops)
+        last = int(origins[-1])                                    # history up to the fold's last origin
+        hops = {lv: I for lv, I in ops.items() if lv in HISTORY_LEVELS}
+        hist = ts.column_sums(Mp, np.arange(last + 1), hops, chunk=128) if hops else {}
         lv_out = {}
         for lv, (g, names) in G.items():
             K = len(names)
-            N = np.bincount(g[g >= 0], minlength=K).astype(float)
-            e = dict(names=names, N=N,
-                     n_test=ts.bincount2(g, obs[:, test_idx].astype(float), K),
-                     S_test=ts.bincount2(g, X[:, test_idx], K))
-            if lv in HISTORY_LEVELS:
-                last = int(origins[-1])                            # history up to the fold's last origin
-                e["n_hist"] = ts.bincount2(g, obs[:, :last + 1].astype(np.float32), K).astype(np.float32)
-                e["S_hist"] = ts.bincount2(g, X[:, :last + 1], K).astype(np.float32)
+            e = dict(names=names, N=np.bincount(g[g >= 0], minlength=K).astype(float),
+                     n_test=test[lv][0], S_test=test[lv][1])
+            if lv in hist:
+                e["n_hist"], e["S_hist"] = hist[lv][0].astype(np.float32), hist[lv][1].astype(np.float32)
             lv_out[lv] = e
+        del Mp
         out["folds"][f["name"]] = dict(panel=int(len(r)), levels=lv_out)
     out["T"] = T
     out["seconds"] = time.time() - t0
