@@ -83,6 +83,13 @@ def ratio(num, den):
     return float(num / den) if den else np.nan
 
 
+def result_metrics(out_dir):
+    """MLflow metrics: <split>/<column>_h<h>, e.g. validation/oracle_bias_h30, test/model_minus_oracle_h7."""
+    t = pd.read_csv(os.path.join(out_dir, "oracle_by_horizon.csv"))
+    return {f"{r['split']}/{c}_h{int(r['horizon'])}": float(r[c]) for _, r in t.iterrows()
+            for c in t.columns if c not in ("split", "horizon", "days") and pd.notna(r[c])}
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--test-set", default=os.path.join(REPO, "configs", "test_set.yaml"))
@@ -180,4 +187,4 @@ def main(argv=None):
 if __name__ == "__main__":
     sys.path.insert(0, os.path.join(REPO, "core"))
     from mlflow_utils import run_script
-    run_script(main, "electricity/analysis")
+    run_script(main, "electricity/analysis", metrics_from=result_metrics)
