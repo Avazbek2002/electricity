@@ -45,7 +45,8 @@ def restore_credentials():
 def read_district(code, roots, start, end, labels):
     """roots: [{"uri", "env_prefix", "start", "end"}] read in order, each only over its own dates.
     -> dict(keys, M (n, T) float32 kWh on kept labels, wt (3, T) t_mean/t_min/t_max, housing (n,), network (n, 3) int64
-    transformer/feeder/substation (MISSING if unknown; placeholder transformers -> -1), dates (T,))."""
+    transformer/feeder/substation (MISSING if unknown; placeholder transformers -> -1), dates (T,),
+    first / last (n,) the first and last day index with any row (any label): the customer is in the district then)."""
     import pyarrow as pa
     import pyarrow.compute as pc
     import pyarrow.dataset as pads
@@ -60,6 +61,8 @@ def read_district(code, roots, start, end, labels):
     house = np.full(cap, np.nan)
     hday = np.full(cap, -1, dtype=np.int64)
     net = np.full((cap, 3), MISSING, dtype=np.int64)
+    first = np.full(cap, T, dtype=np.int64)
+    last = np.full(cap, -1, dtype=np.int64)
     wt = np.full((3, T), np.nan)
     for rt in roots:
         fs, root = eio.open_root(rt["uri"], rt.get("env_prefix", ""))
@@ -92,8 +95,12 @@ def read_district(code, roots, start, end, labels):
                 house = np.r_[house, np.full(new_cap - cap, np.nan)]
                 hday = np.r_[hday, np.full(new_cap - cap, -1, dtype=np.int64)]
                 net = np.vstack([net, np.full((new_cap - cap, 3), MISSING, dtype=np.int64)])
+                first = np.r_[first, np.full(new_cap - cap, T, dtype=np.int64)]
+                last = np.r_[last, np.full(new_cap - cap, -1, dtype=np.int64)]
                 cap = new_cap
             day = pc.cast(pc.cast(bt.column("date"), pa.date32()), pa.int32()).to_numpy(zero_copy_only=False).astype(np.int64) - e0
+            np.minimum.at(first, c, day)
+            np.maximum.at(last, c, day)
             for i, col in enumerate(("t_mean", "t_min", "t_max")):
                 if col in cols:
                     np.fmax.at(wt[i], day, np.asarray(bt.column(col).to_numpy(zero_copy_only=False), dtype=float))
@@ -119,4 +126,4 @@ def read_district(code, roots, start, end, labels):
             M[c[ok], day[ok]] = kv.to_numpy(zero_copy_only=False)[ok].astype(np.float32)
     n = len(keys)
     return dict(keys=np.asarray(keys, dtype=object), M=M[:n], wt=wt, housing=house[:n], network=net[:n],
-                dates=pd.date_range(d0, d1, freq="D"))
+                dates=pd.date_range(d0, d1, freq="D"), first=first[:n], last=last[:n])

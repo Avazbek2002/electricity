@@ -1,8 +1,9 @@
-"""evaluate.py: fit a model on the developer zone, forecast every household from the same origins, score every level, log.
+"""evaluate.py: the standard split and evaluation of the ML guide (configs/test_set.yaml), for any model in models/.
 
-  python evaluate.py --model nlinear_x --mode validate
-  python evaluate.py --model nlinear_x --mode dev-test --coatos 03202          # quick check on one district
-  python evaluate.py --model nlinear_x --mode holdout                          # budgeted; needs a clean git tree
+  python evaluate.py --model gam --mode validate --sample        # model choice: validation (issue dates 2024), 5 districts
+  python evaluate.py --model gam --mode validate                 # validation, every district (national)
+  python evaluate.py --model gam --mode test                     # chosen variants only: validation + test (2025)
+  python evaluate.py --model gam --mode holdout                  # the vault (next data release); budgeted
 """
 import argparse
 import concurrent.futures as cf
@@ -29,16 +30,23 @@ def _date(d):
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--model", required=True, help="folder name under models/")
-    p.add_argument("--mode", required=True, choices=["validate", "dev-test", "holdout", "test"],
-                   help="test = the fixed test set (configs/test_set.yaml): 4 seasonal folds, daily origins")
+    p.add_argument("--mode", required=True, choices=["validate", "test", "holdout"],
+                   help="validate = issue dates 2024; test = 2024 + 2025 (for variants chosen on validation); "
+                        "holdout = the vault")
     p.add_argument("--test-set", default=os.path.join(REPO, "configs", "test_set.yaml"))
-    p.add_argument("--test-dir", default=None, help="built test set (default ~/work/test_set/<version>)")
+    p.add_argument("--test-dir", default=None, help="built evaluation set (default ~/work/test_set/<version>[-sample])")
+    p.add_argument("--sample", action="store_true", help="the guide's 5-district sample (sum of 5 districts)")
+    p.add_argument("--weather", choices=["none", "simulated"], default=None,
+                   help="target-day weather: none (standard) or simulated (preliminary, flagged)")
+    p.add_argument("--no-network", action="store_true", help="skip the supplementary substation / feeder sums")
+    p.add_argument("--no-substitution-test", action="store_true", help="skip the leakage substitution test")
+    p.add_argument("--allow-leak", action="store_true", help="run even if the substitution test fails (recorded)")
     p.add_argument("--config", default=os.path.join(REPO, "configs", "eval.yaml"))
     p.add_argument("--coatos", default=None, help="comma list of districts (quick runs; not allowed for holdout)")
     p.add_argument("--workers", type=int, default=None)
     p.add_argument("--out-dir", default=None)
     p.add_argument("--refit", action="store_true", help="fit again even if this commit + cutoff was fitted before")
-    p.add_argument("--allow-dirty", action="store_true", help="validate / dev-test with uncommitted changes (tagged dirty)")
+    p.add_argument("--allow-dirty", action="store_true", help="validate / test with uncommitted changes (tagged dirty)")
     p.add_argument("--register", action="store_true",
                    help="register the fitted model in the MLflow registry as electricity_household_<model> (aliases: "
                         "best_<mode>, or 'challenger' on the holdout); see harness/registry.py")
@@ -61,7 +69,7 @@ def main(argv=None):
     mcfg_path = os.path.join(model_dir, "config.yaml")
     model_config = yaml.safe_load(open(mcfg_path)) if os.path.exists(mcfg_path) else {}
     runs_csv = os.path.join(out_root, "runs.csv")
-    if args.mode == "test":
+    if args.mode in ("validate", "test"):
         from harness.test_mode import run_test
         return run_test(args, cfg, git, model_dir, model_config, tracking, scoring)
     mode = cfg["modes"][args.mode]

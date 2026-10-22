@@ -1,118 +1,62 @@
-# THE FIXED TEST SET. Every model is scored on exactly this definition by scripts/test_set/score_test.py.
+# THE STANDARD SPLIT AND EVALUATION (ML_EXPERIMENTS_GUIDE_RU.md, 2026-10-22, part 4: the mandatory rules).
+# Every model is scored on exactly this definition by scripts/test_set/score_test.py.
 # Do not edit a released version: copy it to a new `version` and rebuild (the builder records this file's hash in the
-# manifest, and the scorer refuses forecasts built from a different hash).
+# manifest; the scorer refuses targets or forecasts built from a different hash).
 #
-# Design (agreed 2026-10-22):
-#   - 180 test days = four seasonal blocks of 45 days; each block is one walk-forward fold with its own fit
-#     (training data ends before the block's first origin; roughly quarterly retraining, as the ТЗ requires).
-#   - Forecasts issued every day; every test day is scored at every horizon 1..60.
-#   - All eligible households. Fixed panel per fold = households eligible at the fold's first origin.
-#   - district: actual = N x (mean kWh of the panel households observed that day)       (coverage-adjusted)
-#     region / national: the sum of their districts' coverage-adjusted totals (a reporting outage in one district
-#     then only affects that district's estimate)
-#     -> national / region / district can be forecast bottom-up or directly (the template / history files).
-#   - substation / feeder / transformer: bottom-up only, matched score = sum of the forecasts vs sum of the actuals
-#     of the same observed panel households (outage days need no correction).
-#   - Every report adds a sensitivity line: coverage-adjusted scores on days with >= 80 % coverage only.
+#   - Issue date o; history known up to o - 1; forecasts for d = o + h, h = 1..60.
+#   - Validation = issue dates 2024 (targets d <= 2024-12-31); test = issue dates 2025 (every target); 2026 = reserve,
+#     not touched. Model choice on validation; test only for the chosen variants.
+#   - Quarterly refits on fixed dates; a model trained at R sees only pairs with target d <= R - 1.
+#   - Target T2 per district; national (and region) = sum of districts on a common panel.
+#   - B0 (level x last-year seasonal ratio) always on the same rows. Standard runs use no target-day weather.
 
-version: copy it to a new `version` and rebuild (the builder records this file's hash in the
-# manifest, and the scorer refuses forecasts built from a different hash).
-#
-# Design (agreed 2026-10-22):
-#   - 180 test days = four seasonal blocks of 45 days; each block is one walk-forward fold with its own fit
-#     (training data ends before the block's first origin; roughly quarterly retraining, as the ТЗ requires).
-#   - Forecasts issued every day; every test day is scored at every horizon 1..60.
-#   - All eligible households. Fixed panel per fold = households eligible at the fold's first origin.
-#   - Node actual on day d = N x (mean kWh of the panel households observed on d)    (coverage-adjusted total)
-#     scored when N >= min_households and observed share >= min_coverage.
-#   - Bottom-up models also get the matched score: sum of forecasts vs sum of actuals over the same observed households.
-
-version: ts-2026-10-22-v1
+version: ts-2026-10-22-v2
 
 data:
   uri: s3://phase1/electricity/_staging/household-enriched-v14-nat-b2c-20261017-8e1414/
   env_prefix: ""
-  start: "2022-01-01"            # first day any model may read (history)
-  end: "2026-06-29"              # last customer-day of v1.4
-  labels: [complete_observed]    # HH-GAP-001-A1: only observed days are actuals and inputs
+  start: "2022-01-01"
+  end: "2026-06-29"
 
-# Eligibility at a fold's first origin (same rule as the harness / whole_pipeline_v8):
-# >= min_input_days observed of the last lookback_days, and >= min_recent_days of the last recent_days.
-panel:
-  lookback_days: 90
-  min_input_days: 60
-  recent_days: 30
-  min_recent_days: 20
+# District target T2 (guide part 2):  T2(d) = n_rows x (kwh_obs + kwh_est) / (n_obs + n_est)
+target:
+  name: T2
+  min_known_client_days: 100     # a day is not used if obs + est client-days < 100, ...
+  exclude_right_edge: true       # ... if the district has open intervals at the end of history (is_right_edge), or no data
+  min_coverage: 0.5              # (n_obs + n_est) / n_rows below this: flagged (not a training target, not evaluated)
+  flag_columns: [crisis_context, data_interruption]   # Jan-Feb 2023, Aug 2024: flagged
+  experimental: T3               # T3 adds long-gap allocations; reported separately, never mixed with T2
 
-folds:
-  - name: summer
-    test_start: "2025-07-01"
-    test_end: "2025-08-14"
-    cutoff: "2025-03-03"         # last training origin; training targets end <= cutoff + 60 = first origin
-    train_val: ["2024-09-01", "2025-03-03"]
-    first_origin: "2025-05-02"   # test_start - 60: its h=60 forecast is test_start
-    last_origin: "2025-08-13"    # test_end - 1: its h=1 forecast is test_end
-  - name: autumn
-    test_start: "2025-10-01"
-    test_end: "2025-11-14"
-    cutoff: "2025-06-03"
-    train_val: ["2024-12-02", "2025-06-03"]
-    first_origin: "2025-08-02"
-    last_origin: "2025-11-13"
-  - name: winter
-    test_start: "2025-12-20"
-    test_end: "2026-02-02"
-    cutoff: "2025-08-22"
-    train_val: ["2025-02-20", "2025-08-22"]
-    first_origin: "2025-10-21"
-    last_origin: "2026-02-01"
-  - name: spring
-    test_start: "2026-03-01"
-    test_end: "2026-04-14"
-    cutoff: "2025-11-01"
-    train_val: ["2025-05-02", "2025-11-01"]
-    first_origin: "2025-12-31"
-    last_origin: "2026-04-13"
+history_gap_days: 1              # on issue date o the data are known up to o - 1
 
-origin_step_days: 1
+splits:
+  validation: {issue_start: "2024-01-01", issue_end: "2024-12-31", target_end: "2024-12-31"}
+  test:       {issue_start: "2025-01-01", issue_end: "2025-12-31"}
+  # reserve: issue dates 2026 -- not used
+
+# A model fitted at R forecasts the issue dates [R, next R); it may use only targets d <= R - 1.
+refits: ["2024-01-01", "2024-04-01", "2024-07-01", "2024-10-01",
+         "2025-01-01", "2025-04-01", "2025-07-01", "2025-10-01"]
+
 horizons: 60
+control_horizons: [1, 7, 14, 30, 60]
 
-# Levels: horizons stored, the score, and the rule for a scored node-day (always: N >= min_households panel
-# households and >= min_households of them observed that day).
-levels:
-  national:    {horizons: all, score: coverage_adjusted, build_from: district}   # scored if every district qualifies
-  region:      {horizons: all, score: coverage_adjusted, build_from: district}
-  district:    {horizons: all, score: coverage_adjusted, min_coverage: 0.5}
-  substation:  {horizons: [1, 7, 14, 30, 60], score: matched}
-  feeder:      {horizons: [1, 7, 14, 30, 60], score: matched}
-  transformer: {horizons: [1, 7, 14, 30, 60], score: matched, optional: true}
+national:
+  min_district_share: 0.98       # a national (or region) (o, h) row needs >= 98 % of the districts present and clean
+
+reference_model: B0              # level x last-year ratio; computed by the scorer on the same rows
+weather: none                    # standard: no target-day weather (weather up to o - 1 and past climatology only)
+
+# The guide's sample for experiments (sum of 5 districts; noisier than national: a win there calls for a national run)
+sample_districts: ["03203", "10240", "22202", "26266", "33220"]
 
 scoring:
-  min_households: 10             # disclosure rule and minimum for a reliable total
-  sensitivity_min_coverage: 0.8  # extra report line: coverage-adjusted levels on high-coverage days only
-  control_horizons: [1, 7, 14, 30, 60]
-  primary_level: national        # the ТЗ's system-level sysMAPE
-# ТЗ 4.2.4: sysMAPE = sum_d |P_d - A_d| / sum_d A_d over all test days; rejection if any is exceeded
+  # ТЗ 4.2.4: sysMAPE_h = sum_d |P(d) - A(d)| / sum_d A(d); rejection if any is exceeded (checked on test, national)
   spec_thresholds: {1: 0.08, 7: 0.11, 14: 0.15, 30: 0.18, 60: 0.20}
-  bias_audit_ratio: 1.5          # ТЗ bias audit: a group's sysMAPE may be at most 1.5 x the overall value
+  bias_audit_ratio: 1.5          # ТЗ: regions (and season / day-type groups) at most 1.5 x the national value
+  min_households_network: 10     # supplementary network levels (bottom-up harness runs): observed households per node-day
 
-# Public holidays in the test blocks (bias audit day types). CHECK against the official decrees for 2025-2026;
-# the Islamic holidays move with the moon and extra days off are announced each year.
-holidays:
-  "2025-10-01": Teachers' Day
-  "2026-01-01": New Year
-  "2026-01-02": New Year (day off)
-  "2026-03-08": International Women's Day
-  "2026-03-20": Ramazon hayit (Eid al-Fitr), date to confirm
-  "2026-03-21": Navruz
-  "2026-03-22": Navruz (day off)
-  "2026-03-23": Navruz (day off)
-
-# Known limitations (repeated in every score report)
 notes:
-  - Network mapping is last-known and applied retrospectively (data guide); feeder / substation totals assume today's network.
-  - "Substation / feeder / transformer: bottom-up only (matched score), households with a complete network path only (~86%); district and above cover all."
-  - "Reporting outages: on some days a large share of meters do not report; region / national are summed from districts to limit the effect, and the 80 %-coverage sensitivity line shows how much these days matter."
-  - Blocks 2-4 overlap the harness dev-test window already looked at during development; this is the fixed internal
-    benchmark, not the customer-approved acceptance sample.
-  - Tariff-group slices of the bias audit are not available (households are one tariff group in this dataset).
+  - "Standard split and target from the ML experiments guide (2026-10-22, parts 2 and 4)."
+  - "Supplementary substation / feeder scores (bottom-up harness runs only) are not part of the standard and use the last-known network mapping."
+  - "The 2026 reserve is never scored here."

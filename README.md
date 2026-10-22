@@ -7,7 +7,8 @@ personal hidden-test harness that scores every model the same way.
 
 ```
 evaluate.py            one command: fit a model, forecast every household from the same origins, score, log
-configs/eval.yaml      data zones, modes (validate / dev-test / holdout), headline metric, budget, MLflow
+configs/test_set.yaml  the ML guide's standard split and evaluation (validate / test)
+configs/eval.yaml      data zones, the holdout (vault) mode, budget, MLflow
 harness/               the evaluation harness
   contract.py            the Model interface (fit / load / predict) and the Panel predict receives
   data.py                reads one district (developer zone + vault) into a customer x day matrix
@@ -15,8 +16,8 @@ harness/               the evaluation harness
   scoring.py             system WAPE per level, household MAE, headline
   tracking.py            git guard, vault look budget, MLflow + local CSVs
   registry.py            model registry: pyfunc wrapper, versions + aliases, list / promote
-  testset.py             the fixed test set: definition checks, panels, node sums, scoring, report
-  test_mode.py           evaluate.py --mode test (per-fold fits, daily origins, forecast CSVs)
+  testset.py             the standard evaluation: T2 target, B0, calendar, common panel, scoring, report
+  test_mode.py           evaluate.py --mode validate / test (refits, issue dates, district forecasts, substitution test)
   cli.py                 the evaluate.py command line
 models/<name>/         one folder per model: model.py (class Model), config.yaml, NOTES.md
   nlinear_x/             NLinear with weather inputs (trains through core/household_nlinear.py)
@@ -33,50 +34,35 @@ scripts/analysis/      EDA and checks (hierarchy, feeders, autocorrelation, ...)
 scripts/transformer/   transformer-level experiments
 scripts/mlflow_check.py  end-to-end check of an MLflow server
 scripts/test_set/      build_test_set.py (once), score_test.py (the common scorer)
-docs/TEST_SET.md       the fixed test set: design, scores, how to submit
+docs/TEST_SET.md       the standard split and evaluation: rules, how to run and submit
 tests/                 harness and tracking tests (a probe model checks what predict can see)
 ```
 
 ## The evaluation harness
 
-```bash
-source ~/work/ec_env.sh
-python evaluate.py --model nlinear_x --mode validate        # tuning and model choice: unlimited
-python evaluate.py --model nlinear_x --mode dev-test        # sanity check on Nov 2025 - Apr 2026 (already seen)
-python evaluate.py --model nlinear_x --mode holdout --register   # the honest score: clean git tree, budgeted
-python evaluate.py --model persistence30 --mode dev-test --coatos 03202 --allow-dirty   # quick check, one district
-```
+Every model is scored on the ML guide's standard split ([docs/TEST_SET.md](docs/TEST_SET.md), `configs/test_set.yaml`):
+history up to o - 1, validation = issue dates 2024, test = issue dates 2025, quarterly refits (targets <= R - 1),
+district target T2 summed to the national total, B0 on the same rows, no target-day weather, substitution test.
 
-| Mode | Training cutoff | Origins (every household, same dates) | Looks |
-|---|---|---|---|
-| `validate` | 2025-01-31 | 2025-04-01 .. 2025-06-30, every 14 days | unlimited |
-| `dev-test` | 2025-09-01 | 2025-10-31 .. 2026-04-30, every 14 days | unlimited, logged |
-| `holdout` | 2026-04-30 | the vault (next data release), every 7 days | 1 per commit, 2 per month |
-| `test` | four seasonal folds | the **fixed test set** (180 days, daily origins): see [docs/TEST_SET.md](docs/TEST_SET.md) | logged |
+```bash
+source ~/work/ec_env.sh                                            # S3 + MLflow settings
+python scripts/test_set/build_test_set.py --sample --workers 5     # once: district targets (also without --sample)
+python evaluate.py --model gam --mode validate --sample            # experiments: the guide's 5 districts
+python evaluate.py --model gam --mode validate --workers 16        # national
+python evaluate.py --model gam --mode test --workers 16            # chosen variants only: validation + test
+python evaluate.py --model gam --mode holdout                      # the vault (next data release); budgeted
+python scripts/test_set/score_test.py --template ~/work/my_fc --sample   # other models: rows to fill, then --forecasts
+```
 
 What a run does:
-1. **Guard**: records the git commit; holdout refuses uncommitted changes and checks the look budget (`runs.csv`).
-2. **Fit** (main process) on the developer zone up to the cutoff + 60 days; cached per model, commit and cutoff.
-3. **Predict** (worker per district): for each origin, the households passing the input rules get a `Panel` with
-   history up to the origin and the forecast issued that day. S3 keys are removed from the worker before the model runs.
-4. **Score**: forecasts and actuals summed per transformer, feeder, substation, district and the country (system WAPE),
-   household MAE; a 30-day persistence reference is scored on the same households and days.
-5. **Log**: run folder (`summary.csv`, `by_size.csv`, `mae.csv`, `nodes.csv`, `run.json`), `runs.csv`,
-   `leaderboard.csv`, and MLflow.
-
-Headline metric (fixed in `configs/eval.yaml`): feeder system WAPE, pooled, mean of 7 and 30 days.
-
-### The fixed test set
-
-All models are compared on one frozen test set ([docs/TEST_SET.md](docs/TEST_SET.md), `configs/test_set.yaml`): four
-45-day seasonal blocks (summer, autumn, winter, spring; one fit each), daily origins, a fixed household panel per
-fold, coverage-adjusted node actuals, and one scorer (`scripts/test_set/score_test.py`) that also checks the ТЗ
-thresholds and runs the bias audit.
-```bash
-python scripts/test_set/build_test_set.py --workers 16          # once per test-set version
-python evaluate.py --model gam --mode test --workers 16           # harness models
-python scripts/test_set/score_test.py --template ~/work/my_fc     # other models: rows to fill, then --forecasts
-```
+1. **Guard**: records the git commit; refuses uncommitted changes unless `--allow-dirty` (holdout: never).
+2. **Fit** once per refit date (cached per model, commit and refit): `spec.data_end = R - 1`.
+3. **Substitution test** on one district: inputs after T randomised; forecasts issued up to T + 1 must not change.
+4. **Predict** (worker per district): for every issue date, the households with fresh history get a `Panel` with
+   data up to o - 1; the district forecast = customers on o - 1 x their mean forecast. S3 keys are removed first.
+5. **Score** with the common scorer: national and district sysMAPE / bias, B0 on the same days, day counts, the ТЗ
+   thresholds, bias audit; supplementary substation / feeder sums.
+6. **Log**: run folder (`forecasts/`, `scores/`), `runs.csv`, `test_leaderboard.csv`, MLflow.
 
 ### Adding a model
 

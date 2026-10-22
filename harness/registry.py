@@ -4,8 +4,9 @@ One registered model per model folder:  electricity_household_<model>   (e.g. el
 Each version = the fitted model as a loadable MLflow pyfunc, tagged with the evaluation that produced it.
 
 Aliases (set automatically when a version is registered):
-    best_validate / best_dev_test   the version with the lowest headline among versions scored on the same mode,
-                                    cutoff, origins and data version (a version on other dates does not compete)
+    best_validate / best_test       the version with the lowest headline (mean national sysMAPE over h 1, 7, 14, 30,
+                                    60) among national runs on the same evaluation set and data version
+    best_validate_sample / ...      the same among runs on the guide's 5-district sample
     challenger                      the latest version scored on the holdout (the vault)
     champion                        set only by `promote`; the version you would deploy
 
@@ -163,14 +164,15 @@ def register_eval(tr, model, model_uri, fit_run_id, eval_run_id, tags, metrics, 
     if v is None:
         return None
     mode = tags.get("mode", "")
-    if tags.get("districts", "all") != "all":
+    sample = tags.get("scope") == "sample"                # the guide's 5-district sample competes on its own alias
+    if tags.get("districts", "all") != "all" and not sample:
         print(f"[registry] {name} v{v}: quick run on districts {tags['districts']}: registered, no alias moved")
     elif mode == "holdout":
         tr.set_alias(name, "challenger", v)
         print(f"[registry] {name} v{v} -> alias 'challenger' (promote with: python -m harness.registry promote "
               f"--model {model} --version {v})")
     else:
-        alias = _alias_mode(mode)
+        alias = _alias_mode(mode) + ("_sample" if sample else "")
         cur, _ = tr.version_by_alias(name, alias)
         move, why = True, "first version on this mode"
         if cur is not None:

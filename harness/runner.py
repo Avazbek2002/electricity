@@ -1,4 +1,5 @@
-"""One district in a worker process: build as-of panels per origin, run the model, add forecasts and actuals per node."""
+"""One district in a worker process (holdout mode): as-of panels per issue date, run the model, add forecasts and
+actuals per node. History ends at origin - 1 (ML guide part 4); validate / test use harness/test_mode.py."""
 import importlib.util
 import os
 import sys
@@ -68,7 +69,7 @@ def district_worker(code, cfg):
     M, wt, dates = D["M"], D["wt"], D["dates"]
     T = M.shape[1]
     origins = np.asarray(cfg["origins"], dtype=np.int64)           # day indices from cfg["start"]
-    origins = origins[(origins >= L - 1) & (origins + H <= T - 1)]
+    origins = origins[(origins >= L) & (origins + H <= T - 1)]
     hz = np.asarray(cfg["horizons"]) - 1
     nO = len(cfg["origins"])
     oi_of = {int(o): i for i, o in enumerate(cfg["origins"])}
@@ -92,12 +93,12 @@ def district_worker(code, cfg):
     W = int(cfg["history_days"])
     blk = int(cfg["block"])
     for o in origins:
-        n_in = cnt[:, o + 1] - cnt[:, o - L + 1]
-        n_rec = cnt[:, o + 1] - cnt[:, o - wp.RECENT_WINDOW + 1]
+        n_in = cnt[:, o] - cnt[:, o - L]                            # data known up to o - 1
+        n_rec = cnt[:, o] - cnt[:, o - wp.RECENT_WINDOW]
         elig = np.flatnonzero((n_in >= wp.MIN_INPUT_DAYS) & (n_rec >= wp.MIN_RECENT_DAYS))
         if not len(elig):
             continue
-        lo = max(0, o - W + 1)
+        lo = max(0, o - W)
         gi = issue_index(clim, dates[o])
         g1 = np.full_like(grid, np.nan)
         g1[:, gi] = grid[:, gi]                                     # only the forecast issued on this origin
@@ -107,8 +108,8 @@ def district_worker(code, cfg):
         oi = oi_of[int(o)]
         for a in range(0, len(elig), blk):
             r = elig[a:a + blk]
-            panel = Panel(coato=str(code), origin=dates[o], keys=D["keys"][r], kwh=M[r, lo:o + 1].copy(),
-                          dates=dates[lo:o + 1], weather=wt[:, lo:o + 1].copy(), housing=D["housing"][r].copy(),
+            panel = Panel(coato=str(code), origin=dates[o], keys=D["keys"][r], kwh=M[r, lo:o].copy(),
+                          dates=dates[lo:o], weather=wt[:, lo:o].copy(), housing=D["housing"][r].copy(),
                           network=D["network"][r].copy(),
                           pipeline=dict(clim=clim, fc_grid=g1, fc_grid_mm=gm, seed=int(cfg["seed"])))
             P = np.asarray(model.predict(panel), dtype=np.float64)

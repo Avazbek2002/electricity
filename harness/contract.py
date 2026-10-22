@@ -4,10 +4,12 @@ The harness calls, in this order:
     model = Model(config)                     config = models/<name>/config.yaml as a dict
     model.fit(spec, artifacts_dir)            once per evaluation, in the main process (may run its own workers)
     model.load(artifacts_dir)                 once per worker process
-    model.predict(panel) -> (n, 60) kWh       once per district x origin x block of households, in workers
+    model.predict(panel) -> (n, 60) kWh       once per district x issue date x block of households, in workers
+                                              forecasts for origin + 1 .. origin + 60; history ends at origin - 1
 
-A model sees the data only through `spec` (fit: data up to the cutoff) and `panel` (predict: one origin, history up to
-the origin). Inside predict the S3 keys have been removed from the environment, so it cannot read anything else.
+A model sees the data only through `spec` (fit: targets up to data_end = refit date - 1) and `panel` (predict: one issue
+date `origin`; data known up to origin - 1, as in the ML guide part 4). Inside predict the S3 keys have been removed
+from the environment, so it cannot read anything else.
 """
 from dataclasses import dataclass, field
 
@@ -32,15 +34,16 @@ class TrainSpec:
 
 @dataclass
 class Panel:
-    """One district, one origin, a block of households that pass the input rules at that origin.
+    """One district, one issue date `origin`, a block of households with fresh history at that date.
 
-    kwh        (n, W) float32, observed daily kWh (NaN = missing), the last column is the origin day
-    dates      (W,) the calendar days of the columns
-    weather    (3, W) district t_mean, t_min, t_max, observed, up to the origin
+    kwh        (n, W) float32, observed daily kWh (NaN = missing); the last column is origin - 1 (history gap 1 day)
+    dates      (W,) the calendar days of the columns (dates[-1] == origin - 1 day)
+    weather    (3, W) district t_mean, t_min, t_max, observed, up to origin - 1
     housing    (n,) housing_type_id (float, NaN unknown)
     network    (n, 3) transformer_id, feeder_id, substation_id (int64, negative = unknown)
-    pipeline   objects for whole_pipeline_v8-based models: clim (climate normals), fc_grid / fc_grid_mm (the 10-day
-               forecast issued on this origin only), wp settings. Other models can ignore it.
+    pipeline   objects for whole_pipeline_v8-based models: clim (built from weather up to origin - 1), fc_grid /
+               fc_grid_mm (the forecast issued on origin; all NaN in the standard no-weather run), weather_mode.
+    The forecast returned is for origin + 1 .. origin + 60 (column h - 1 = day origin + h).
     """
     coato: str
     origin: pd.Timestamp
@@ -55,6 +58,11 @@ class Panel:
     @property
     def n(self):
         return len(self.keys)
+
+    @property
+    def last_day(self):
+        """The last day of history (origin - 1 day)."""
+        return self.dates[-1]
 
 
 class BaseModel:

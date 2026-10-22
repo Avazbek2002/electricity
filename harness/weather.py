@@ -34,3 +34,26 @@ def district_weather(code, wt, dates, seed, wp):
 def issue_index(clim, day):
     """Index of calendar day `day` in the forecast grid's issue-day axis."""
     return int((np.datetime64(pd.Timestamp(day).date(), "D") - np.datetime64(clim.start, "D")).astype(int))
+
+
+def climate_asof(code, wt, dates, end, wp, pad=None):
+    """Climate object from the observed weather of days < end (index): on issue date o use end = o, i.e. data up to
+    o - 1 only. Its normals use past years only, and the days from `end` on are present but empty (NaN) up to
+    end + pad, so lookups of the issue and target days work and find no observation (ML guide part 5.3)."""
+    from household_nlinear import _quiet
+    pad = wp.HORIZON + 2 if pad is None else pad
+    have = np.isfinite(wt[:, :end]).any(axis=0)
+    idx = np.flatnonzero(have)
+    fut = pd.date_range(dates[end - 1] + pd.Timedelta(days=1), periods=pad, freq="D")
+    nan = np.full(len(fut), np.nan)
+    wdf = pd.DataFrame({"coato_id": str(code), "d": np.r_[dates[idx].values, fut.values],
+                        "t": np.r_[wt[0, idx], nan], "tmin": np.r_[wt[1, idx], nan], "tmax": np.r_[wt[2, idx], nan]})
+    wdf["d"] = pd.to_datetime(wdf["d"])
+    with _quiet():
+        return wp.build_climate(wdf)
+
+
+def no_forecast(n_days, K):
+    """The forecast grid of a run without target-day weather: no forecast issued (models fall back to normals)."""
+    g = np.full((1, n_days, K), np.nan)
+    return g, dict(min=g.copy(), max=g.copy())

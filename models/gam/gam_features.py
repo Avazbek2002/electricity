@@ -62,8 +62,9 @@ def household_block(kwh, wp):
     return out
 
 
-def origin_weather(coato, origin, clim, grid, wp):
-    """-> (temperature path for target days 1..60, mean observed temperature of the last 30 days)."""
+def origin_weather(coato, origin, clim, grid, wp, gap=1):
+    """-> (temperature path for target days origin + 1..60, mean observed temperature of the 30 days before the gap:
+    on issue date o the weather is known up to o - gap)."""
     L, H = wp.LOOKBACK, wp.HORIZON
     pdf = pd.DataFrame({"coato_code": [str(coato)], "origin_date": [pd.Timestamp(origin)]})
     t_obs, t_nrm, _ = wp.lookup_weather(pdf, clim, "loyo")
@@ -76,7 +77,8 @@ def origin_weather(coato, origin, clim, grid, wp):
         anom = float(np.mean(t_fc[-3:] - nrm[K - 3:K]))
         h = np.arange(K + 1, H + 1)
         path[K:] = nrm[K:] + anom * np.exp(-(h - K) / 5.0)
-    past30 = float(np.nanmean(t_obs[0, L - 30:L])) if np.isfinite(t_obs[0, L - 30:L]).any() else np.nan
+    w = t_obs[0, L - 30 - gap:L - gap]
+    past30 = float(np.nanmean(w)) if np.isfinite(w).any() else np.nan
     return path, past30
 
 
@@ -132,17 +134,17 @@ def district_rows(code, cfg):
     hz = np.asarray(KNOTS)
     parts = []
     step = int(cfg["origin_step"])
-    first = L - 1 + zlib.crc32(str(code).encode()) % step                 # origins staggered across districts
+    first = L + zlib.crc32(str(code).encode()) % step                     # origins staggered across districts
     for o in range(first, min(cut, T - 1 - H) + 1, step):
         if _excluded(o, dates, wp):
             continue
-        n_in = cnt[:, o + 1] - cnt[:, o - L + 1]
-        n_rec = cnt[:, o + 1] - cnt[:, o - wp.RECENT_WINDOW + 1]
+        n_in = cnt[:, o] - cnt[:, o - L]                                      # history ends at o - 1 (issue date o)
+        n_rec = cnt[:, o] - cnt[:, o - wp.RECENT_WINDOW]
         r = np.flatnonzero((n_in >= wp.MIN_INPUT_DAYS) & (n_rec >= wp.MIN_RECENT_DAYS))
         if not len(r):
             continue
         lo = max(0, o - W + 1)
-        hh = household_block(Mk[r, lo:o + 1], wp)
+        hh = household_block(Mk[r, lo:o], wp)
         ok = np.isfinite(hh["level"]) & (hh["level"] > cfg["min_level"])
         if not ok.any():
             continue

@@ -1,7 +1,8 @@
 """Harness checks on a synthetic enriched dataset.
 
-  EVAL_TEST_CONFIG=/path/to/eval_synthetic.yaml python -m pytest tests/ -q
-(eval_synthetic.yaml = configs/eval.yaml with data.dev.uri pointing at a local synthetic copy; skipped without it.)
+  EVAL_TEST_CONFIG=eval_synthetic.yaml TEST_SET_SPEC=test_set_synthetic.yaml TEST_SET_DIR=<built dir> \
+      python -m pytest tests/ -q
+(the synthetic files point the data uri at a local synthetic copy; the probe test is skipped without them.)
 """
 import os
 import subprocess
@@ -10,17 +11,20 @@ import sys
 import pytest
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-CFG = os.getenv("EVAL_TEST_CONFIG")
+CFG, SPEC, TDIR = os.getenv("EVAL_TEST_CONFIG"), os.getenv("TEST_SET_SPEC"), os.getenv("TEST_SET_DIR")
 
 
-@pytest.mark.skipif(not CFG, reason="set EVAL_TEST_CONFIG to a config pointing at synthetic data")
-def test_probe_sees_only_the_past():
-    env = {**os.environ, "AWS_ACCESS_KEY_ID": "dummy", "AWS_SECRET_ACCESS_KEY": "dummy"}
+@pytest.mark.skipif(not (CFG and SPEC and TDIR), reason="set EVAL_TEST_CONFIG, TEST_SET_SPEC, TEST_SET_DIR (synthetic)")
+def test_probe_sees_only_the_past_and_the_substitution_test_passes(tmp_path):
+    """The probe asserts inside predict: history ends on o - 1, no S3 keys, at most one forecast issue day, no weather
+    of the issue date or later in the climate object. The run must also pass the substitution test."""
+    env = {**os.environ, "AWS_ACCESS_KEY_ID": "dummy", "AWS_SECRET_ACCESS_KEY": "dummy", "MLFLOW_DISABLE": "1"}
     r = subprocess.run([sys.executable, os.path.join(REPO, "evaluate.py"), "--model", os.path.join(REPO, "tests", "probe_model"),
-                        "--mode", "dev-test", "--config", CFG, "--allow-dirty", "--no-mlflow", "--workers", "1"],
+                        "--mode", "test", "--config", CFG, "--test-set", SPEC, "--test-dir", TDIR, "--allow-dirty",
+                        "--no-mlflow", "--workers", "1", "--no-network", "--out-dir", str(tmp_path)],
                        capture_output=True, text=True, env=env, cwd=REPO)
     assert r.returncode == 0, r.stdout[-2000:] + r.stderr[-2000:]
-    assert "headline" in r.stdout
+    assert "[leakage] PASSED" in r.stdout and "headline" in r.stdout
 
 
 def test_contract_imports():

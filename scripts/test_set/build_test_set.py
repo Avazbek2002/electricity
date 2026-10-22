@@ -1,19 +1,20 @@
 #!/usr/bin/env python
 """
-Build the fixed test set once (configs/test_set.yaml -> ~/work/test_set/<version>/): the panel of every fold, the
-coverage-adjusted actuals of every node and test day, and the node history for direct (node-level) models.
+Build the standard evaluation set once (configs/test_set.yaml v2 -> ~/work/test_set/<version>/): the district target
+series T2 / T3 with the guide's day flags, the district -> region map, and the standing calendar.
 
-    python scripts/test_set/build_test_set.py --workers 16
-    python scripts/test_set/build_test_set.py --workers 16 --with-transformer     # also the transformer level
+    python scripts/test_set/build_test_set.py --workers 16                  # all districts (national runs)
+    python scripts/test_set/build_test_set.py --sample --workers 5          # the guide's 5-district sample only
 
-Run it once per test-set version; the harness and the scorer check the manifest's hash of configs/test_set.yaml.
-The panel files hold customer keys: they stay in ~/work (never uploaded). Actuals and history hold node totals of
->= min_households panel households only.
+Only district-day aggregates are written (counts and kWh sums of thousands of customers); no customer keys.
+The harness and the scorer check the manifest's hash of configs/test_set.yaml.
 """
 import argparse
 import concurrent.futures as cf
 import json
+import multiprocessing as mp
 import os
+import subprocess
 import sys
 import time
 
@@ -23,74 +24,78 @@ import pandas as pd
 REPO = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 sys.path.insert(0, REPO)
 from harness import testset as ts  # noqa: E402
-from harness.data import read_district  # noqa: E402
 import enriched_io as eio  # noqa: E402  (harness puts core/ on the path)
 
-HISTORY_LEVELS = ("district",)          # region / national history is summed from it; network levels: bottom-up only
+LABEL_OBS, LABEL_EST = "complete_observed", "complete_with_estimated"
+WANT = ["date", "label_state", "kwh", "kwh_nano", "is_long_gap_allocated", "kwh_long_gap_allocated", "is_right_edge",
+        "crisis_context", "data_interruption", "region_code"]
 
 
-def district_region(code, uri, env_prefix=""):
-    fs, root = eio.open_root(uri, env_prefix)
-    try:
-        dset = eio.district_daily(fs, root, code)
-        if "region_code" not in dset.schema.names:
-            return "unknown"
-        for fr in dset.get_fragments():
-            col = fr.to_table(columns=["region_code"]).column(0).drop_null()
-            if len(col):
-                return str(col[0].as_py()).strip()
-    except (FileNotFoundError, OSError):
-        pass
-    return "unknown"
-
-
-def build_district(code, cfg):
-    t0 = time.time()
-    spec = cfg["spec"]
-    d = spec["data"]
-    D = read_district(code, [dict(uri=d["uri"], env_prefix=d.get("env_prefix", ""), start=d["start"], end=d["end"])],
-                      d["start"], d["end"], d["labels"])
-    region = district_region(code, d["uri"], d.get("env_prefix", ""))
-    out = dict(code=str(code), region=region, customers=int(len(D["keys"])), folds={}, seconds=0.0)
-    print(f"[build] {code}: read {len(D['keys']):,} households x {D['M'].shape[1]} days | {ts.memory_line()}", flush=True)
-    if not len(D["keys"]):
-        return out
-    M = D["M"]
-    T = M.shape[1]
+def district_counts(code, cfg):
+    """One district -> daily counts and kWh sums by day state (guide part 2), over the whole data window."""
     import pyarrow as pa
-    import pyarrow.parquet as pq
-    for f in spec["folds"]:
-        test_idx, origins = ts.fold_days(spec, f)
-        r = ts.panel_rows(M, int(origins[0]), spec)
-        pdir = os.path.join(cfg["out"], "panel", f["name"])
-        os.makedirs(pdir, exist_ok=True)
-        pq.write_table(pa.table({"customer_key": pa.array(D["keys"][r].astype(str))}), os.path.join(pdir, f"{code}.parquet"))
-        Mp = M[r]                                                  # the panel's rows (one copy, float32)
-        G = ts.groups(D["network"][r], code, region, cfg["levels"])
-        ops = {lv: ts.indicator(g, len(names)) for lv, (g, names) in G.items()}
-        test = ts.column_sums(Mp, test_idx, ops)
-        last = int(origins[-1])                                    # history up to the fold's last origin
-        hops = {lv: I for lv, I in ops.items() if lv in HISTORY_LEVELS}
-        hist = ts.column_sums(Mp, np.arange(last + 1), hops, chunk=128) if hops else {}
-        lv_out = {}
-        for lv, (g, names) in G.items():
-            K = len(names)
-            e = dict(names=names, N=np.bincount(g[g >= 0], minlength=K).astype(float),
-                     n_test=test[lv][0], S_test=test[lv][1])
-            if lv in hist:
-                e["n_hist"], e["S_hist"] = hist[lv][0].astype(np.float32), hist[lv][1].astype(np.float32)
-            lv_out[lv] = e
-        del Mp
-        out["folds"][f["name"]] = dict(panel=int(len(r)), levels=lv_out)
-    out["T"] = T
-    out["seconds"] = time.time() - t0
-    out["peak_bytes"] = ts.peak_rss_bytes()
-    return out
+    import pyarrow.compute as pc
+    import pyarrow.dataset as pads
+    t0 = time.time()
+    d = cfg["data"]
+    fs, root = eio.open_root(d["uri"], d.get("env_prefix", ""))
+    dset = eio.district_daily(fs, root, code)
+    cols = [c for c in WANT if c in dset.schema.names]
+    missing = [c for c in ("label_state", "is_long_gap_allocated", "is_right_edge", "crisis_context", "data_interruption")
+               if c not in cols]
+    d0, d1 = pd.Timestamp(d["start"]), pd.Timestamp(d["end"])
+    T = (d1 - d0).days + 1
+    e0 = int((d0 - pd.Timestamp("1970-01-01")).days)
+    acc = {k: np.zeros(T) for k in ("n_rows", "n_obs", "n_est", "n_lg", "kwh_obs", "kwh_est", "kwh_lg", "n_right",
+                                    "crisis", "interruption")}
+    region = None
+    flt = (pads.field("date") >= d0.date()) & (pads.field("date") <= d1.date())
+    for b in dset.scanner(columns=cols, filter=flt, batch_size=262_144, use_threads=True).to_batches():
+        if not b.num_rows:
+            continue
+        day = pc.cast(pc.cast(b.column("date"), pa.date32()), pa.int32()).to_numpy(zero_copy_only=False).astype(np.int64) - e0
+        ok = (day >= 0) & (day < T)
+        day = day[ok]
 
-
-def write_csv(df, path):
-    df.to_csv(path, index=False, float_format="%.10g")
-    return path
+        def col(name, kind=float):
+            if name not in cols:
+                return np.zeros(len(day), dtype=kind)
+            a = b.column(name)
+            if kind is bool:
+                a = pc.fill_null(a, False)
+            v = a.to_numpy(zero_copy_only=False)
+            v = v[ok]
+            return v.astype(bool) if kind is bool else np.nan_to_num(np.asarray(v, dtype=float))
+        if "kwh_nano" in cols:
+            kwh = col("kwh_nano") / 1e9
+        else:
+            kwh = col("kwh")
+        lab = b.column("label_state").to_numpy(zero_copy_only=False)[ok] if "label_state" in cols else np.array([], object)
+        obs, est = (lab == LABEL_OBS), (lab == LABEL_EST)
+        lg = col("is_long_gap_allocated", bool)
+        bc = lambda w: np.bincount(day, weights=w, minlength=T)          # noqa: E731
+        acc["n_rows"] += bc(np.ones(len(day)))
+        acc["n_obs"] += bc(obs.astype(float))
+        acc["n_est"] += bc(est.astype(float))
+        acc["n_lg"] += bc(lg.astype(float))
+        acc["kwh_obs"] += bc(np.where(obs, kwh, 0.0))
+        acc["kwh_est"] += bc(np.where(est, kwh, 0.0))
+        acc["kwh_lg"] += bc(np.where(lg, col("kwh_long_gap_allocated"), 0.0))
+        acc["n_right"] += bc(col("is_right_edge", bool).astype(float))
+        acc["crisis"] = np.maximum(acc["crisis"], bc(col("crisis_context", bool).astype(float)))
+        acc["interruption"] = np.maximum(acc["interruption"], bc(col("data_interruption", bool).astype(float)))
+        if region is None and "region_code" in cols:
+            r = b.column("region_code").drop_null()
+            if len(r):
+                region = str(r[0].as_py()).strip()
+    df = pd.DataFrame(acc)
+    df.insert(0, "date", pd.date_range(d0, d1, freq="D"))
+    df.insert(1, "node", str(code))
+    for k, n in (("kwh_obs", "n_obs"), ("kwh_est", "n_est"), ("kwh_lg", "n_lg")):
+        df.loc[df[n] == 0, k] = np.nan                              # "nothing of that kind" (guide: kWh NaN)
+    df.loc[df["n_rows"] == 0, "n_rows"] = np.nan
+    return dict(code=str(code), region=region or "unknown", counts=df, missing=missing, seconds=time.time() - t0,
+                peak_bytes=ts.peak_rss_bytes())
 
 
 def main():
@@ -98,137 +103,78 @@ def main():
     p.add_argument("--spec", default=os.path.join(REPO, "configs", "test_set.yaml"))
     p.add_argument("--out-root", default="~/work/test_set")
     p.add_argument("--workers", type=int, default=8)
-    p.add_argument("--coatos", default=None, help="comma list: build on a few districts only (a trial, not the test set)")
-    p.add_argument("--with-transformer", action="store_true")
-    p.add_argument("--overwrite", action="store_true")
+    p.add_argument("--sample", action="store_true", help="the guide's 5-district sample only (spec sample_districts)")
+    p.add_argument("--coatos", default=None, help="comma list: a trial on a few districts (not the test set)")
+    p.add_argument("--overwrite", action="store_true", help="trials only: replace an existing build")
     a = p.parse_args()
     spec = ts.load_spec(a.spec)
-    out = os.path.join(os.path.expanduser(a.out_root), spec["version"] + ("-trial" if a.coatos else ""))
-    if os.path.exists(os.path.join(out, "manifest.json")) and not a.overwrite:
-        raise SystemExit(f"{out} is already built (manifest.json); a released test set is not rebuilt. "
-                         f"Use a new version in the spec, or --overwrite for a trial")
-    os.makedirs(out, exist_ok=True)
-    levels = ts.levels_of(spec, include_optional=a.with_transformer)
+    want = spec["sample_districts"] if a.sample else (a.coatos.split(",") if a.coatos else None)
+    suffix = "-sample" if a.sample else ("-trial" if a.coatos else "")
+    out = os.path.join(os.path.expanduser(a.out_root), spec["version"] + suffix)
+    if os.path.exists(os.path.join(out, "manifest.json")):
+        if not a.overwrite or not suffix:
+            raise SystemExit(f"{out} is already built; a released set is not rebuilt (new version in the spec, or "
+                             f"--overwrite for a sample / trial)")
+    os.makedirs(os.path.join(out, "targets"), exist_ok=True)
     d = spec["data"]
     fs, root = eio.open_root(d["uri"], d.get("env_prefix", ""))
-    codes = eio.finished_districts(fs, root, set(a.coatos.split(",")) if a.coatos else None)
-    print(f"[build] {spec['version']} ({spec['_sha256'][:12]}) | {len(codes)} districts | levels {levels} | -> {out}")
-    node_levels = [lv for lv in levels if not ts.built_from(spec, lv)]
-    cfg = dict(spec=spec, out=out, levels=node_levels)
-    acc = {f["name"]: {lv: ts.NodeSum() for lv in node_levels} for f in spec["folds"]}
-    dist_rows, t0 = [], time.time()
+    codes = eio.finished_districts(fs, root, set(want) if want else None)
+    if want and set(want) - set(codes):
+        raise SystemExit(f"districts not in the data (or unfinished): {sorted(set(want) - set(codes))}")
+    print(f"[build] {spec['version']} ({spec['_sha256'][:12]}) | {len(codes)} districts -> {out}")
     print(f"[memory] at start: {ts.memory_line()}", flush=True)
-    import multiprocessing as mp
+    parts, rows, warned, t0 = [], [], set(), time.time()
     with cf.ProcessPoolExecutor(a.workers, mp_context=mp.get_context("spawn")) as ex:
-        futs = {ex.submit(build_district, c, cfg): c for c in codes}
+        futs = {ex.submit(district_counts, c, dict(data=d)): c for c in codes}
         for k, fu in enumerate(cf.as_completed(futs), 1):
             r = fu.result()
-            row = dict(district=r["code"], region=r["region"], customers=r["customers"])
-            for fname, fr in r["folds"].items():
-                row[f"panel_{fname}"] = fr["panel"]
-                for lv, e in fr["levels"].items():
-                    acc[fname][lv].add(e["names"], {k2: v for k2, v in e.items() if k2 != "names"})
-            dist_rows.append(row)
-            print(f"[build] {r['code']}: {r['customers']:,} households, {r.get('seconds', 0):.0f} s | "
-                  f"{ts.memory_line(r.get('peak_bytes'))}", flush=True)
+            for m in r["missing"]:
+                if m not in warned:
+                    print(f"[build] WARNING: column {m} not in the data: treated as absent/false")
+                    warned.add(m)
+            tgt = ts.target_series(r["counts"], spec)
+            parts.append(tgt)
+            rows.append(dict(district=r["code"], region=r["region"], max_customers=int(np.nanmax(r["counts"]["n_rows"])),
+                             days_clean=int((~tgt["flag"]).sum())))
             if k % 10 == 0 or k == len(codes) or k <= 3:
                 el = time.time() - t0
-                print(f"[build] {k}/{len(codes)} districts, {el / 60:.1f} min, about {el / k * (len(codes) - k) / 60:.1f} min left",
-                      flush=True)
-    dist = pd.DataFrame(dist_rows).sort_values("district")
-    write_csv(dist, os.path.join(out, "districts.csv"))
+                print(f"[build] {k}/{len(codes)} districts, {el / 60:.1f} min, about {el / k * (len(codes) - k) / 60:.1f} "
+                      f"min left | {ts.memory_line(r['peak_bytes'])}", flush=True)
+    T = pd.concat(parts, ignore_index=True).sort_values(["node", "date"])
+    cols = ["date", "node", "n_rows", "n_obs", "n_est", "n_lg", "kwh_obs", "kwh_est", "kwh_lg", "n_right", "crisis",
+            "interruption", "coverage", "T2", "T3", "flag", "flag_reason", "artefact"]
+    T[cols].to_csv(os.path.join(out, "targets", "district.csv.gz"), index=False, float_format="%.10g")
+    dist = pd.DataFrame(rows).sort_values("district")
+    dist.to_csv(os.path.join(out, "districts.csv"), index=False)
+    ts.standing_calendar(pd.date_range(d["start"], pd.Timestamp(d["end"]) + pd.Timedelta(days=int(spec["horizons"]))))\
+        .to_csv(os.path.join(out, "calendar.csv"), index=False)
 
-    # ---- actuals per level (all folds in one file) and history per fold
-    mn = int(spec["scoring"]["min_households"])
-    start = pd.Timestamp(d["start"])
-    up_levels = [lv for lv in levels if ts.built_from(spec, lv)]
-    group_of = {"national": {c: "national" for c in dist["district"]},
-                "region": dict(zip(dist["district"], dist["region"].astype(str)))}
-
-    def frame(f, ns, n_key, S_key, dates):
-        """All nodes of one fold-level as rows (no size filter yet)."""
-        names = np.asarray(ns.names())
-        N, n, S = ns.stack("N"), ns.stack(n_key), ns.stack(S_key)
-        K, Dn = len(names), len(dates)
-        with np.errstate(invalid="ignore", divide="ignore"):
-            actual = np.where(n > 0, N[:, None] * S / n, np.nan)
-        return pd.DataFrame({"fold": f["name"], "node": np.repeat(names, Dn), "date": np.tile(dates.date, K),
-                             "households": np.repeat(N, Dn).astype(int), "observed": n.ravel().astype(int),
-                             "actual_observed_sum": S.ravel().astype(float), "actual": actual.ravel()})
-
-    def finish(df, lv):
-        with np.errstate(invalid="ignore", divide="ignore"):
-            df["coverage"] = df["observed"] / df["households"].where(df["households"] > 0)
-        sc = ts.scored_mask(spec, lv, df["households"], df["observed"]) & np.isfinite(df["actual"])
-        if "min_district_observed" in df:                          # region / national: every district must qualify
-            sc &= df["min_district_observed"] >= mn
-        df["scored"] = sc
-        cols = ["fold", "node", "date", "households", "observed", "coverage", "actual_observed_sum", "actual", "scored"]
-        cols += [c for c in ("districts", "min_district_observed") if c in df]
-        return df.loc[df["households"] >= mn, cols]
-
-    actual_all, hist_all, counts = {}, {}, {}
-    os.makedirs(os.path.join(out, "actuals"), exist_ok=True)
-    for lv in [x for x in levels if x not in up_levels]:
-        parts = []
-        for f in spec["folds"]:
-            ns = acc[f["name"]][lv]
-            if not ns.names():
-                continue
-            test_idx, origins = ts.fold_days(spec, f)
-            parts.append(frame(f, ns, "n_test", "S_test", start + pd.to_timedelta(test_idx, unit="D")))
-            if lv in HISTORY_LEVELS:
-                hn = ns.stack("n_hist")
-                hist_all.setdefault(lv, {})[f["name"]] = frame(
-                    f, ns, "n_hist", "S_hist", start + pd.to_timedelta(np.arange(hn.shape[1]), unit="D"))
-        actual_all[lv] = pd.concat(parts, ignore_index=True)
-    for lv in up_levels:                                           # region / national = sums of district totals
-        src = actual_all[ts.built_from(spec, lv)]
-        actual_all[lv] = ts.roll_up(src, group_of[lv], ["fold", "date"], "actual",
-                                    ("households", "observed", "actual_observed_sum"))
-        for fname, h in hist_all.get(ts.built_from(spec, lv), {}).items():
-            hist_all.setdefault(lv, {})[fname] = ts.roll_up(h, group_of[lv], ["fold", "date"], "actual",
-                                                            ("households", "observed", "actual_observed_sum"))
-    for lv in levels:
-        a_lv = finish(actual_all[lv], lv)
-        write_csv(a_lv, os.path.join(out, "actuals", ts.level_file(lv)))
-        for f in spec["folds"]:
-            af = a_lv[a_lv["fold"] == f["name"]]
-            counts.setdefault(lv, {})[f["name"]] = dict(nodes=int(af["node"].nunique()), node_days=int(len(af)),
-                                                         scored_node_days=int(af["scored"].sum()))
-        for fname, h in hist_all.get(lv, {}).items():
-            hdir = os.path.join(out, "history", fname)
-            os.makedirs(hdir, exist_ok=True)
-            hh = finish(h.copy(), lv).drop(columns=["fold", "scored"])
-            write_csv(hh, os.path.join(hdir, ts.level_file(lv, compressed=True)))
-
-    # ---- manifest
+    # ---- summary per split: share of clean district-days among the targets of the split
+    summ = {}
+    for split, s in spec["splits"].items():
+        a0 = pd.Timestamp(s["issue_start"]) + pd.Timedelta(days=1)
+        a1 = min(pd.Timestamp(s.get("target_end") or "2100-01-01"),
+                 pd.Timestamp(s["issue_end"]) + pd.Timedelta(days=int(spec["horizons"])))
+        q = T[(T["date"] >= a0) & (T["date"] <= a1)]
+        summ[split] = dict(target_days=int(q["date"].nunique()), district_days=int(len(q)),
+                           clean_share=float((~q["flag"]).mean()),
+                           flag_reasons={k: int(v) for k, v in q.loc[q["flag"], "flag_reason"].value_counts().head(8).items()})
     files = {}
     for base, _, fl in os.walk(out):
         for fn in fl:
             if fn.endswith((".csv", ".csv.gz")):
                 pth = os.path.join(base, fn)
                 files[os.path.relpath(pth, out)] = ts.sha256_file(pth)
-    import subprocess
     commit = subprocess.run(["git", "-C", REPO, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
     man = dict(test_set_version=spec["version"], test_set_sha256=spec["_sha256"], data_uri=d["uri"],
                data_version=os.path.basename(d["uri"].rstrip("/")), built_at=time.strftime("%Y-%m-%d %H:%M:%S"),
-               git_commit=commit, trial=bool(a.coatos), districts=len(codes), levels=levels,
-               panel_households={f["name"]: int(dist[f"panel_{f['name']}"].sum()) for f in spec["folds"]},
-               counts=counts, files=files)
+               git_commit=commit, scope="sample" if a.sample else ("trial" if a.coatos else "national"),
+               districts=len(codes), missing_columns=sorted(warned), splits=summ, files=files)
     json.dump(man, open(os.path.join(out, "manifest.json"), "w"), indent=2)
     print(f"\n[build] done in {(time.time() - t0) / 60:.1f} min -> {out}")
-    print("  panel households per fold: " + ", ".join(f"{k} {v:,}" for k, v in man["panel_households"].items()))
-    for lv, c in counts.items():
-        share = sum(v["scored_node_days"] for v in c.values()) / max(1, sum(v["node_days"] for v in c.values()))
-        rule = (f"every district >= {mn} observed" if ts.built_from(spec, lv) else
-                f">= {mn} observed" + (f", coverage >= {spec['levels'][lv]['min_coverage']:.0%}"
-                                       if spec["levels"][lv].get("min_coverage") else ""))
-        print(f"  {lv:12s} nodes >= {mn} households: " + ", ".join(f"{k} {v['nodes']}" for k, v in c.items())
-              + f" | node-days scored ({rule}): {share:.1%}")
-        if lv == spec["scoring"]["primary_level"] and share < 1:
-            print(f"  WARNING: {lv} loses {1 - share:.1%} of its test days; the ТЗ scores every day -- check "
-                  f"actuals/{ts.level_file(lv)} (min_district_observed) before releasing this test set")
+    for split, s in summ.items():
+        print(f"  {split:10s}: {s['target_days']} target days, {s['district_days']:,} district-days, "
+              f"{s['clean_share']:.1%} clean | flagged: {s['flag_reasons']}")
 
 
 if __name__ == "__main__":

@@ -60,7 +60,9 @@ class Model(BaseModel):
         n = panel.n
         kin = panel.kwh[:, -L:].astype("float64")
         ht = pd.Series(panel.housing).astype("Int64").astype(str).replace("<NA>", np.nan).to_numpy()
-        pdf = pd.DataFrame({"meter_id": panel.keys.astype(str), "consumer_id": np.nan, "origin_date": panel.origin,
+        last = pd.Timestamp(panel.dates[-1])                    # history end = origin - 1 (the harness contract)
+        gap = int((pd.Timestamp(panel.origin) - last).days)
+        pdf = pd.DataFrame({"meter_id": panel.keys.astype(str), "consumer_id": np.nan, "origin_date": last,
                             "coato_code": panel.coato, "housing_type_id": ht})
         pp = panel.pipeline
         with hn._quiet():
@@ -80,4 +82,9 @@ class Model(BaseModel):
         P = hn.to_kwh(self.variant, X[:, self.cols] @ self.W, np.where(ok, lev, 0.0), base)
         fallback = np.nan_to_num(lev)[:, None]
         P = np.where(ok[:, None], P, base if self.variant.startswith("thermal") else fallback)
-        return np.where(np.isfinite(P), P, fallback)
+        P = np.where(np.isfinite(P), P, fallback)
+        if gap > 0:                       # step k of the model = day last + k; the harness wants origin + h = last + gap + h
+            self.notes = [f"nlinear_x: trained with history ending on its origin; forecasts shifted by the {gap}-day "
+                          f"history gap (h1..h{HORIZON - gap} exact, the last {gap} horizon(s) repeat step {HORIZON})"]
+            P = np.concatenate([P[:, gap:], np.repeat(P[:, -1:], gap, axis=1)], axis=1)
+        return P
