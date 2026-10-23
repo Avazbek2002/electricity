@@ -76,8 +76,20 @@ def _settings(wp, spec, cfg):
     for k, v in s.items():
         if not hasattr(wp, k):
             raise SystemExit(f"whole_pipeline_v8 has no setting {k}")
-        setattr(wp, k, v)
+        _set(wp, k, v)
     return s
+
+
+def _set(wp, k, v):
+    """setattr, except a dict setting (CATBOOST_PARAMS, XGB_PARAMS) is updated key by key: the config names only the
+    keys it changes. Merged into v8's defaults each time, so a key dropped from the config goes back to the default."""
+    if isinstance(v, dict):
+        base = _V8_DICT_DEFAULTS.setdefault(k, dict(getattr(wp, k)))
+        v = {**base, **v}
+    setattr(wp, k, v)
+
+
+_V8_DICT_DEFAULTS = {}
 
 
 def _curves(fold):
@@ -147,7 +159,7 @@ class Predictor:
         self.wp, self.variant = wp, variant
         self.info = json.load(open(os.path.join(artifacts_dir, "boost.json")))
         for k, v in (self.info.get("wp_overrides") or {}).items():      # the fit's pipeline settings (config `wp`)
-            setattr(wp, k, v)
+            _set(wp, k, v)
         if variant == "catboost":
             from catboost import CatBoostRegressor
             self.model = CatBoostRegressor()
