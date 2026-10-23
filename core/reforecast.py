@@ -49,7 +49,7 @@ DEFAULTS = dict(
     min_windows=20000,                       # refuse to train on fewer windows with a forecast
 )
 POINT_COLS = ("coato_code", "coato_id", "coato", "point_id", "point", "location_id", "station_id", "station", "id")
-TIME_COLS = ("valid_time", "valid_datetime", "valid_date", "time", "datetime", "timestamp")
+TIME_COLS = ("valid_time_utc", "valid_time", "valid_datetime", "valid_date", "time", "datetime", "timestamp")
 STEP_COLS = ("step", "step_hours", "lead_hours", "lead_time", "leadtime", "fhour", "forecast_hour", "lead")
 VAR_COL, VALUE_COL = "variable", "value"
 T_NAMES = ("2t", "t2m", "t2", "tas", "temperature_2m", "2m_temperature", "air_temperature_2m", "temperature")
