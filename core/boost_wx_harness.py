@@ -29,7 +29,7 @@ import pandas as pd
 import boost_harness as bh
 import reforecast as rf
 
-SHARED_KEYS = bh.SHARED_KEYS + ("wx",)
+SHARED_KEYS = bh.SHARED_KEYS + ("wx", "gpu")
 
 
 def config_hash(cfg):
@@ -57,6 +57,21 @@ def v8_forecast_settings(w):
     return dict(FORECAST_DAYS=K, FC_BLOCKS=blocks, FC_TAIL_DAYS=min(3, K - 1))
 
 
+def gpu_settings(cfg, wp_cfg):
+    """`gpu: [catboost, xgboost]` in the model config -> v8 parameter overrides that train those boosters on GPU 0.
+    Training only: prediction stays on CPU (the scoring workers would otherwise share one GPU)."""
+    g = [str(x).lower() for x in (cfg.get("gpu") or [])]
+    bad = set(g) - {"catboost", "xgboost"}
+    if bad:
+        raise SystemExit(f"gpu: only catboost and/or xgboost, not {sorted(bad)}")
+    out = {}
+    if "catboost" in g:
+        out["CATBOOST_PARAMS"] = {**(wp_cfg.get("CATBOOST_PARAMS") or {}), "task_type": "GPU", "devices": "0"}
+    if "xgboost" in g:
+        out["XGB_PARAMS"] = {**(wp_cfg.get("XGB_PARAMS") or {}), "device": "cuda"}
+    return out
+
+
 def train(spec, artifacts_dir, cfg):
     """One v8 fit with real forecasts for refit spec (shared by catboost_wx / xgboost_wx)."""
     sdir = shared_dir(artifacts_dir, cfg)
@@ -66,7 +81,10 @@ def train(spec, artifacts_dir, cfg):
         w = rf.wx_config(cfg)
         wp = bh._wp()
         fs_set = v8_forecast_settings(w)
-        c = dict(cfg, forecast="archive", wp={**(cfg.get("wp") or {}), **fs_set})
+        wp_cfg = cfg.get("wp") or {}
+        c = dict(cfg, forecast="archive", wp={**wp_cfg, **fs_set, **gpu_settings(cfg, wp_cfg)})
+        if cfg.get("gpu"):
+            print(f"[boost-wx] training on GPU: {cfg.get('gpu')} (non-deterministic; prediction on CPU)")
         s = bh._settings(wp, spec, c)
         t0 = time.time()
         arch = rf.load_archive(w)                                         # harness convention: issue o, lead k = o + k
@@ -144,7 +162,16 @@ def train(spec, artifacts_dir, cfg):
 
 class Predictor(bh.Predictor):
     """boost_harness.Predictor for a model trained on real forecasts: the panel must carry the forecast issued on o
-    from the same source (evaluate.py --weather <wx.source>)."""
+    from the same source (evaluate.py --weather <wx.source>). A model trained on GPU predicts on CPU: the harness
+    scores districts in parallel worker processes, which must not compete for one GPU."""
+
+    def __init__(self, artifacts_dir, variant):
+        super().__init__(artifacts_dir, variant)
+        if variant == "xgboost":
+            try:
+                self.model.set_params(device="cpu")
+            except Exception:                                            # noqa: BLE001  older xgboost: no device param
+                pass
 
     def predict(self, panel, horizon):
         wp, L = self.wp, self.wp.LOOKBACK
