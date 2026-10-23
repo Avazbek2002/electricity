@@ -110,6 +110,7 @@ Top GAM terms (refit Jan 1): log_level 0.119, temp 0.105, r7_30 0.081, temp_dev 
 The curves below are from the runs of 2026-10-23 (commit `9a8a9aa`). Each run also writes the full 1..60 horizon chart, drawn by [`plots.metrics_by_horizon`][plots].
 
 ```mermaid
+%%{init: {"themeVariables": {"xyChart": {"plotColorPalette": "#2563eb, #16a34a, #7c3aed, #ca8a04, #f97316, #9ca3af"}}}}%%
 xychart-beta
     title "National sysMAPE by horizon, % (validation 2025-H1, 5 districts)"
     x-axis [h1, h7, h14, h30, h60]
@@ -122,7 +123,7 @@ xychart-beta
     line "ТЗ limit" [8, 11, 15, 18, 20]
 ```
 
-Lines in order: XGBoost, CatBoost, NLinear_x, GAM, B0, ТЗ limit.
+**Blue** = XGBoost, **green** = CatBoost, **purple** = NLinear_x, **gold** = GAM, **orange** = B0, **grey** = ТЗ limit.
 
 | Best at | h1 | h7 | h14 | h30 | h60 |
 |---|---|---|---|---|---|
@@ -178,6 +179,7 @@ Averaging gives the best headline so far, 9.51–9.52 %. The three weightings di
 | B0 | 10.66 | 13.35 | 13.86 | 12.52 | **12.69** | 12.61 |
 
 ```mermaid
+%%{init: {"themeVariables": {"xyChart": {"plotColorPalette": "#2563eb"}}}}%%
 xychart-beta horizontal
     title "National bias at h60, % (averaging with NLinear cuts the under-forecast from 6.1% to 2.6%)"
     x-axis ["CatBoost", "XGBoost", "NLinear_x", "Equal 3-model", "0.45/0.10/0.45", "XGB + NL 50/50", "B0"]
