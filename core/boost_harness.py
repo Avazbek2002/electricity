@@ -168,6 +168,8 @@ class Predictor:
             import xgboost as xgb
             self.model = xgb.XGBRegressor()
             self.model.load_model(os.path.join(artifacts_dir, "xgboost_model.json"))
+            self.model.set_params(device="cpu")                          # trained on GPU or not: predict on CPU
+                                                                         # (many scoring workers, one GPU)
         else:
             raise ValueError(f"unknown variant {variant!r}")
         self.segment_of = {}                                             # customer key -> segment (this process only)

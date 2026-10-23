@@ -14,8 +14,11 @@ wp:                             # other whole_pipeline_v8 settings (part of the 
   MAX_FINAL_ITERATIONS: 1500    # v8: 150, which cut the 2025-01 refit from 2,996 best trees to 150 (log_s25_catboost)
   CATBOOST_PARAMS:              # merged into v8's dict: only the keys listed change
     learning_rate: 0.15         # v8: 0.05 never early-stopped within 3,000 trees on ~400k windows (6.5 s a tree)
+    task_type: GPU              # 842k windows: ~12 s a tree on CPU; check first with scripts/gpu_check.py
+    devices: "0"
   XGB_PARAMS:
     learning_rate: 0.15
+    device: cuda                # XGBoost >= 3: multi_output_tree on CUDA; prediction is forced to CPU
 wx:                             # the real forecasts (core/reforecast.py; ML guide part 2). Same block in catboost_wx and
                                 # xgboost_wx: they share one fit per refit
   source: aifs                  # aifs | fcn3 | ens (mean of the two); run evaluate.py with --weather <source>
