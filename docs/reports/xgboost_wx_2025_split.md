@@ -7,6 +7,8 @@ This is the same v8 XGBoost as in the no-weather report: the same thermal baseli
 
 **Result:** on the 24 validation issue dates that have a forecast, national sysMAPE is 5.98 / 7.21 / 8.12 % at h1 / h7 / h14. That is 4.2–4.5 points better than B0 and well inside the ТЗ limits. h30 is the weak spot: 12.64 %, 1 point worse than B0.
 
+**Same-dates check (§4.4, rerun at `2e187b1`):** against the same XGBoost without weather, the forecast cuts error by 2.1 points at h1 and 3.1 points at h7. From h14 on there is no weather effect; the h30–h60 differences come from unstable early stopping.
+
 Code links point to commit `32ce082`. Later commits changed the tree caps (`e9c5504`), so line numbers on later commits may differ.
 
 | National sysMAPE (bias) | h1 | h7 | h14 | h30 | h60 |
@@ -256,29 +258,52 @@ xychart-beta
 
 The c(o) scaling pushes the bias down by about 2 points at every horizon, so the unscaled forecast is better everywhere. The growing under-forecast after h14 is the same pattern the no-weather boosters show.
 
-### 4.4 Against the no-weather XGBoost (proxy)
+### 4.4 Same dates, with and without the forecast
 
-The no-weather run was scored on all 181 dates and this run on 24, so B0 differs between them. The fair comparison is to divide each model's error by B0 on its own dates. The exact head-to-head is the `--issue-dates reforecast` run, which is still pending.
+This rerun used the same commit (`2e187b1`), the same 24 issue dates and the same B0 rows for both models. The no-weather model was scored with `--issue-dates reforecast`. **The forecast cuts national error by 2.1 points at h1 and 3.1 points at h7. From h14 on it adds nothing.**
 
 ```mermaid
-%%{init: {"themeVariables": {"xyChart": {"plotColorPalette": "#2563eb, #f97316"}}}}%%
-%%{init: {"themeVariables": {"xyChart": {"plotColorPalette": "#2563eb, #7c3aed"}}}}%%
+%%{init: {"themeVariables": {"xyChart": {"plotColorPalette": "#2563eb, #9ca3af, #f97316"}}}}%%
 xychart-beta
-    title "Model sysMAPE ÷ B0 sysMAPE on its own dates (below 1 = better than B0)"
+    title "Same 24 dates: national sysMAPE, % (commit 2e187b1, 5 districts)"
     x-axis [h1, h7, h14, h30, h60]
-    y-axis "ratio" 0.5 --> 1.15
-    line "xgboost_wx (24 dates)" [0.57, 0.62, 0.66, 1.08, 0.90]
-    line "xgboost, no weather (181 dates)" [0.66, 0.63, 0.63, 0.79, 1.10]
+    y-axis "sysMAPE %" 0 --> 16
+    bar [5.59, 7.79, 9.27, 12.24, 14.03]
+    bar [7.70, 10.87, 9.25, 12.08, 12.69]
+    line [10.52, 11.57, 12.33, 11.68, 12.90]
 ```
 
-**Blue** = xgboost_wx (24 dates), **purple** = no-weather xgboost (181 dates).
+**Blue bars** = xgboost_wx (AIFS), **grey bars** = xgboost without weather, **orange line** = B0 on the same days.
 
-| ÷ B0 | h1 | h7 | h14 | h30 | h60 |
+| National sysMAPE (bias), % | h1 | h7 | h14 | h30 | h60 | Mean |
+|---|---|---|---|---|---|---|
+| **xgboost_wx (AIFS)** | **5.59** (−1.6) | **7.79** (−3.0) | 9.27 (+0.7) | 12.24 (−5.4) | 14.03 (−5.7) | **9.78** |
+| xgboost, no weather | 7.70 (−2.0) | 10.87 (−5.3) | 9.25 (−0.2) | 12.08 (−6.2) | **12.69** (−6.4) | 10.52 |
+| **Weather effect, points** | **−2.11** | **−3.08** | +0.02 | +0.16 | +1.34 | −0.74 |
+| Weather effect, unscaled | −2.55 | −2.56 | +0.01 | +0.42 | +1.93 | |
+| B0, same days | 10.52 | 11.57 | 12.33 | **11.68** | 12.90 | 11.80 |
+
+| District-level sysMAPE, % | h1 | h7 | h14 | h30 | h60 |
 |---|---|---|---|---|---|
-| xgboost_wx | **0.57** | **0.62** | 0.66 | 1.08 | **0.90** |
-| xgboost, no weather (150 trees) | 0.66 | 0.63 | **0.63** | **0.79** | 1.10 |
+| xgboost_wx | **8.07** | **10.66** | **12.05** | 16.24 | **18.87** |
+| xgboost, no weather | 9.32 | 13.53 | 12.42 | 16.24 | 19.34 |
+| B0 | 12.50 | 13.72 | 15.16 | 15.42 | 17.07 |
 
-On this proxy the forecast clearly helps at h1, and h60 also looks better. h7–h14 are about even and h30 is worse. With only 20 dates at h30, one bad week can explain that. The two runs also differ in tree caps (1,500 vs 150), so this is not yet a clean weather effect.
+What the comparison shows:
+- **h1–h7: a real gain of 2–3 points.** Without weather the model under-forecasts by 5.3 % at h7; with the forecast, by 3.0 %. It cannot see a cold spell coming without the forecast.
+- **h14: no gain.** AIFS days 8–14 add nothing over climate normals on these dates.
+- **h30–h60: fit noise, not weather.** By h30 only about 4 % of the forecast anomaly is left, so the forecast cannot move these horizons by 1.3 points. At district level the weather model is better or equal at every horizon, h60 included.
+
+**Why the long horizons are noisy: XGBoost early stopping.**
+
+| Refit | xgboost_wx trees | xgboost, no weather, trees | Fit set → early-stopping set |
+|---|---|---|---|
+| 2025-01-01 | 1,132 | 643 | 642k old-regime → 129k new-regime windows |
+| 2025-04-01 | 255 | 73 | 708k old + 11k new → 572k new-regime windows |
+
+Early stopping fits on almost only old whole-kWh windows and is judged on new-regime windows. The validation curve goes flat after about 100 trees, so the chosen tree count is close to arbitrary. With the same XGBoost settings, the first run (commit `32ce082`) gave 11.55 % at h60 and this rerun gave 14.03 %. The final cap (1,500 or 4,000) was never binding.
+
+Run folders: `20261023-184140_xgboost_wx_validate`, `20261023-191653_xgboost_validate` · W&B runs `2c1w2rxb`, `7jfrrqrf`.
 
 ### 4.5 District level
 
@@ -340,13 +365,16 @@ Errors cancel out quickly once households are summed: 33.5 % at household level 
 |---|---|
 | 24 scored dates (17 at h60) | Noisy: h30 / h60 can move by a point on one bad week |
 | 5-district sample, supplementary split | A national run and the standard split are needed before conclusions |
-| Commit `32ce082`: final cap 1,500 trees | XGBoost stopped at 1,129 trees, so the cap was not binding; CatBoost was capped (best 2,913) |
-| No same-dates no-weather run yet | §4.4 is a proxy; the weather effect is not yet isolated |
-| c(o) scaling hurts here | Check the unscaled forecast on the no-weather runs too before dropping c(o) |
+| XGBoost early stopping is unstable | 73–1,132 trees between refits and runs; h30–h60 differ by up to 2.5 points between two runs with the same settings (§4.4) |
+| Final tree cap (1,500 or 4,000) | Never binding for XGBoost; not the cause of the run-to-run differences |
+| c(o) scaling not settled | Unscaled was better everywhere in the first run, mixed in the rerun |
 | `housing_type_id` snapshot, `loyo` normals | Same possible leakage as the no-weather models |
 
-- [ ] `xgboost --issue-dates reforecast` on the same 24 dates (the clean weather effect)
-- [ ] Retrain on `e9c5504` (GPU, up to 4,000 trees) and rerun both
+- [x] `xgboost --issue-dates reforecast` on the same 24 dates (the clean weather effect, §4.4)
+- [x] Retrain on `e9c5504` (GPU, up to 4,000 trees) and rerun both
+- [ ] Stability fix: XGBoost learning rate 0.05, a minimum tree count, a 42-day early-stopping slice
+- [ ] Per-horizon blend: `xgboost_wx` for h1–h7, B0 or the ensemble beyond
+- [ ] Old-data ablation: `OLD_WEIGHT` 0.5 and `INCLUDE_OLD: non_winter`
 - [ ] `catboost_wx` (shares the fit) and an ensemble with NLinear_x on the same dates
 - [ ] Try `--weather fcn3` and `ens`
 - [ ] Standard split (2024 validation, 48 forecast dates) and a national run
