@@ -1,0 +1,27 @@
+# OLD-DATA ABLATION (abl_old_w025): the `xgboost` config (baseline: INCLUDE_OLD all, OLD_WEIGHT 1.0, OLD_REGIME_FLAG on)
+# with ONE change. OLD_WEIGHT 0.25: old-regime windows count a quarter in the fit (new = 1.0).
+# Run and compare: scripts/run_old_ablation.sh, scripts/ablation_table.py
+family: v8_boost
+variant: xgboost
+forecast: none                  # the standard run: no target-day weather (normals only). See xgboost_fc for the forecast run
+buckets: [0, 1, 2, 3, 4]        # customer_bucket values: each ~1 % of customers -> 5 %. null = every customer
+train_sample: 0.2               # share of the trainable windows kept (stable hash): with >= 30 target days 5 % of
+                                # customers give ~1.3M windows (~15 s per CatBoost tree on 64 cores); 0.2 keeps ~260k
+max_window_gb: 40               # refuse if kin + ktg would need more (raise on a big pod)
+workers: null                   # districts read in parallel (null: evaluate.py --workers)
+wp:                             # other whole_pipeline_v8 settings (part of the shared fit), e.g. CATBOOST_PARAMS
+  OLD_WEIGHT: 0.25             # ablation: sample weight of old-regime windows
+  SEGMENT_USE_OLD: true         # segments + priors from all history: every 2024 refit has old-regime data only (v8: false)
+  TRAIN_MIN_TARGET_DAYS: 30     # train on windows with >= 30 of 60 target days observed (v8: 54, which keeps ~1 % of the
+                                # pre-2024-08 windows: regime_audit.py); a missing target day = residual 0 (no correction)
+  OLD_REGIME_FLAG: true         # feature regime_old = issue date before 2024-08-01: old winters read 10-17 % higher for the
+                                # same customers (regime_audit.py E); 1 for 2024 issue dates, 0 from 2024-08
+  MAX_FINAL_ITERATIONS: 4000    # v8: 150; GPU runs still improved at 3,000 trees (best 2,913), ~45 ms a tree on a B200
+  CATBOOST_PARAMS:              # merged into v8's dict: only the keys listed change
+    learning_rate: 0.15         # v8: 0.05 never early-stopped within 3,000 trees on ~400k windows (6.5 s a tree)
+    iterations: 6000            # early-stopping budget (v8: 3,000; GPU best was 2,913 at 3,000)
+    task_type: GPU              # B200: ~45 ms a tree vs ~12 s on CPU (scripts/gpu_check.py); needs a GPU pod
+    devices: "0"
+  XGB_PARAMS:
+    learning_rate: 0.15
+    device: cuda                # XGBoost >= 3; prediction is forced to CPU

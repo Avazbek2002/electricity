@@ -2379,10 +2379,10 @@ def fit_and_evaluate(pdf, kin, ktg, ktg_raw, clim, fc_grid, fc_grid_mm, train_cu
     print(f"origin months  fit {om[fit].min()}..{om[fit].max()} ({om[fit].nunique()}) | val {om[val].min()}..{om[val].max()} "
           f"({om[val].nunique()}) | test {om[test].min()}..{om[test].max()} ({om[test].nunique()})" if fit.any() and val.any()
           and test.any() else "origin months: a split is empty")
-    no_val = not val.any()
+    no_val = not val.any() or (train_only and bool(fallback_iters) and not fit.any())   # no early stopping possible
     if train_only and no_val and fallback_iters and train.any():
-        print(f"[fold '{label}'] WARNING: no validation windows: early stopping skipped, final trees "
-              f"{tuple(fallback_iters)} (catboost, xgboost) from an earlier fit")
+        print(f"[fold '{label}'] WARNING: no {'validation' if not val.any() else 'fit'} windows: early stopping "
+              f"skipped, final trees {tuple(fallback_iters)} (catboost, xgboost) from an earlier fit or fixed_iters")
     elif train_only and (not fit.any() or no_val):
         raise ValueError(f"fold '{label}': empty fit / validation split (fit {fit.sum()}, val {val.sum()}); pass "
                          f"fallback_iters to train without validation")

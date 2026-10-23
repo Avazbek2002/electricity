@@ -27,7 +27,7 @@ import numpy as np
 import pandas as pd
 
 FILES = ("catboost_model.cbm", "xgboost_model.json", "boost.json")
-SHARED_KEYS = ("forecast", "buckets", "train_sample", "max_window_gb", "workers", "wp")    # what makes two fits equal
+SHARED_KEYS = ("forecast", "buckets", "train_sample", "max_window_gb", "workers", "wp", "fixed_iters")  # what makes two fits equal
 
 
 def _wp():
@@ -46,6 +46,16 @@ def shared_dir(artifacts_dir, cfg):
     refit, commit = os.path.basename(art), os.path.basename(os.path.dirname(art))
     root = os.path.dirname(os.path.dirname(os.path.dirname(art)))
     return os.path.join(root, "_boost", commit, config_hash(cfg), refit)
+
+
+def fallback_iters(sdir, cfg):
+    """Tree counts used when a refit cannot early-stop (no fit or no validation windows): the latest earlier refit's,
+    else the config's `fixed_iters: [catboost, xgboost]` (e.g. INCLUDE_OLD none on a first refit), else None."""
+    earlier = _earlier_iters(sdir)
+    if earlier:
+        return earlier
+    f = cfg.get("fixed_iters")
+    return (int(f[0]), int(f[1])) if f else None
 
 
 def _earlier_iters(sdir):
@@ -119,7 +129,7 @@ def train(spec, artifacts_dir, cfg):
         clim = wp.build_climate(daily_t)
         fold = wp.fit_and_evaluate(pdf, kin, ktg, ktg.copy(), clim, None, None, spec.cutoff, spec.val_start,
                                    label=f"refit {os.path.basename(sdir)}", val_end=spec.val_end, train_only=True,
-                                   fallback_iters=_earlier_iters(sdir))
+                                   fallback_iters=fallback_iters(sdir, cfg))
         del pdf, kin, ktg
         os.makedirs(sdir, exist_ok=True)
         fold.cb_model.save_model(os.path.join(sdir, "catboost_model.cbm"))

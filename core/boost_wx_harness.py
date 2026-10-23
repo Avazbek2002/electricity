@@ -127,7 +127,7 @@ def train(spec, artifacts_dir, cfg):
         del arch
         fold = wp.fit_and_evaluate(pdf, kin, ktg, ktg.copy(), clim, fc_grid, fc_grid_mm, spec.cutoff, spec.val_start,
                                    label=f"refit {os.path.basename(sdir)} (forecast {w['source']})", val_end=spec.val_end,
-                                   train_only=True, fallback_iters=bh._earlier_iters(sdir))
+                                   train_only=True, fallback_iters=bh.fallback_iters(sdir, cfg))
         del pdf, kin, ktg, fc_grid, fc_grid_mm
         os.makedirs(sdir, exist_ok=True)
         fold.cb_model.save_model(os.path.join(sdir, "catboost_model.cbm"))
