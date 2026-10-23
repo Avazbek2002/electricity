@@ -59,6 +59,20 @@ def no_forecast(n_days, K):
     return g, dict(min=g.copy(), max=g.copy())
 
 
+REFORECAST = ("aifs", "fcn3", "ens")             # --weather values backed by the real AIFS / FCN3 reforecasts
+
+
+def reforecast_grid(code, arch, clim, day, wp):
+    """The real forecast issued on `day` for one district (core/reforecast.py archive, harness convention: lead k =
+    day + k) as (grid, grid_mm) shaped like district_weather's, with only that issue day filled (NaN if none)."""
+    a = arch[(arch["coato_id"].astype(str) == str(code)) & (arch["issue_date"] == pd.Timestamp(day))]
+    a = a.assign(coato_id=str(code))
+    with np.errstate(all="ignore"):
+        g = wp.build_forecast_grid(a, clim)
+        gm = dict(min=wp.build_forecast_grid(a, clim, col="t_fc_min"), max=wp.build_forecast_grid(a, clim, col="t_fc_max"))
+    return g, gm
+
+
 def grid_at_last_day(panel):
     """For models whose window origin is the last history day (o - 1): the forecast issued on o, moved to issue day
     o - 1 with leads shifted by one (window lead k + 1 = forecast lead k; window lead 1 = day o has no forecast).

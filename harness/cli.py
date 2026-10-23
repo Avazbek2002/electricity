@@ -36,8 +36,12 @@ def main(argv=None):
     p.add_argument("--test-set", default=os.path.join(REPO, "configs", "test_set.yaml"))
     p.add_argument("--test-dir", default=None, help="built evaluation set (default ~/work/test_set/<version>[-sample])")
     p.add_argument("--sample", action="store_true", help="the guide's 5-district sample (sum of 5 districts)")
-    p.add_argument("--weather", choices=["none", "simulated"], default=None,
-                   help="target-day weather: none (standard) or simulated (preliminary, flagged)")
+    p.add_argument("--weather", choices=["none", "simulated", "aifs", "fcn3", "ens"], default=None,
+                   help="target-day weather: none (standard), simulated (preliminary, flagged), or the real AIFS / FCN3 "
+                        "reforecasts (aifs, fcn3, ens = their mean; scored on the issue dates that have a forecast)")
+    p.add_argument("--issue-dates", choices=["all", "reforecast"], default="all",
+                   help="reforecast: score only the issue dates with an AIFS / FCN3 forecast (always so with --weather "
+                        "aifs|fcn3|ens), so a model without weather is compared on the same dates")
     p.add_argument("--no-network", action="store_true", help="skip the supplementary substation / feeder sums")
     p.add_argument("--no-substitution-test", action="store_true", help="skip the leakage substitution test")
     p.add_argument("--allow-leak", action="store_true", help="run even if the substitution test fails (recorded)")
@@ -70,6 +74,8 @@ def main(argv=None):
     mcfg_path = os.path.join(model_dir, "config.yaml")
     model_config = yaml.safe_load(open(mcfg_path)) if os.path.exists(mcfg_path) else {}
     runs_csv = os.path.join(out_root, "runs.csv")
+    if args.mode == "holdout" and (args.weather not in (None, "none", "simulated") or args.issue_dates != "all"):
+        raise SystemExit("[holdout] the reforecast weather modes are for validate / test only")
     if args.mode in ("validate", "test"):
         from harness.test_mode import run_test
         return run_test(args, cfg, git, model_dir, model_config, tracking, scoring)

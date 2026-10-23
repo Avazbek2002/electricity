@@ -30,7 +30,7 @@ from harness import testset as ts
 from harness.contract import HORIZON, Panel, TrainSpec
 from harness.data import read_district, restore_credentials, scrub_credentials
 from harness.runner import load_model, persistence30
-from harness.weather import climate_asof, district_weather, issue_index, no_forecast
+from harness.weather import REFORECAST, climate_asof, district_weather, issue_index, no_forecast, reforecast_grid
 
 NETWORK_LEVELS = ("substation", "feeder", "transformer")
 NODE_FILES = ("substation", "feeder")          # per-node files; every level is also summarised per district and day
@@ -65,6 +65,11 @@ def test_worker(code, cfg):
     if simulated:                  # the simulated forecast archive is an outside input known on its issue date: it is
         # drawn from the unperturbed weather, so the substitution test checks the household data and observed weather
         _, grid_all, grid_mm_all = district_weather(code, D["wt"].copy(), D["dates"], cfg["seed"], wp)
+    refc = cfg["weather"] in REFORECAST
+    if refc:                       # the real AIFS / FCN3 forecasts issued on each date (an outside input, not perturbed)
+        arch = pd.read_parquet(cfg["reforecast_path"])
+        arch = arch[arch["coato_id"].astype(str) == str(code)]
+        arch["issue_date"] = pd.to_datetime(arch["issue_date"])
     if cfg.get("perturb_after") is not None:
         D = _perturb(D, ts.day_index(spec, cfg["perturb_after"]))
     M, wt, dates = D["M"], D["wt"], D["dates"]
@@ -119,6 +124,8 @@ def test_worker(code, cfg):
                     g1[:, gi] = grid_all[:, gi]
                     for kk in gm:
                         gm[kk][:, gi] = grid_mm_all[kk][:, gi]
+            elif refc:                                               # the real forecast issued on o (harness leads)
+                g1, gm = reforecast_grid(code, arch, clim, dates[o], wp)
             else:
                 g1, gm = no_forecast(int(clim.n_days), wp.FORECAST_DAYS)
             lo = max(0, last + 1 - W)
@@ -270,6 +277,7 @@ def substitution_test(wcfg, code, spec):
     R, block = wcfg["blocks"][0]
     T_day = pd.Timestamp(block[min(5, len(block) - 1)])
     sel = [o for o in block if T_day - pd.Timedelta(days=1) <= o <= T_day + pd.Timedelta(days=3)]
+    sel = sorted(set(sel) | set([o for o in block if o > T_day + pd.Timedelta(days=1)][:1]))   # sparse issue dates
     c = dict(wcfg, blocks=[(R, sel)], network_levels=())
     a = test_worker(code, dict(c, perturb_after=None))
     b = test_worker(code, dict(c, perturb_after=str(T_day.date())))
@@ -281,6 +289,35 @@ def substitution_test(wcfg, code, spec):
     detail = (f"district {code}, T = {T_day.date()}: max change of forecasts issued <= T+1: {same:.3g}; "
               f"issued >= T+2: {later:.3g}" + ("" if later > 0 else " (later forecasts did not react: check the model)"))
     return dict(passed=passed, detail=detail, district=code, T=str(T_day.date()))
+
+
+def _reforecast_blocks(blocks, weather, model_config, out_root):
+    """Keep the issue dates that have an AIFS / FCN3 forecast (guide part 2: weather and no-weather models are compared
+    on the same dates). With --weather aifs|fcn3|ens the archive is built (cached) here, in the main process, and handed
+    to the workers as a local file. -> (blocks, archive path or None)"""
+    import reforecast as rf
+    w = rf.wx_config(model_config)
+    if weather in REFORECAST:
+        if model_config.get("wx") and w["source"] != weather:
+            raise SystemExit(f"[weather] this model was trained with wx.source = {w['source']}: run --weather {w['source']}")
+        w["source"] = weather
+        arch = rf.load_archive(w)
+        dates = set(pd.to_datetime(arch["issue_date"].unique()))
+        sig = rf._cache_path(w, weather, "eval").rsplit("_", 1)[-1]
+        path = os.path.join(os.path.expanduser(w["cache_dir"]), f"eval_{weather}_{sig}")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        arch.to_parquet(path + ".tmp", index=False)
+        os.replace(path + ".tmp", path)
+    else:
+        dates, path = set(rf.issue_dates(w)), None
+    out = [(R, pd.DatetimeIndex([o for o in b if o in dates])) for R, b in blocks]
+    out = [(R, b) for R, b in out if len(b)]
+    n0, n1 = sum(len(b) for _, b in blocks), sum(len(b) for _, b in out)
+    print(f"[weather] {weather}: scoring the {n1} of {n0} issue dates that have a {w['source']} forecast "
+          f"(sets {', '.join(w['sets'])})")
+    if not out:
+        raise SystemExit("[weather] no issue date of this split has a reforecast")
+    return out, path
 
 
 # ----------------------------------------------------------------------------- the command
@@ -332,6 +369,9 @@ def _run_test(args, cfg, git, model_dir, model_config, tracking, holder):
                   "validation and looks at the test only for the chosen variants")
     blocks = ts.refit_blocks(spec, splits)
     weather = args.weather or spec.get("weather", "none")
+    reforecast_path = None
+    if weather in REFORECAST or getattr(args, "issue_dates", "all") == "reforecast":
+        blocks, reforecast_path = _reforecast_blocks(blocks, weather, model_config, out_root)
     notes = [] if weather == "none" else [f"weather = {weather}: preliminary (not the standard no-weather run)"]
     wcfg = dict(cfg.get("wandb") or {})
     if getattr(args, "no_wandb", False):
@@ -375,7 +415,7 @@ def _run_test(args, cfg, git, model_dir, model_config, tracking, holder):
         wandb_log.log_fit(wrun, i_fit, R.date(), art, time.time() - t_fit, reused)
 
     wcfg = dict(spec=spec, blocks=blocks, labels=cfg["data"]["labels"], model_name=args.model, model_dir=model_dir,
-                model_config=model_config, artifacts=arts, seed=wp.SEED, weather=weather,
+                model_config=model_config, artifacts=arts, seed=wp.SEED, weather=weather, reforecast_path=reforecast_path,
                 history_days=int(cfg["data"]["history_days"]), block=int(run_cfg["block"]),
                 network_levels=() if args.no_network else NETWORK_LEVELS,
                 scaling=run_cfg.get("scaling") or {"method": "ratio"},
