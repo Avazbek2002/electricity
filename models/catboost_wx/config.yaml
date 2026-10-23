@@ -11,9 +11,10 @@ wp:                             # other whole_pipeline_v8 settings (part of the 
                                 # pre-2024-08 windows: regime_audit.py); a missing target day = residual 0 (no correction)
   OLD_REGIME_FLAG: true         # feature regime_old = issue date before 2024-08-01: old winters read 10-17 % higher for the
                                 # same customers (regime_audit.py E); 1 for 2024 issue dates, 0 from 2024-08
-  MAX_FINAL_ITERATIONS: 1500    # v8: 150, which cut the 2025-01 refit from 2,996 best trees to 150 (log_s25_catboost)
+  MAX_FINAL_ITERATIONS: 4000    # v8: 150; GPU runs still improved at 3,000 trees (best 2,913), ~45 ms a tree on a B200
   CATBOOST_PARAMS:              # merged into v8's dict: only the keys listed change
     learning_rate: 0.15         # v8: 0.05 never early-stopped within 3,000 trees on ~400k windows (6.5 s a tree)
+    iterations: 6000            # early-stopping budget (v8: 3,000; GPU best was 2,913 at 3,000)
     task_type: GPU              # 842k windows: ~12 s a tree on CPU; check first with scripts/gpu_check.py
     devices: "0"
   XGB_PARAMS:
