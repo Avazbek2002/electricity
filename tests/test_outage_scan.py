@@ -1,4 +1,4 @@
-"""outage_scan.py on a synthetic district with planted outages (local files in the enriched layout)."""
+"""outage_scan.py on synthetic districts with planted events (local files in the enriched layout)."""
 import importlib.util
 import os
 
@@ -12,18 +12,32 @@ spec = importlib.util.spec_from_file_location("outage_scan", os.path.join(REPO, 
 osc = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(osc)
 
-CODE = "99001"
+CODE, PLACEHOLDER = "99001", "99002"
 D0, D1 = "2024-08-01", "2024-12-31"
+HOLIDAY = "2024-12-20"
 
 
-def make_district(root, seed=1):
+def _write(root, code, df):
+    base = os.path.join(root, "household_daily_enriched", f"coato={code}")
+    for per, g in df.groupby(pd.to_datetime(df["date"]).dt.strftime("%Y-%m")):
+        out = os.path.join(base, "household_daily_enriched", "data", f"period={per}")
+        os.makedirs(out, exist_ok=True)
+        pq.write_table(pa.Table.from_pandas(g, preserve_index=False), os.path.join(out, "part-0.parquet"))
+    open(os.path.join(base, "_SUCCESS"), "w").close()
+
+
+def make_district(root, seed=1, code=CODE, placeholder=False):
+    """3 substations x 3 feeders x 4 transformers x 12 households, Aug-Dec 2024, with planted events:
+    transformer 1102 -70 % on Oct 9-10, feeder 101 -65 % on Nov 8, substation 11 -60 % on Nov 28, transformer 1221
+    silent Oct 29-31, feeder 121 half its households missing and the rest -50 % on Oct 16 (partial silent),
+    transformer 1023 -50 % for 10 days from Sep 20 (level shift), and on the holiday Dec 20 one transformer per feeder
+    -45 % (clustered)."""
     rng = np.random.default_rng(seed)
     dates = pd.date_range(D0, D1)
     T = len(dates)
     weather = 1 + 0.25 * np.sin(np.arange(T) / 20) + 0.05 * rng.standard_normal(T)     # shared by everyone
-    rows = []
-    hh = 0
     paths = []
+    hh = 0
     for s in range(3):
         for f in range(3):
             for t in range(4):
@@ -33,60 +47,82 @@ def make_district(root, seed=1):
     P = pd.DataFrame(paths, columns=["c", "t", "f", "s"])
     level = rng.lognormal(np.log(6), 0.4, len(P))
     K = level[:, None] * weather[None, :] * rng.lognormal(0, 0.15, (len(P), T))
-    d = {x: dates.get_loc(pd.Timestamp(x)) for x in ("2024-10-09", "2024-10-10", "2024-11-08", "2024-11-28",
-                                                     "2024-10-29", "2024-10-30", "2024-10-31")}
-    K[(P["t"] == 1102).to_numpy(), d["2024-10-09"]:d["2024-10-10"] + 1] *= 0.3       # transformer, 2 days
-    K[(P["f"] == 101).to_numpy(), d["2024-11-08"]] *= 0.35                            # feeder, 1 day
-    K[(P["s"] == 11).to_numpy(), d["2024-11-28"]] *= 0.4                              # substation, 1 day
-    silent = (P["t"] == 1221).to_numpy()                                              # transformer silent 3 days
+    d = lambda x: dates.get_loc(pd.Timestamp(x))                                      # noqa: E731
+    K[(P["t"] == 1102).to_numpy(), d("2024-10-09"):d("2024-10-10") + 1] *= 0.3
+    K[(P["f"] == 101).to_numpy(), d("2024-11-08")] *= 0.35
+    K[(P["s"] == 11).to_numpy(), d("2024-11-28")] *= 0.4
+    K[(P["f"] == 121).to_numpy(), d("2024-10-16")] *= 0.5
+    K[(P["t"] == 1023).to_numpy(), d("2024-09-20"):d("2024-09-29") + 1] *= 0.5
+    K[(P["t"] % 10 == 0).to_numpy(), d(HOLIDAY)] *= 0.55                              # transformer 0 of every feeder
+    silent = (P["t"] == 1221).to_numpy()
+    part = ((P["f"] == 121) & (P["c"] % 2 == 0)).to_numpy()
     state = np.where(rng.random((len(P), T)) < 0.9, "complete_observed", "complete_with_estimated")
+    rows = []
     for i in range(len(P)):
         for j in range(T):
-            if silent[i] and d["2024-10-29"] <= j <= d["2024-10-31"]:
+            if silent[i] and d("2024-10-29") <= j <= d("2024-10-31"):
                 continue
-            rows.append((f"c{i:04d}", dates[j].date(), int(P.t[i]), int(P.f[i]), int(P.s[i]), False, state[i, j],
-                         float(np.round(K[i, j], 3))))
+            if part[i] and j == d("2024-10-16"):
+                continue
+            hol = dates[j] == pd.Timestamp(HOLIDAY)
+            rows.append((f"c{i:04d}", dates[j].date(), int(P.t[i]), int(P.f[i]), int(P.s[i]), bool(placeholder),
+                         state[i, j], float(np.round(K[i, j], 3)), bool(hol), "Test holiday" if hol else None,
+                         False))
     df = pd.DataFrame(rows, columns=["customer_key", "date", "transformer_id", "feeder_id", "substation_id",
-                                     "placeholder_transformer", "label_state", "kwh"])
-    base = os.path.join(root, "household_daily_enriched", f"coato={CODE}")
-    for per, g in df.groupby(pd.to_datetime(df["date"]).dt.strftime("%Y-%m")):
-        out = os.path.join(base, "household_daily_enriched", "data", f"period={per}")
-        os.makedirs(out, exist_ok=True)
-        pq.write_table(pa.Table.from_pandas(g, preserve_index=False), os.path.join(out, "part-0.parquet"))
-    open(os.path.join(base, "_SUCCESS"), "w").close()
+                                     "placeholder_transformer", "label_state", "kwh", "is_public_holiday",
+                                     "holiday_name", "is_ramadan"])
+    _write(root, code, df)
 
 
-def test_planted_outages_found_at_their_level(tmp_path):
-    make_district(str(tmp_path / "root"))
-    out = osc.main(["--out-dir", str(tmp_path / "out"), "--root", str(tmp_path / "root"), "--districts", CODE,
+def test_planted_events_found_and_classified(tmp_path):
+    root = str(tmp_path / "root")
+    make_district(root)
+    make_district(root, seed=2, code=PLACEHOLDER, placeholder=True)
+    out = osc.main(["--out-dir", str(tmp_path / "out"), "--root", root, "--districts", f"{CODE},{PLACEHOLDER}",
                     "--start", D0, "--end", D1, "--workers", "1", "--inject-transformers", "16",
                     "--inject-feeders", "8"])
-    ev = pd.read_csv(os.path.join(out, "events.csv"))
-    sup = ev[ev["type"] == "supply_dip"]
+    ev = pd.read_csv(os.path.join(out, "events.csv"), dtype={"coato_code": str})
+    assert set(ev["coato_code"]) == {CODE}                                  # the placeholder district is skipped
+    info = pd.read_csv(os.path.join(out, "districts.csv"), dtype={"coato_code": str}).set_index("coato_code")
+    assert "placeholder" in info.loc[PLACEHOLDER, "skipped"] and pd.isna(info.loc[CODE, "skipped"])
 
-    def found(level, node, start):
-        return ((sup["level"] == level) & (sup["node_id"] == node) & (sup["start"] == start)).any()
-    assert found("transformer", 1102, "2024-10-09"), sup.to_string()
-    assert sup[(sup["node_id"] == 1102)]["days"].max() == 2
-    assert found("feeder", 101, "2024-11-08"), sup.to_string()
-    assert found("substation", 11, "2024-11-28"), sup.to_string()
-    # covered children are not reported again
-    assert not ((sup["level"] == "transformer") & (sup["start"] == "2024-11-08") & (sup["feeder_id"] == 101)).any()
-    sil = ev[(ev["type"] == "silent") & (ev["node_id"] == 1221)]
-    assert len(sil) and sil["start"].iloc[0] == "2024-10-29"
-    # the planted events are almost all there is: few false events in noise
+    def get(typ, level, node, start):
+        return ev[(ev["type"] == typ) & (ev["level"] == level) & (ev["node_id"] == node) & (ev["start"] == start)]
+    t = get("supply_dip", "transformer", 1102, "2024-10-09")
+    assert len(t) and t["days"].iloc[0] == 2 and t["tier"].iloc[0] == "deep", ev.to_string()
+    assert len(get("supply_dip", "feeder", 101, "2024-11-08")), ev.to_string()
+    s = get("supply_dip", "substation", 11, "2024-11-28")                    # one substation is not a cluster
+    assert len(s) and s["tier"].iloc[0] == "deep", ev.to_string()
+    assert not ((ev["level"] == "transformer") & (ev["start"] == "2024-11-08") & (ev["feeder_id"] == 101)).any()
+    assert len(get("silent", "transformer", 1221, "2024-10-29"))
+    ps = get("partial_silent", "feeder", 121, "2024-10-16")
+    assert len(ps) and pd.isna(ps["lost_kwh_est"].iloc[0])                   # no kWh lost for missing readings
+    assert not ((ev["type"] == "supply_dip") & (ev["start"] == "2024-10-16")).any(), ev.to_string()
+    ls = ev[(ev["type"] == "level_shift") & (ev["node_id"] == 1023)]
+    assert len(ls) and ls["days"].iloc[0] >= 8, ev.to_string()
+    cl = ev[(ev["type"] == "clustered_dip") & (ev["start"] == HOLIDAY)]
+    assert len(cl) >= 5 and (cl["holiday"] == "Test holiday").all(), ev.to_string()
+    assert not ((ev["type"] == "supply_dip") & (ev["start"] == HOLIDAY)).any()
+    assert ev.loc[ev["type"].isin(["silent", "partial_silent"]), "lost_kwh_est"].isna().all()
+    sup = ev[ev["type"] == "supply_dip"]
     assert len(sup) <= 8, sup.to_string()
+    assert (ev["lost_kwh_est"].dropna() <= 2.0 * ev["lost_kwh_observed"].dropna() + 1e-6).all()
     ctl = pd.read_csv(os.path.join(out, "control.csv"))
+    assert {"tier", "type", "level"} <= set(ctl.columns)
     real = ctl[(ctl["run"] == "real") & (ctl["type"] == "supply_dip")]["events"].sum()
     shuf = ctl[(ctl["run"] != "real") & (ctl["type"] == "supply_dip")]["events"].sum()
     assert real > shuf
+    dd = pd.read_csv(os.path.join(out, "district_days.csv"))
+    assert dd.loc[dd["date"] == HOLIDAY, "clustered"].all() and not dd.loc[dd["date"] == "2024-11-28", "clustered"].any()
     inj = pd.read_csv(os.path.join(out, "injection.csv"))
     assert len(inj) >= 16
-    deep = inj[inj["depth"] == 0.6]
-    assert deep["detected_same_level"].mean() >= 0.8, inj.to_string()
+    assert inj[inj["depth"] == 0.6]["detected_same_level"].mean() >= 0.8, inj.to_string()
     nd = pd.read_parquet(os.path.join(out, "node_day.parquet"))
     assert (nd["households_observed"] >= 10).all()
-    assert os.path.exists(os.path.join(out, "figures", "top_events.png"))
+    rep = open(os.path.join(out, "outage_report.txt")).read()
+    assert "SKIPPED 99002" in rep and "usable" in rep
+    for f in ("events_by_month", "lift", "injection_recall", "top_events"):
+        assert os.path.exists(os.path.join(out, "figures", f + ".png")), f
 
 
 def test_attribution_top_down():
