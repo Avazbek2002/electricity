@@ -1,0 +1,47 @@
+family: tide
+variant: tide_daily
+# households: customer_bucket values (each ~1 % of customers); the store needs ~11 bytes a household-day on the GPU
+buckets: [0, 1, 2, 3, 4]
+workers: null                   # districts read in parallel (null: evaluate.py --workers)
+lookback: 90                    # input days (the harness's fresh rule: >= 60 observed of these 90)
+stride: 7                       # days between a household's training issue dates (random phase per household)
+min_input_days: 60              # known input days of 90 (observed; before the regime cutoff also closed intervals)
+min_recent_days: 20             # ... of them in the last 30
+min_target_days: 20             # labelled target days (observed + days of wholly-contained intervals) of 60
+coarse_inputs: old              # old: interval days are inputs only for issue dates before regime_cutoff (the harness
+                                # serves complete_observed only) | all | none
+regime_cutoff: "2024-08-01"
+interval_labels: false          # ablation: daily labels only (old windows keep only their few observed days)
+old_weight: 1.0                 # loss weight of windows issued before the cutoff
+regime_flag: false              # static feature "issued before the cutoff" (old winters read 7-17 % higher)
+val_households: 0.05            # a stable share of customers held out for early stopping (never trained on)
+exclude_ranges: [["2023-01-01", "2023-02-28"]]   # the Jan-Feb 2023 crisis: no input, no label
+model:
+  hidden: 512
+  enc_layers: 2
+  dec_layers: 2
+  decoder_dim: 16
+  temporal_hidden: 64
+  cov_proj: 4
+  cov_hidden: 64
+  dropout: 0.2
+  layernorm: true
+train:
+  batch: 4096
+  lr: 0.001
+  weight_decay: 0.0001
+  epochs: 40
+  windows_per_epoch: 2000000
+  patience: 4
+  huber_delta: 1.0              # in units of the household's mean input day
+  weight_power: 1.0             # window weight s^p: larger households count more (the node sums are energy sums)
+  val_windows: 200000
+  seed: 42
+  device: auto                  # cuda when available
+  amp: true                     # bf16 autocast on the GPU
+  min_val_windows: 1000         # fewer validation windows: no early stopping, fallback_epochs (8)
+  max_store_gb: 60
+predict:
+  device: cpu                   # harness workers; "auto" uses the GPU if the worker sees one
+  batch: 8192
+  threads: 4

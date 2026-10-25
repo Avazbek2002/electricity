@@ -4,6 +4,8 @@
   python evaluate.py --model gam --mode validate                 # validation, every district (national)
   python evaluate.py --model gam --mode test                     # chosen variants only: validation + test (2025)
   python evaluate.py --model gam --mode holdout                  # the vault (next data release); budgeted
+  python evaluate.py --model tide_agg --mode validate --test-set configs/test_set_substations_2025.yaml
+                                                                 # substation / feeder test, dev nodes (node_mode.py)
 """
 import argparse
 import concurrent.futures as cf
@@ -76,6 +78,12 @@ def main(argv=None):
     runs_csv = os.path.join(out_root, "runs.csv")
     if args.mode == "holdout" and (args.weather not in (None, "none", "simulated") or args.issue_dates != "all"):
         raise SystemExit("[holdout] the reforecast weather modes are for validate / test only")
+    from harness import nodeset
+    if nodeset.is_node_spec(args.test_set):                 # the substation / feeder test (harness/node_mode.py)
+        if args.mode == "holdout":
+            raise SystemExit("[nodes] the node test has validate (dev substations) and test (test substations) only")
+        from harness.node_mode import run_node
+        return run_node(args, cfg, git, model_dir, model_config, tracking)
     if args.mode in ("validate", "test"):
         from harness.test_mode import run_test
         return run_test(args, cfg, git, model_dir, model_config, tracking, scoring)
