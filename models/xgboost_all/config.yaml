@@ -4,6 +4,7 @@ forecast: none                  # the standard run: no target-day weather (norma
 buckets: null                   # every customer (models/xgboost: buckets 0-4 = ~5 %)
 train_sample: null              # every trainable window (xgboost: a 0.2 share of the 5 %): ~100x its windows
 max_window_gb: 150              # kin + ktg guard; check the pod RAM (free -g) first
+cache_dir: ~/work/boost_cache    # district reads saved per refit: a failed fit restarts without re-reading (deleted after)
 workers: null                   # districts read in parallel (null: evaluate.py --workers)
 wp:                             # other whole_pipeline_v8 settings (part of the shared fit), e.g. CATBOOST_PARAMS
   TRAIN_CATBOOST: false         # XGBoost only (the shared fit would otherwise also train CatBoost on all customers)

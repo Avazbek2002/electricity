@@ -78,7 +78,8 @@ def _settings(wp, spec, cfg):
              ENRICHED_END=spec.data_end, ENRICHED_LABELS=list(spec.labels),
              ENRICHED_BUCKETS=None if buckets in (None, "all") else [int(b) for b in buckets],
              ENRICHED_TRAIN_SAMPLE=cfg.get("train_sample"), ENRICHED_TEST_SAMPLE=0.0,   # no test windows are read
-             ENRICHED_WORKERS=int(cfg.get("workers") or spec.workers), ENRICHED_CACHE_DIR=None,
+             ENRICHED_WORKERS=int(cfg.get("workers") or spec.workers),
+             ENRICHED_CACHE_DIR=cfg.get("_cache_now"),
              MAX_WINDOW_ARRAY_GB=float(cfg.get("max_window_gb", 40)), TRAIN_CUTOFF=spec.cutoff,
              VAL_START=spec.val_start, VAL_END=spec.val_end, BACKTEST_CUTOFFS=[], GLITCH_REPAIR=False,
              FORECAST_MODE=cfg.get("forecast", "none"), PRECOMPUTED_SEGMENT_FEATURES=None,
@@ -121,6 +122,11 @@ def train(spec, artifacts_dir, cfg):
         print(f"[boost] reusing the shared fit {sdir}")
     else:
         wp = _wp()
+        cache = None
+        if cfg.get("cache_dir"):           # per-district reads saved, so a failed fit resumes without re-reading
+            cache = os.path.join(os.path.expanduser(cfg["cache_dir"]), config_hash(cfg), os.path.basename(sdir))
+            cfg = dict(cfg, _cache_now=cache)
+            print(f"[boost] district cache {cache} (holds customer keys: removed after the fit)")
         s = _settings(wp, spec, cfg)
         t0 = time.time()
         who = "all customers" if s["ENRICHED_BUCKETS"] is None else f"customer buckets {s['ENRICHED_BUCKETS']}"
@@ -149,12 +155,14 @@ def train(spec, artifacts_dir, cfg):
             xgboost_best_iteration=fold.xgb_best_iter, xgboost_final_iterations=fold.xgb_final_iters,
             curves=_curves(fold),
             counts=fold.counts, forecast=s["FORECAST_MODE"], wp_overrides=cfg.get("wp") or {},
-            settings={k: v for k, v in s.items() if k != "ENRICHED_ROOT"},
+            settings={k: v for k, v in s.items() if k not in ("ENRICHED_ROOT", "ENRICHED_CACHE_DIR")},
             cutoff=spec.cutoff, data_end=spec.data_end, val=[spec.val_start, spec.val_end],
             seconds=round(time.time() - t0, 1),
             top_features={"catboost": fold.cb_imp.sort_values("importance", ascending=False).head(25).values.tolist(),
                           "xgboost": fold.xgb_imp.sort_values("importance", ascending=False).head(25).values.tolist()})
         json.dump(info, open(os.path.join(sdir, "boost.json"), "w"), indent=2, default=str)
+        if cache:
+            shutil.rmtree(cache, ignore_errors=True)
         print(f"[boost] fitted in {(time.time() - t0) / 60:.1f} min: train {fold.counts['train']:,} windows "
               f"(fit {fold.counts['fit']:,}, validation {fold.counts['val']:,}), {fold.counts['features']} features | "
               f"trees catboost {fold.cb_final_iters}, xgboost {fold.xgb_final_iters} -> {sdir}")
