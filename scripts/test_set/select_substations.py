@@ -419,9 +419,12 @@ def write_spec(path, args, sel, feeders, sel_sha):
         out = []
         for r in sel[sel["role"] == role].sort_values(["coato_code", "substation_id"]).itertuples():
             fd = feeders[(feeders["coato_code"] == r.coato_code) & (feeders["substation_id"] == r.substation_id)]
+            small = fd[fd["households_2025"] < args.min_feeder_households]
+            fd = fd[fd["households_2025"] >= args.min_feeder_households]
             out.append(dict(coato_code=str(r.coato_code), substation_id=int(r.substation_id), region=str(r.region_name or
                             r.region_code), district=str(r.admin_location_name), stratum=str(r.stratum),
-                            households=int(r.households), feeders=sorted(int(f) for f in fd["feeder_id"])))
+                            households=int(r.households), feeders=sorted(int(f) for f in fd["feeder_id"]),
+                            feeders_excluded_small=len(small)))
         return out
     spec = dict(
         version=args.version,
@@ -437,6 +440,10 @@ def write_spec(path, args, sel, feeders, sel_sha):
                     test=dict(issue_start="2025-01-01", issue_end="2025-12-31"),
                     reserve="issue dates 2026 on the test substations: not used"),
         refits=["2025-01-01", "2025-04-01", "2025-07-01", "2025-10-01"],
+        feeders=dict(min_households=args.min_feeder_households,
+                     note="feeders below this size are left out of the feeder scores (mostly mis-mapped fragments of "
+                          "1-40 households; below 10 households a node series would also expose individual customers); "
+                          "their households still count in the substation"),
         horizons=60, control_horizons=[1, 7, 14, 30, 60], reference_model="B0_node", weather="none",
         selection=dict(seed=args.seed, rules={k: getattr(args, k) for k in DEFAULTS},
                        test_districts=args.test_districts, per_district=args.per_district, dev=args.dev,
@@ -489,8 +496,10 @@ def report(sub, sel, feeders, funnel, picked, notes, args):
     for role in ("test", "dev"):
         s = sel[sel["role"] == role]
         fd = feeders.merge(s[["coato_code", "substation_id"]], on=["coato_code", "substation_id"])
+        keep = int((fd["households_2025"] >= args.min_feeder_households).sum())
         print(f"  {role}: {len(s)} substations in {s['coato_code'].nunique()} districts, {s['region_code'].nunique()} "
-              f"regions | {s['households'].sum():,.0f} households | {len(fd)} feeders (size bands: "
+              f"regions | {s['households'].sum():,.0f} households | {keep} feeders scored (>= "
+              f"{args.min_feeder_households} households) of {len(fd)} (size bands: "
               + ", ".join(f"{k} {v}" for k, v in fd["size_band"].value_counts().sort_index().items()) + ")")
     for n in notes:
         print(f"  NOTE: {n}")
@@ -562,7 +571,8 @@ def main(argv=None):
     p.add_argument("--per-district", type=int, default=2)
     p.add_argument("--dev", type=int, default=20)
     p.add_argument("--exclude-test", default=",".join(SAMPLE), help="districts never used for test (dev first)")
-    p.add_argument("--version", default="ss-2026-10-23-v1")
+    p.add_argument("--version", default="ss-2026-10-25-v2")
+    p.add_argument("--min-feeder-households", type=int, default=50, help="smaller feeders are not scored")
     p.add_argument("--spec-out", default=os.path.join(REPO, "configs", "test_set_substations_2025.yaml"))
     for k, v in DEFAULTS.items():
         p.add_argument("--" + k.replace("_", "-"), type=type(v), default=v)

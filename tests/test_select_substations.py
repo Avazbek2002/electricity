@@ -78,7 +78,7 @@ def test_selection(tmp_path):
     assert not set(dev["coato_code"]) & set(test["coato_code"])
     sp = yaml.safe_load(open(spec_out))
     assert len(sp["test_substations"]) == len(test) and len(sp["dev_substations"]) == 3
-    assert all(len(x["feeders"]) == 2 for x in sp["test_substations"])
+    assert all(len(x["feeders"]) == 0 and x["feeders_excluded_small"] == 2 for x in sp["test_substations"])  # < 50
     assert sp["selection"]["selection_csv_sha256"]
     # deterministic with the seed
     out2 = sel.main(["--out-dir", str(tmp_path / "out2"), "--root", root, "--ref-root", "none", "--start", D0,
