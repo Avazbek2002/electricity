@@ -370,6 +370,8 @@ CATBOOST_PARAMS = dict(
     verbose=100,
 )
 CATBOOST_EARLY_STOPPING_ROUNDS = 200
+TRAIN_CATBOOST = True          # False (evaluation harness, train_only): fit XGBoost only (all-customer fits: CatBoost's
+                               # 60-output MultiRMSE would take hours a refit)
 CAT_FEATURES = ["coato_code", "housing_type_id", "segment"]
 
 # --- behavior segmentation for segment-specific priors (v4.1) ---
@@ -2409,7 +2411,11 @@ def fit_and_evaluate(pdf, kin, ktg, ktg_raw, clim, fc_grid, fc_grid_mm, train_cu
     # -------------------------------------------------------------------
     # CatBoost
     # -------------------------------------------------------------------
-    if no_val and fallback_iters:
+    skip_cb = train_only and not TRAIN_CATBOOST
+    if skip_cb:
+        cb_best_iter, cb_curves, cb_model = 0, {}, None
+        print("[catboost] skipped (TRAIN_CATBOOST = False)")
+    elif no_val and fallback_iters:
         cb_best_iter, cb_curves = int(fallback_iters[0]), {}
     else:
         cb_model = CatBoostRegressor(cat_features=CAT_FEATURES, **CATBOOST_PARAMS)
@@ -2417,13 +2423,13 @@ def fit_and_evaluate(pdf, kin, ktg, ktg_raw, clim, fc_grid, fc_grid_mm, train_cu
                      sample_weight=sw(fit))
         cb_best_iter = cb_model.get_best_iteration()
         cb_curves = cb_model.get_evals_result()              # learning curves of the early-stopping fit
-    cb_final_iters = max(min(cb_best_iter, MAX_FINAL_ITERATIONS), 10)
-    print(f"[catboost] best iteration on validation: {cb_best_iter} -> using {cb_final_iters} for the final fit "
-          f"(capped at MAX_FINAL_ITERATIONS={MAX_FINAL_ITERATIONS})")
-
-    cb_final_params = dict(CATBOOST_PARAMS, iterations=cb_final_iters, verbose=200)
-    cb_model = CatBoostRegressor(cat_features=CAT_FEATURES, **cb_final_params)
-    cb_model.fit(X[train], Y[train], sample_weight=sw(train))
+    cb_final_iters = 0 if skip_cb else max(min(cb_best_iter, MAX_FINAL_ITERATIONS), 10)
+    if not skip_cb:
+        print(f"[catboost] best iteration on validation: {cb_best_iter} -> using {cb_final_iters} for the final fit "
+              f"(capped at MAX_FINAL_ITERATIONS={MAX_FINAL_ITERATIONS})")
+        cb_final_params = dict(CATBOOST_PARAMS, iterations=cb_final_iters, verbose=200)
+        cb_model = CatBoostRegressor(cat_features=CAT_FEATURES, **cb_final_params)
+        cb_model.fit(X[train], Y[train], sample_weight=sw(train))
 
     # -------------------------------------------------------------------
     # XGBoost
@@ -2449,7 +2455,8 @@ def fit_and_evaluate(pdf, kin, ktg, ktg_raw, clim, fc_grid, fc_grid_mm, train_cu
             cb_curves=cb_curves, xgb_curves=xgb_curves,
             xgb_categories=xgb_categories(Xg), meter_segment=meter_segment, segment_priors=segment_priors,
             pooled_prior=pooled_prior, segment_priors_mm=segment_priors_mm, pooled_prior_mm=pooled_prior_mm,
-            cb_imp=pd.DataFrame({"feature": feature_cols, "importance": cb_model.get_feature_importance()}),
+            cb_imp=pd.DataFrame({"feature": feature_cols, "importance": cb_model.get_feature_importance() if cb_model
+                                 is not None else np.zeros(len(feature_cols))}),
             xgb_imp=pd.DataFrame({"feature": feature_cols, "importance": xgb_model.feature_importances_}),
             counts=dict(train=int(train.sum()), fit=int(fit.sum()), val=int(val.sum()), features=len(feature_cols),
                         meters=int(meta["meter_id"].nunique())))
@@ -2799,7 +2806,7 @@ CONFIG_NAMES = [
     "ENRICHED_ROOT", "ENRICHED_BUCKETS", "ENRICHED_COATOS", "ENRICHED_LABELS", "ENRICHED_START", "ENRICHED_END",
     "WINDOW_STRIDE", "MIN_INPUT_DAYS", "MIN_RECENT_DAYS", "RECENT_WINDOW", "MIN_TARGET_DAYS", "TRAIN_MIN_TARGET_DAYS",
     "GLITCH_REPAIR",
-    "SEGMENT_MIN_COVERAGE_DAYS", "CATBOOST_EARLY_STOPPING_ROUNDS", "XGB_EARLY_STOPPING_ROUNDS", "SERVE_MODEL",
+    "SEGMENT_MIN_COVERAGE_DAYS", "CATBOOST_EARLY_STOPPING_ROUNDS", "TRAIN_CATBOOST", "XGB_EARLY_STOPPING_ROUNDS", "SERVE_MODEL",
     "BACKTEST_CUTOFFS", "BACKTEST_TEST_DAYS",
 ]
 
