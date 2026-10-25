@@ -27,13 +27,13 @@ from torch import nn
 
 import tide_data as td
 
-DEFAULTS = dict(lookback=90, buckets=[0, 1, 2, 3, 4], stride=7, val_stride=7, min_input_days=60, min_recent_days=20,
+DEFAULTS = dict(lookback=90, buckets=[0, 1, 2, 3, 4], stride=7, stride_new=1, val_stride=7, year_ago=True, min_input_days=60, min_recent_days=20,
                 min_target_days=20, coarse_inputs="old", regime_cutoff="2024-08-01", old_weight=1.0, regime_flag=False,
                 interval_labels=True, val_households=0.05, exclude_ranges=[["2023-01-01", "2023-02-28"]], min_scale=0.05,
                 model=dict(hidden=512, enc_layers=2, dec_layers=2, decoder_dim=16, temporal_hidden=64, cov_proj=4,
                            cov_hidden=64, dropout=0.2, layernorm=True, house_dim=4, dist_dim=8),
                 train=dict(batch=4096, lr=1e-3, weight_decay=1e-4, epochs=40, windows_per_epoch=2_000_000, patience=4,
-                           huber_delta=1.0, weight_power=1.0, val_windows=200_000, seed=42, device="auto", amp=True,
+                           loss="mse", huber_delta=1.0, weight_power=1.0, val_windows=200_000, seed=42, device="auto", amp=True,
                            fallback_epochs=8, min_val_windows=1000, max_store_gb=60),
                 predict=dict(device="cpu", batch=8192, threads=None))
 
@@ -69,31 +69,35 @@ class TiDE(nn.Module):
         self.proj = ResBlock(n_cov, int(mc["cov_hidden"]), r, dr, ln)
         self.house = nn.Embedding(td.HOUSING_IDS, int(mc["house_dim"]))
         self.dist = nn.Embedding(n_dist + 1, int(mc["dist_dim"]))         # row 0 = a district not seen in training
-        d_in = 3 * L + (L + H) * r + n_stat + int(mc["house_dim"]) + int(mc["dist_dim"])
+        d_in = 5 * L + 2 * H + (L + H) * r + n_stat + int(mc["house_dim"]) + int(mc["dist_dim"])
         enc = [ResBlock(d_in, hid, hid, dr, ln)] + [ResBlock(hid, hid, hid, dr, ln) for _ in range(int(mc["enc_layers"]) - 1)]
         dec = [ResBlock(hid, hid, hid, dr, ln) for _ in range(int(mc["dec_layers"]) - 1)] + \
               [ResBlock(hid, hid, H * self.p, dr, ln)]
         self.encoder, self.decoder = nn.Sequential(*enc), nn.Sequential(*dec)
-        self.temporal = ResBlock(self.p + r, int(mc["temporal_hidden"]), 1, dr, ln)
+        self.temporal = ResBlock(self.p + r + 2, int(mc["temporal_hidden"]), 1, dr, ln)   # + year-ago value, mask
         self.skip = nn.Linear(L, H)
 
     def forward(self, b):
         cov = torch.cat([b["cov_p"], b["cov_f"]], 1)                       # (B, L + H, n_cov)
         f = self.proj(cov)                                                 # (B, L + H, r)
-        x = torch.cat([b["y"], b["m"], b["c"], f.flatten(1), b["stat"], self.house(b["house"]), self.dist(b["dist"])], 1)
+        x = torch.cat([b["y"], b["m"], b["c"], b["ly_p"], b["ly_pm"], b["ly_f"], b["ly_fm"], f.flatten(1), b["stat"],
+                       self.house(b["house"]), self.dist(b["dist"])], 1)
         g = self.decoder(self.encoder(x)).view(-1, self.H, self.p)
-        out = self.temporal(torch.cat([g, f[:, self.L:, :]], 2)).squeeze(-1)
+        ly = torch.stack([b["ly_f"], b["ly_fm"]], 2)
+        out = self.temporal(torch.cat([g, f[:, self.L:, :], ly], 2)).squeeze(-1)
         return out + self.skip(b["y"])
 
 
 def huber(r, delta):
+    if delta is None:                                  # squared error: the forecast targets the MEAN (node sums add up)
+        return 0.5 * r * r
     a = r.abs()
     return torch.where(a <= delta, 0.5 * r * r, delta * (a - 0.5 * delta))
 
 
 def window_loss(pred, b, tc, old_weight):
     """-> (loss, dict of row counts) for one batch (scaled units)."""
-    delta = float(tc["huber_delta"])
+    delta = None if tc.get("loss", "mse") == "mse" else float(tc["huber_delta"])
     daily = huber(pred - b["yt"], delta) * b["mt"]
     C = torch.cat([torch.zeros_like(pred[:, :1]), torch.cumsum(pred, 1)], 1)       # C[:, j] = sum of the first j days
     pos = torch.arange(pred.shape[1], device=pred.device)[None, :]
@@ -174,6 +178,7 @@ def fit(spec, artifacts_dir, cfg_in):
     idx = lambda d: int((pd.Timestamp(d) - d0).days)                              # noqa: E731
     rc = dict(uri=spec.roots[0]["uri"], start=spec.start, end=spec.data_end, buckets=cfg["buckets"],
               lookback=int(cfg["lookback"]), stride=int(cfg["stride"]), val_stride=int(cfg["val_stride"]),
+              stride_new=int(cfg["stride_new"]), year_ago=bool(cfg["year_ago"]),
               min_input_days=int(cfg["min_input_days"]), min_recent_days=int(cfg["min_recent_days"]),
               min_target_days=int(cfg["min_target_days"]), coarse_inputs=cfg["coarse_inputs"],
               interval_labels=bool(cfg["interval_labels"]), regime_idx=idx(cfg["regime_cutoff"]),
@@ -214,7 +219,7 @@ def fit(spec, artifacts_dir, cfg_in):
     gcfg = dict(rc, regime_flag=bool(cfg["regime_flag"]), min_scale=float(cfg["min_scale"]),
                 regime_cutoff=str(cfg["regime_cutoff"]))
     L, H = int(cfg["lookback"]), td.H
-    net = TiDE(L, H, td.N_COV, 4, len(coatos), cfg["model"]).to(device)
+    net = TiDE(L, H, td.N_COV, td.N_STAT, len(coatos), cfg["model"]).to(device)
     opt = torch.optim.AdamW(net.parameters(), lr=float(tc["lr"]), weight_decay=float(tc["weight_decay"]))
     sched = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, factor=0.5, patience=1)
     trh, tro = torch.from_numpy(tr[0]).to(device), torch.from_numpy(tr[1]).to(device)
@@ -271,7 +276,7 @@ def fit(spec, artifacts_dir, cfg_in):
         best_state = {k: t.detach().cpu() for k, t in net.state_dict().items()}
     torch.save(best_state, os.path.join(artifacts_dir, "tide_weights.pt"))
     np.savez(os.path.join(artifacts_dir, "tide_normals.npz"), **{f"c{c}": v for c, v in norms.items()})
-    info = dict(config=cfg, gather=gcfg, coatos=coatos, n_stat=4, curves=curves, stats=stats,
+    info = dict(config=cfg, gather=gcfg, coatos=coatos, n_stat=td.N_STAT, curves=curves, stats=stats,
                 counts=dict(train=int(len(tr[0])), val=int(len(va[0])), households=int(S["val"].shape[0])),
                 best_epoch=int(np.argmin([c.get("val_loss", np.inf) for c in curves]) + 1) if use_val else len(curves),
                 fit_minutes=(time.time() - t0) / 60)

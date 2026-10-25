@@ -4,7 +4,10 @@ variant: tide_daily
 buckets: [0, 1, 2, 3, 4]
 workers: null                   # districts read in parallel (null: evaluate.py --workers)
 lookback: 90                    # input days (the harness's fresh rule: >= 60 observed of these 90)
-stride: 7                       # days between a household's training issue dates (random phase per household)
+stride: 7                       # days between a household's training issue dates before regime_cutoff (random phase)
+stride_new: 1                   # ... and from regime_cutoff on: the served regime gets ~7x more windows (run 1: 96 % of the
+                                # windows were old-regime even at the 2025-10 refit)
+year_ago: true                  # inputs: the household's own 90 input + 60 target days a year earlier (364 days)
 min_input_days: 60              # known input days of 90 (observed; before the regime cutoff also closed intervals)
 min_recent_days: 20             # ... of them in the last 30
 min_target_days: 20             # labelled target days (observed + days of wholly-contained intervals) of 60
@@ -31,9 +34,11 @@ train:
   lr: 0.001
   weight_decay: 0.0001
   epochs: 40
-  windows_per_epoch: 2000000
+  windows_per_epoch: 8000000     # ~16 s an epoch on the B200
   patience: 4
-  huber_delta: 1.0              # in units of the household's mean input day
+  loss: mse                     # mse: the forecast targets the mean, so household forecasts add up to node sums
+                                # (run 1 used huber, delta 1: median-like, -3.5 % on every substation) | huber
+  huber_delta: 1.0              # huber only: in units of the household's mean input day
   weight_power: 1.0             # window weight s^p: larger households count more (the node sums are energy sums)
   val_windows: 200000
   seed: 42

@@ -39,6 +39,8 @@ N_CAL = 14                       # dow one-hot 7, doy sin/cos x 2 harmonics 4, h
 N_COV = N_CAL + 3 + 3 + 1        # + temperature normals (mean, min, max) + anomalies + "weather observed"
 ANOM = slice(N_CAL + 3, N_CAL + 6)
 WX_SEEN = N_CAL + 6
+N_STAT = 6                       # log s, input coverage, coarse share, regime flag, log(year-ago level / s), year-ago coverage
+YEAR = 364                       # year-ago offset in days (same weekday)
 HOUSING_IDS = 16                 # housing_type_id 0..14 -> embedding row, 15 = unknown / other
 
 
@@ -298,8 +300,19 @@ def covariates(dates, wt, norm):
 
 # ----------------------------------------------------------------------------- windows
 def candidate_origins(st, cfg, o_lo, o_hi, rng):
-    """Issue dates o (store day index) for each household, every cfg stride days with a random phase, where the inputs
-    have enough known days and the targets enough labelled days -> (row, o) int arrays."""
+    """Issue dates o (store day index) for each household where the inputs have enough known days and the targets
+    enough labelled days -> (row, o) int arrays. Every `stride` days (random phase per household) before the regime
+    cutoff, every `stride_new` days after it (the regime that is served gets more windows)."""
+    reg = int(cfg["regime_idx"])
+    sn = int(cfg.get("stride_new") or cfg["stride"])
+    if sn == int(cfg["stride"]):
+        return _candidates(st, cfg, o_lo, o_hi, rng)
+    a = _candidates(st, cfg, o_lo, min(o_hi, reg - 1), rng)
+    b = _candidates(st, dict(cfg, stride=sn), max(o_lo, reg), o_hi, rng)
+    return np.concatenate([a[0], b[0]]), np.concatenate([a[1], b[1]])
+
+
+def _candidates(st, cfg, o_lo, o_hi, rng):
     L = int(cfg["lookback"])
     kind = st["kind"]
     n, T = kind.shape
@@ -406,6 +419,22 @@ def gather(st, h, o, cfg, xp=np, device=None):
     s = s.clip(min=float(cfg.get("min_scale", 0.05)))
     y = vz / s[:, None]
     cflag = op.f32(known & (k_p == KIND_INT))
+    # the same household a year earlier (364 days: same weekday): its 90 input days and its 60 target days, scaled by
+    # s; the same knowledge rule as the inputs (observed, and closed intervals only where coarse inputs are allowed)
+    use_ly = bool(cfg.get("year_ago", True))
+
+    def year_ago(idx):
+        ok = (idx >= 0) & use_ly
+        ix = idx.clip(min=0)
+        v, k, c = st["val"][hh, ix], st["kind"][hh, ix], st["coff"][hh, ix]
+        cl = (op.i64(ix) + op.i64(c)) <= (o[:, None] - 1)
+        kn = ok & ((k == KIND_OBS) | ((k == KIND_INT) & cl & coarse_ok[:, None]))
+        return op.where(kn, op.nan_to_num(v), 0.0) / s[:, None], op.f32(kn)
+    ly_p, ly_pm = year_ago(past - YEAR)
+    ly_f, ly_fm = year_ago(fut - YEAR)
+    n_ly = ly_pm.sum(1)
+    r_ly = ly_p.sum(1) / n_ly.clip(min=1.0)
+    lr_ly = op.where(n_ly >= 10, op.log(r_ly.clip(min=0.05)), 0.0 * n_ly)
     # covariates: past and target days (day o itself is neither); anomalies unknown on target days
     dist = st["dist"][h]
     cov_p = st["cov"][dist[:, None], past]
@@ -428,7 +457,8 @@ def gather(st, h, o, cfg, xp=np, device=None):
     isum = op.where(im, op.nan_to_num(st["isum"][hh, fut]), 0.0) / s[:, None]
     stat = [op.log(s), op.f32(n_known) / L, cflag.sum(1) / L]
     stat.append(op.f32(old) if cfg.get("regime_flag") else op.f32(old) * 0.0)
-    return dict(y=op.f32(y), m=m, c=cflag, cov_p=cov_p, cov_f=cov_f, s=s, stat=op.stack(stat),
+    stat += [op.f32(lr_ly), (n_ly + ly_fm.sum(1)) / (L + H)]
+    return dict(y=op.f32(y), m=m, c=cflag, ly_p=op.f32(ly_p), ly_pm=ly_pm, ly_f=op.f32(ly_f), ly_fm=ly_fm, cov_p=cov_p, cov_f=cov_f, s=s, stat=op.stack(stat),
                 house=st["house"][h], dist=st["demb"][h] if "demb" in st else dist, yt=op.f32(yt), mt=mt, il=il, im=op.f32(im), isum=op.f32(isum),
                 old=old)
 

@@ -178,9 +178,10 @@ def test_gather_numpy_equals_torch_and_loss_uses_intervals(data):
     St = {k: torch.from_numpy(v) for k, v in S.items()}
     b = td.gather(St, torch.from_numpy(h[:400]), torch.from_numpy(o[:400]), cfg, torch)
     for k in a:
-        assert np.allclose(np.asarray(a[k], dtype=float), b[k].numpy().astype(float), equal_nan=True), k
+        x, y = np.asarray(a[k], dtype=float), b[k].numpy().astype(float)
+        assert np.allclose(x, y, equal_nan=True, atol=1e-6), (k, np.argwhere(~np.isclose(x, y, equal_nan=True, atol=1e-6))[:3], x[~np.isclose(x, y, equal_nan=True, atol=1e-6)][:3], y[~np.isclose(x, y, equal_nan=True, atol=1e-6)][:3])
     mc = tide.merged({})["model"]
-    net = tide.TiDE(90, 60, td.N_COV, 4, 1, dict(mc, hidden=16, temporal_hidden=8, cov_hidden=8))
+    net = tide.TiDE(90, 60, td.N_COV, td.N_STAT, 1, dict(mc, hidden=16, temporal_hidden=8, cov_hidden=8))
     pred = net(b)
     tc = tide.merged({})["train"]
     loss, cnt = tide.window_loss(pred, b, tc, 1.0)

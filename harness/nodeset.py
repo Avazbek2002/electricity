@@ -287,13 +287,34 @@ def score(models, targets, spec, role, nodes):
             band.append(dict(model=n, level=lv, band=bd, horizon=h, nodes=len(q), median=float(q["sysmape"].median())))
     summ, band = pd.DataFrame(summ), pd.DataFrame(band)
     ctrl = list(spec["control_horizons"])
+    by_month = _by_month(rows, names, ctrl)
     head = {}
     if len(summ):
         for (n, lv), q in summ[summ["horizon"].isin(ctrl)].groupby(["model", "level"]):
             head[f"{n}/{lv}"] = float(q["median"].mean())
     data.update(rows=int(len(rows)), nodes={lv: int(rows.loc[rows["level"] == lv, "node"].nunique()) for lv in LEVELS},
                 issue_dates=int(rows["origin"].nunique()))
-    return dict(per_node=per, summary=summ, by_band=band, headline=head, data=data, ctrl=ctrl, role=role)
+    return dict(per_node=per, summary=summ, by_band=band, by_month=by_month, headline=head, data=data, ctrl=ctrl,
+                role=role)
+
+
+def _by_month(rows, names, ctrl):
+    """Per issue month, level and model: median per-node sysMAPE and pooled bias, both averaged over the control
+    horizons (seasonal misses show up here; they partly cancel in the year's totals)."""
+    q = rows[rows["horizon"].isin(ctrl)]
+    if not len(q):
+        return pd.DataFrame(columns=["model", "level", "month", "median", "bias"])
+    q = q.assign(month=q["origin"].dt.strftime("%Y-%m"))
+    out = []
+    for n in names:
+        g = q.groupby(["level", "month", "node", "horizon"]).agg(y=("y", "sum"), ae=(f"ae_{n}", "sum"),
+                                                                 e=(f"e_{n}", "sum")).reset_index()
+        g["sm"] = g["ae"] / g["y"]
+        med = g.groupby(["level", "month", "horizon"])["sm"].median().groupby(["level", "month"]).mean()
+        pb = g.groupby(["level", "month", "horizon"]).apply(lambda x: x["e"].sum() / x["y"].sum(), include_groups=False)\
+            .groupby(["level", "month"]).mean()
+        out.append(pd.DataFrame({"model": n, "median": med, "bias": pb}).reset_index())
+    return pd.concat(out, ignore_index=True)
 
 
 def report(res, models):
@@ -330,6 +351,22 @@ def report(res, models):
             lines.append(f"  {m:24s} bias " + " ".join(f"h{h} {r.loc[h, 'bias']:+.1%}" for h in ctrl if h in r.index)
                          + " | beats B0 " + " ".join(f"h{h} {r.loc[h, 'beats_b0']:.0%}" for h in ctrl if h in r.index))
         lines.append("")
+    bm = res.get("by_month")
+    if bm is not None and len(bm):
+        for lv in LEVELS:
+            q = bm[bm["level"] == lv]
+            if not len(q):
+                continue
+            med = q.pivot(index="month", columns="model", values="median")
+            bia = q.pivot(index="month", columns="model", values="bias")
+            ms = [m for m in models if m in med.columns]
+            lines.append(f"BY ISSUE MONTH, {lv} (median per-node sysMAPE | pooled bias; mean over the control horizons)")
+            lines.append("  month   " + " ".join(f"{m[:16]:>16s}" for m in ms) + "  | " +
+                         " ".join(f"{m[:10]:>10s}" for m in ms))
+            for mo in med.index:
+                lines.append(f"  {mo} " + " ".join(f"{med.loc[mo, m]:16.2%}" for m in ms) + "  | " +
+                             " ".join(f"{bia.loc[mo, m]:+10.1%}" for m in ms))
+            lines.append("")
     b = res["by_band"]
     if len(b):
         lines.append("BY SIZE (median per-node sysMAPE, mean over the control horizons)")
@@ -343,7 +380,7 @@ def report(res, models):
 
 def save(res, out_dir, text):
     os.makedirs(out_dir, exist_ok=True)
-    for k in ("per_node", "summary", "by_band"):
+    for k in ("per_node", "summary", "by_band", "by_month"):
         res[k].to_csv(os.path.join(out_dir, f"{k}.csv"), index=False, float_format="%.6f")
     open(os.path.join(out_dir, "report.txt"), "w").write(text + "\n")
     json.dump(dict(headline=res["headline"], data=res["data"], role=res["role"]),
