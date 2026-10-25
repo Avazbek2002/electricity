@@ -1,0 +1,52 @@
+family: tide
+variant: tide_obs
+# households: customer_bucket values (each ~1 % of customers); the store needs ~11 bytes a household-day on the GPU
+buckets: [0, 1, 2, 3, 4]
+workers: null                   # districts read in parallel (null: evaluate.py --workers)
+lookback: 90                    # input days (the harness's fresh rule: >= 60 observed of these 90)
+stride: 7                       # days between a household's training issue dates before regime_cutoff (random phase)
+stride_new: 1                   # ... and from regime_cutoff on: the served regime gets ~7x more windows (run 1: 96 % of the
+                                # windows were old-regime even at the 2025-10 refit)
+year_ago: true                  # inputs: the household's own 90 input + 60 target days a year earlier (364 days)
+min_input_days: 40              # training only (the harness still serves households with >= 60): observed days alone
+min_recent_days: 20             # ... of them in the last 30
+min_target_days: 20             # labelled target days (observed + days of wholly-contained intervals) of 60
+coarse_inputs: none             # interval days are never inputs (nor year-ago inputs): an old-regime window looks like
+                                # a served one; run 2 showed coarse inputs act as a regime flag confounded with season
+regime_cutoff: "2024-08-01"
+interval_labels: true           # the aggregate labels: interval sums of estimated runs and allocated long gaps
+old_weight: 1.0                 # loss weight of windows issued before the cutoff
+regime_flag: false              # static feature "issued before the cutoff" (old winters read 7-17 % higher)
+val_households: 0.05            # a stable share of customers held out for early stopping (never trained on)
+exclude_ranges: [["2023-01-01", "2023-02-28"]]   # the Jan-Feb 2023 crisis: no input, no label
+model:
+  hidden: 512
+  enc_layers: 2
+  dec_layers: 2
+  decoder_dim: 16
+  temporal_hidden: 64
+  cov_proj: 4
+  cov_hidden: 64
+  dropout: 0.2
+  layernorm: true
+train:
+  batch: 4096
+  lr: 0.001
+  weight_decay: 0.0001
+  epochs: 40
+  windows_per_epoch: 8000000     # ~16 s an epoch on the B200
+  patience: 4
+  loss: mse                     # mse: the forecast targets the mean, so household forecasts add up to node sums
+                                # (run 1 used huber, delta 1: median-like, -3.5 % on every substation) | huber
+  huber_delta: 1.0              # huber only: in units of the household's mean input day
+  weight_power: 1.0             # window weight s^p: larger households count more (the node sums are energy sums)
+  val_windows: 200000
+  seed: 42
+  device: auto                  # cuda when available
+  amp: true                     # bf16 autocast on the GPU
+  min_val_windows: 1000         # fewer validation windows: no early stopping, fallback_epochs (8)
+  max_store_gb: 60
+predict:
+  device: cpu                   # harness workers; "auto" uses the GPU if the worker sees one
+  batch: 8192
+  threads: 4
