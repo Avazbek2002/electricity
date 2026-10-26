@@ -22,6 +22,8 @@ Part B. CALENDAR EFFECTS. Day type from the standing calendar: workday, Saturday
     (composition / reading schedule), not from consumption: a data artefact, not a load event.
 Part C. FORECAST ERROR BY TARGET-DAY TYPE (with --forecasts): pooled sysMAPE and bias of each model (and B0) by
     the day type of the target day.
+Part D. FORECAST ERROR BY WEATHER PERIOD (with --forecasts): median per-node sysMAPE, pooled sysMAPE and bias by the
+    weather period of the target day (heating / dead band / cooling, the district's observed mean) x horizon block.
 
 Writes <out>/report.txt, CSV tables and PNG charts. Node aggregates only (nodes of >= 50 households; a same-household
 step needs >= 10 households on both days); no customer keys.
@@ -346,6 +348,36 @@ def main(argv=None):
         lines += [f"PART C. FORECAST ERROR BY TARGET-DAY TYPE ({a.role} substations, pooled over all horizons)",
                   "  sysMAPE:", pv.to_string(float_format="{:.2%}".format), "", "  bias:",
                   pb.to_string(float_format="{:+.2%}".format), ""]
+
+        # ---- Part D: forecast error by weather period of the target day (district observed t_mean)
+        rows = rows.merge(nodes[["node", "coato"]], on="node", how="left").merge(wx, on=["coato", "date"], how="left")
+        rows["wclass"] = wclass(rows["t_mean"])
+        rows["hblock"] = pd.cut(rows["horizon"], [0, 7, 14, 30, 60], labels=["h1-7", "h8-14", "h15-30", "h31-60"])
+        Dw = []
+        for (lv, wc_, hb), q in rows.groupby(["level", "wclass", "hblock"], observed=True):
+            for m in models:
+                pn = q.groupby("node").apply(lambda r: (r[m] - r["y"]).abs().sum() / r["y"].sum())
+                Dw.append(dict(level=lv, wclass=wc_, hblock=hb, model=m, node_days=len(q), nodes=q["node"].nunique(),
+                               median_node=float(pn.median()),
+                               pooled=float((q[m] - q["y"]).abs().sum() / q["y"].sum()),
+                               bias=float((q[m] - q["y"]).sum() / q["y"].sum())))
+        Dw = pd.DataFrame(Dw)
+        Dw.to_csv(os.path.join(out, "error_by_wclass.csv"), index=False, float_format="%.5f")
+        lines += [f"PART D. FORECAST ERROR BY WEATHER PERIOD OF THE TARGET DAY ({a.role}; district observed mean temperature:"
+                  f" heating < {HDD:g} C, dead band, cooling > {CDD:g} C)"]
+        for lv in ("substation", "feeder"):
+            q = Dw[Dw["level"] == lv]
+            if not len(q):
+                continue
+            nd = q[q["model"] == "B0"].groupby("wclass")["node_days"].sum()
+            lines += [f"  {lv}: node-days " + " | ".join(f"{k} {v:,} ({v / nd.sum():.0%})" for k, v in nd.items())]
+            for col, fmt in (("median_node", "{:.2%}"), ("bias", "{:+.2%}")):
+                t = q.pivot_table(index=["wclass", "hblock"], columns="model", values=col, observed=True)
+                t = t[list(models)]
+                t = t.reindex([(w, h) for w in ("heating", "dead band", "cooling", "unknown")
+                               for h in ("h1-7", "h8-14", "h15-30", "h31-60") if (w, h) in t.index])
+                lines += [f"  {lv} {'median per-node sysMAPE' if col == 'median_node' else 'pooled bias'}:",
+                          t.to_string(float_format=fmt.format), ""]
 
     _charts(clean, B, D, top, out)
     text = "\n".join(lines)
