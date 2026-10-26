@@ -373,6 +373,12 @@ CATBOOST_EARLY_STOPPING_ROUNDS = 200
 CALENDAR_FEATURES = False      # True: target-day calendar inputs (cal_*): weekday of the origin (so each of the 60 outputs
                                # knows its own weekday), days to the next public holidays / Eids / transferred days off,
                                # days to the start and end of Ramadan. Standing calendar, known years ahead (no leakage)
+EXPECTED_DEGREE_DAYS = False   # True: target days without a real forecast get the climatological EXPECTED degree days
+                               # (smoothed mean of past years' daily HDD/CDD) instead of the degree days of the normal
+                               # temperature. max(T - base, 0) is convex, so DD(normal) < mean DD (Jensen): in shoulder months
+                               # the normal Tmax sits just above the cooling base and DD(normal) misses about a third of
+                               # the expected cooling load (node analysis Part D: -7..-9 % on hot days after h14).
+                               # Same past-year data as the normal, so no leakage
 CALENDAR_HORIZON = 70          # a holiday further than this from the origin -> CALENDAR_FAR
 CALENDAR_FAR = 99
 TRAIN_CATBOOST = True          # False (evaluation harness, train_only): fit XGBoost only (all-customer fits: CatBoost's
@@ -1246,6 +1252,12 @@ def build_climate(d: pd.DataFrame) -> Climate:
         c.W_max[ci, di] = d["tmax"].values
         c.normal_min_all, c.normal_min_loyo = _normals(ci, yidx, doy, d["tmin"].values, n_c, n_y)
         c.normal_max_all, c.normal_max_loyo = _normals(ci, yidx, doy, d["tmax"].values, n_c, n_y)
+    # expected (climatological) degree days: normals of the daily degree days, same smoothing and years as the normals
+    hdd, cdd = degree_days(d["t"].values)
+    c.edd = dict(h=_normals(ci, yidx, doy, hdd, n_c, n_y), c=_normals(ci, yidx, doy, cdd, n_c, n_y))
+    if c.W_min is not None:
+        hmin, cmax = degree_days_minmax(d["tmin"].values, d["tmax"].values)
+        c.edd.update(hmin=_normals(ci, yidx, doy, hmin, n_c, n_y), cmax=_normals(ci, yidx, doy, cmax, n_c, n_y))
     return c
 
 
@@ -1285,6 +1297,34 @@ def _lookup_grid(pdf: pd.DataFrame, clim: Climate, W, normal_all, normal_loyo, n
         t_nrm = n_all
     t_nrm = np.where(ok, t_nrm, np.nan)
     return t_obs, t_nrm, t_prev
+
+
+def lookup_edd(pdf: pd.DataFrame, clim: Climate, normal_mode: str):
+    """Expected degree days of the HORIZON target days -> {h, c[, hmin, cmax]: (N, HORIZON)} (EXPECTED_DEGREE_DAYS)."""
+    if getattr(clim, "edd", None) is None:
+        raise ValueError("climate built without expected degree days (rebuild it with build_climate)")
+    cmap = {k: i for i, k in enumerate(clim.coatos)}
+    ci = pdf["coato_code"].astype(str).map(cmap).fillna(-1).astype(int).values
+    ok = (ci >= 0)[:, None]
+    cs = np.maximum(ci, 0)[:, None]
+    origin = pdf["origin_date"].values.astype("datetime64[D]")
+    dates = origin[:, None] + OFFS[LOOKBACK:].astype("timedelta64[D]")[None, :]
+    yr = dates.astype("datetime64[Y]")
+    doy = (dates - yr.astype("datetime64[D]")).astype(int)
+    yi = yr.astype(int) + 1970 - clim.years[0]
+    in_years = (yi >= 0) & (yi < len(clim.years))
+    out = {}
+    for k, (n_all, n_loyo) in clim.edd.items():
+        v = n_all[cs, doy]
+        if normal_mode == "loyo":
+            v = np.where(in_years, n_loyo[cs, np.clip(yi, 0, len(clim.years) - 1), doy], v)
+        out[k] = np.where(ok, v, np.nan)
+    return out
+
+
+def _jensen(edd, dd_normal, no_fc):
+    """Expected minus normal-temperature degree days (>= 0), on the days without a real forecast; 0 elsewhere."""
+    return np.where(no_fc, np.maximum(np.nan_to_num(edd - dd_normal, nan=0.0), 0.0), 0.0)
 
 
 def lookup_weather(pdf: pd.DataFrame, clim: Climate, normal_mode: str):
@@ -2020,6 +2060,17 @@ def build_features(pdf, kin, ktg, clim, future_mode=None, normal_mode=None,
 
     h_in, c_in = degree_days(t_in)
     h_fut, c_fut = degree_days(t_fut)
+    edd = None
+    if EXPECTED_DEGREE_DAYS and future_mode != "actual":
+        edd = lookup_edd(pdf, clim, normal_mode)
+        no_fc = np.ones(n_fut.shape, bool)
+        if t_fc is not None:
+            no_fc[:, :t_fc.shape[1]] = ~np.isfinite(t_fc)
+        hn, cn = degree_days(n_fut)
+        jh, jc = _jensen(edd["h"], hn, no_fc), _jensen(edd["c"], cn, no_fc)
+        h_fut, c_fut = h_fut + jh, c_fut + jc
+        print(f"[expected dd] mean added per target day: HDD {jh.mean():.2f}, CDD {jc.mean():.2f} | days 31-60: "
+              f"{jh[:, 30:].mean():.2f}, {jc[:, 30:].mean():.2f}")
 
     # --- daily min/max weather (v6): observed history, normals, and the blended future ---
     tmin_fc = tmax_fc = None
@@ -2048,6 +2099,15 @@ def build_features(pdf, kin, ktg, clim, future_mode=None, normal_mode=None,
                 tmax_fut, _ = blend_forecast(nmax_fut, tmax_fc)
         h_in_mm, c_in_mm = degree_days_minmax(tmin_in, tmax_in)
         h_fut_mm, c_fut_mm = degree_days_minmax(tmin_fut, tmax_fut)
+        if edd is not None and "hmin" in edd:
+            no_mm = np.ones(nmin_fut.shape, bool)
+            if tmin_fc is not None:
+                no_mm[:, :tmin_fc.shape[1]] = ~(np.isfinite(tmin_fc) & np.isfinite(tmax_fc))
+            hn_mm, cn_mm = degree_days_minmax(nmin_fut, nmax_fut)
+            jh_mm, jc_mm = _jensen(edd["hmin"], hn_mm, no_mm), _jensen(edd["cmax"], cn_mm, no_mm)
+            h_fut_mm, c_fut_mm = h_fut_mm + jh_mm, c_fut_mm + jc_mm
+            print(f"[expected dd] min/max, mean added per target day: HDD(min) {jh_mm.mean():.2f}, "
+                  f"CDD(max) {jc_mm.mean():.2f} | days 31-60: {jh_mm[:, 30:].mean():.2f}, {jc_mm[:, 30:].mean():.2f}")
 
     f = {}
     # --- static / calendar ---
@@ -2861,7 +2921,7 @@ CONFIG_NAMES = [
     "ENRICHED_ROOT", "ENRICHED_BUCKETS", "ENRICHED_COATOS", "ENRICHED_LABELS", "ENRICHED_START", "ENRICHED_END",
     "WINDOW_STRIDE", "MIN_INPUT_DAYS", "MIN_RECENT_DAYS", "RECENT_WINDOW", "MIN_TARGET_DAYS", "TRAIN_MIN_TARGET_DAYS",
     "GLITCH_REPAIR",
-    "SEGMENT_MIN_COVERAGE_DAYS", "CATBOOST_EARLY_STOPPING_ROUNDS", "TRAIN_CATBOOST", "CALENDAR_FEATURES", "XGB_EARLY_STOPPING_ROUNDS", "SERVE_MODEL",
+    "SEGMENT_MIN_COVERAGE_DAYS", "CATBOOST_EARLY_STOPPING_ROUNDS", "TRAIN_CATBOOST", "CALENDAR_FEATURES", "EXPECTED_DEGREE_DAYS", "XGB_EARLY_STOPPING_ROUNDS", "SERVE_MODEL",
     "BACKTEST_CUTOFFS", "BACKTEST_TEST_DAYS",
 ]
 
