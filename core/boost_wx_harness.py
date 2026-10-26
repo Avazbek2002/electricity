@@ -75,7 +75,8 @@ def gpu_settings(cfg, wp_cfg):
 def train(spec, artifacts_dir, cfg):
     """One v8 fit with real forecasts for refit spec (shared by catboost_wx / xgboost_wx)."""
     sdir = shared_dir(artifacts_dir, cfg)
-    if all(os.path.exists(os.path.join(sdir, f)) for f in bh.FILES):
+    need = bh.FILES if (cfg.get("wp") or {}).get("TRAIN_CATBOOST", True) else tuple(f for f in bh.FILES if "catboost" not in f)
+    if all(os.path.exists(os.path.join(sdir, f)) for f in need):
         print(f"[boost-wx] reusing the shared fit {sdir}")
     else:
         w = rf.wx_config(cfg)
@@ -130,7 +131,8 @@ def train(spec, artifacts_dir, cfg):
                                    train_only=True, fallback_iters=bh.fallback_iters(sdir, cfg))
         del pdf, kin, ktg, fc_grid, fc_grid_mm
         os.makedirs(sdir, exist_ok=True)
-        fold.cb_model.save_model(os.path.join(sdir, "catboost_model.cbm"))
+        if fold.cb_model is not None:
+            fold.cb_model.save_model(os.path.join(sdir, "catboost_model.cbm"))
         fold.xgb_model.save_model(os.path.join(sdir, "xgboost_model.json"))
         km = fold.meter_segment.attrs.get("kmeans")
         info = dict(
@@ -156,7 +158,7 @@ def train(spec, artifacts_dir, cfg):
               f"(fit {fold.counts['fit']:,}, validation {fold.counts['val']:,}), {fold.counts['features']} features | "
               f"trees catboost {fold.cb_final_iters}, xgboost {fold.xgb_final_iters} -> {sdir}")
     os.makedirs(artifacts_dir, exist_ok=True)
-    for f in bh.FILES:
+    for f in need:
         shutil.copy(os.path.join(sdir, f), artifacts_dir)
 
 

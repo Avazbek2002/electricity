@@ -31,7 +31,7 @@ from harness import testset as ts
 from harness.contract import HORIZON, Panel, TrainSpec
 from harness.data import read_district, restore_credentials, scrub_credentials
 from harness.runner import load_model, persistence30
-from harness.weather import climate_asof, no_forecast
+from harness.weather import REFORECAST, climate_asof, no_forecast, reforecast_grid
 
 
 def refit_blocks(spec, role):
@@ -88,6 +88,11 @@ def node_worker(code, cfg):
     sdays = int(sc.get("days", 28))
     lo_c, hi_c = (sc.get("clip") or [0.5, 2.0])
     pcs, nrs = cfg["per_customer"], cfg["n_rows"]
+    refc = cfg.get("weather", "none") in REFORECAST
+    if refc:                       # the real AIFS / FCN3 forecasts issued on each date (an outside input, not perturbed)
+        arch = pd.read_parquet(cfg["reforecast_path"])
+        arch = arch[arch["coato_id"].astype(str) == str(code)]
+        arch["issue_date"] = pd.to_datetime(arch["issue_date"])
     scrub_credentials()
 
     cnt = np.zeros((len(sel), T + 1), dtype=np.int32)
@@ -114,7 +119,10 @@ def node_worker(code, cfg):
                 k += 1
                 continue
             clim = climate_asof(code, wt, dates, last + 1, wp)
-            g1, gm = no_forecast(int(clim.n_days), wp.FORECAST_DAYS)
+            if refc:
+                g1, gm = reforecast_grid(code, arch, clim, dates[o], wp)
+            else:
+                g1, gm = no_forecast(int(clim.n_days), wp.FORECAST_DAYS)
             lo = max(0, last + 1 - W)
             tot = np.zeros((K, H))
             num = np.zeros(K)
@@ -123,7 +131,8 @@ def node_worker(code, cfg):
                 panel = Panel(coato=str(code), origin=dates[o], keys=D["keys"][r], kwh=M[r, lo:last + 1].copy(),
                               dates=dates[lo:last + 1], weather=wt[:, lo:last + 1].copy(), housing=D["housing"][r].copy(),
                               network=D["network"][r].copy(),
-                              pipeline=dict(clim=clim, fc_grid=g1, fc_grid_mm=gm, seed=int(cfg["seed"]), weather_mode="none"))
+                              pipeline=dict(clim=clim, fc_grid=g1, fc_grid_mm=gm, seed=int(cfg["seed"]),
+                                            weather_mode=cfg.get("weather", "none")))
                 P = np.asarray(model.predict(panel), dtype=np.float64)
                 if P.shape != (len(r), H):
                     raise RuntimeError(f"{cfg['model_name']}.predict returned {P.shape}, expected {(len(r), H)}")
@@ -245,17 +254,28 @@ def _run_node(args, cfg, git, model_dir, model_config, tracking, holder):
     pcs, nrs = ns.per_customer(targets[targets["node"].isin(set(rn["node"]))], spec)
     issue = pd.DatetimeIndex(sorted(set().union(*[set(ns.issue_dates(spec, r)) for r in roles])))
     blocks = refit_blocks(spec, roles[0]) if len(roles) == 1 else _blocks_for(spec, issue)
+    weather = getattr(args, "weather", None) or spec.get("weather", "none")
+    reforecast_path = None
+    if weather in REFORECAST or getattr(args, "issue_dates", "all") == "reforecast":
+        from harness.test_mode import _reforecast_blocks          # the issue dates with an AIFS / FCN3 forecast only
+        blocks, reforecast_path = _reforecast_blocks(blocks, weather, model_config, out_root)
+        issue = pd.DatetimeIndex(sorted(set(o for _, b in blocks for o in b)))
+    if weather == "simulated":
+        raise SystemExit("[nodes] --weather simulated is not supported here (none, aifs, fcn3, ens)")
+    sc_run = dict(cfg["run"].get("scaling") or {"method": "ratio"})
+    if getattr(args, "scaling_days", None):
+        sc_run["days"] = int(args.scaling_days)
 
     wcfg_wb = dict(cfg.get("wandb") or {})
     if getattr(args, "no_wandb", False):
         wcfg_wb["enabled"] = False
-    sc_cfg = cfg["run"].get("scaling") or {"method": "ratio"}
+    sc_cfg = sc_run
     wb_config = dict(model=args.model, family=model_config.get("family", args.model), model_config=model_config,
                      test_set=spec["version"], test_set_sha256=spec["_sha256"][:12], data_version=man["data_version"],
                      roles=roles, districts=",".join(codes),
                      **{f"{r}_substations": int(((rn["role"] == r) & (rn["level"] == "substation")).sum()) for r in roles},
                      **{f"{r}_feeders": int(((rn["role"] == r) & (rn["level"] == "feeder")).sum()) for r in roles},
-                     scaling=sc_cfg, commit=git["commit"], dirty=git["dirty"],
+                     scaling=sc_cfg, weather=weather, issue_dates=int(len(issue)), commit=git["commit"], dirty=git["dirty"],
                      refits=[str(R.date()) for R, _ in blocks], workers=workers)
     wrun = holder["run"] = wandb_log.start(
         wcfg_wb, name=f"{args.model} | nodes-{label} | {git['short']}", group=f"{spec['version']} nodes",
@@ -297,7 +317,8 @@ def _run_node(args, cfg, git, model_dir, model_config, tracking, holder):
     wcfg = dict(spec=spec, data=d, blocks=blocks, labels=cfg["data"]["labels"], model_name=args.model,
                 model_dir=model_dir, model_config=model_config, artifacts=arts, seed=wp.SEED,
                 history_days=int(cfg["data"]["history_days"]), block=int(run_cfg["block"]),
-                scaling=run_cfg.get("scaling") or {"method": "ratio"}, nodes=node_lists, per_customer=pcs, n_rows=nrs)
+                scaling=sc_run, nodes=node_lists, per_customer=pcs, n_rows=nrs, weather=weather,
+                reforecast_path=reforecast_path)
     thr = max(1, (os.cpu_count() or 4) // workers)
     for v in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
         os.environ[v] = str(thr)
@@ -336,7 +357,10 @@ def _run_node(args, cfg, git, model_dir, model_config, tracking, holder):
     predict_seconds = time.time() - t1
 
     # ---- write
-    out = os.path.join(out_root, "runs", f"{time.strftime('%Y%m%d-%H%M%S')}_{args.model}_nodes-{label}")
+    tag = "" if weather == "none" and getattr(args, "issue_dates", "all") == "all" else f"-wx{weather}"
+    if getattr(args, "scaling_days", None):
+        tag += f"-sc{int(args.scaling_days)}"
+    out = os.path.join(out_root, "runs", f"{time.strftime('%Y%m%d-%H%M%S')}_{args.model}_nodes-{label}{tag}")
     fdir = os.path.join(out, "forecasts", args.model)
     udir = os.path.join(out, "forecasts", f"{args.model}_unscaled")
     for p_ in (fdir, udir):
@@ -351,7 +375,7 @@ def _run_node(args, cfg, git, model_dir, model_config, tracking, holder):
               f"{np.percentile(allc, 95):.3f})")
     meta = dict(model=args.model, test_set_version=spec["version"], test_set_sha256=spec["_sha256"], target="T2_node",
                 role="+".join(roles), roles=roles, git_commit=git["commit"], dirty=git["dirty"], districts=codes,
-                substitution_test=sub, notes=notes, household_forecasts=sum(r["windows"] for r in results),
+                substitution_test=sub, notes=notes, weather=weather, issue_dates=int(len(issue)), household_forecasts=sum(r["windows"] for r in results),
                 gaps_filled_with_persistence=sum(r["gaps"] for r in results), test_dir=test_dir,
                 scaling=wcfg["scaling"])
     for p_ in (fdir, udir):

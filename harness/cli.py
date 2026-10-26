@@ -45,6 +45,8 @@ def main(argv=None):
                    help="reforecast: score only the issue dates with an AIFS / FCN3 forecast (always so with --weather "
                         "aifs|fcn3|ens), so a model without weather is compared on the same dates")
     p.add_argument("--no-network", action="store_true", help="skip the supplementary substation / feeder sums")
+    p.add_argument("--scaling-days", type=int, default=None,
+                   help="node test: days of the level scaling c(o) (default configs/eval.yaml run.scaling.days, 28)")
     p.add_argument("--no-substitution-test", action="store_true", help="skip the leakage substitution test")
     p.add_argument("--allow-leak", action="store_true", help="run even if the substitution test fails (recorded)")
     p.add_argument("--config", default=os.path.join(REPO, "configs", "eval.yaml"))
