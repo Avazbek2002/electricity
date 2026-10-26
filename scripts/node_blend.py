@@ -69,11 +69,31 @@ def simplex(k, step=STEP):
     return np.stack(out)
 
 
-def fit_weights(rows, names, W):
-    """-> {block: weight vector} minimising the node-normalised absolute error."""
-    out = {}
+def _cells(rows):
+    """(key, mask) per horizon block, and per target-day group when rows carry a 'grp' column (--by-daytype)."""
     for a, b in BLOCKS:
-        q = rows[(rows["horizon"] >= a) & (rows["horizon"] <= b)]
+        m = ((rows["horizon"] >= a) & (rows["horizon"] <= b)).to_numpy()
+        if "grp" in rows:
+            for g in ("workday", "offday"):
+                yield f"{a}-{b}|{g}", m & (rows["grp"] == g).to_numpy()
+        else:
+            yield f"{a}-{b}", m
+
+
+def offday(dates):
+    """Target day is a Saturday, Sunday, public holiday or transferred day off (standing calendar)."""
+    from harness.testset import standing_calendar
+    d = pd.DatetimeIndex(pd.to_datetime(dates))
+    cal = standing_calendar(pd.date_range(d.min(), d.max())).set_index("date")
+    off = ((cal["hol"] + cal["xoff"]) > 0) | (cal.index.dayofweek >= 5)
+    return np.where(off.reindex(d).to_numpy(), "offday", "workday")
+
+
+def fit_weights(rows, names, W):
+    """-> {block[|day group]: weight vector} minimising the node-normalised absolute error."""
+    out = {}
+    for key, cell in _cells(rows):
+        q = rows[cell]
         tot = q.groupby("node")["y"].transform("sum").to_numpy()
         wt = 1.0 / np.where(tot > 0, tot, np.nan)
         P = q[names].to_numpy(float)
@@ -85,16 +105,15 @@ def fit_weights(rows, names, W):
             j = int(np.argmin(s))
             if s[j] < best:
                 best, bw = s[j], W[i + j]
-        out[f"{a}-{b}"] = [float(x) for x in bw]
+        out[key] = [float(x) for x in bw]
     return out
 
 
 def apply(rows, names, weights):
     f = np.full(len(rows), np.nan)
     P = rows[names].to_numpy(float)
-    for (a, b) in BLOCKS:
-        m = ((rows["horizon"] >= a) & (rows["horizon"] <= b)).to_numpy()
-        f[m] = P[m] @ np.asarray(weights[f"{a}-{b}"])
+    for key, m in _cells(rows):
+        f[m] = P[m] @ np.asarray(weights[key])
     return rows[["node", "origin", "horizon"]].assign(forecast=f)
 
 
@@ -107,6 +126,8 @@ def main(argv=None):
     p.add_argument("--spec", default=os.path.join(REPO, "configs", "test_set_substations_2025.yaml"))
     p.add_argument("--apply", default=None, help="weights.json from a dev run (required for --role test)")
     p.add_argument("--out", required=True)
+    p.add_argument("--by-daytype", action="store_true",
+                   help="separate weights for target days that are weekends / holidays and for workdays")
     a = p.parse_args(argv)
     if a.role == "test" and not a.apply:
         raise SystemExit("on the test substations the blend is only applied (--apply <dev weights.json>)")
@@ -119,6 +140,8 @@ def main(argv=None):
     models[ns.REFERENCE] = b0[["node", "origin", "horizon", "forecast"]]
     names = list(models)
     rows, _ = ns.common_rows(models, targets, spec, a.role, nodes)
+    if a.by_daytype or (a.apply and json.load(open(os.path.expanduser(a.apply))).get("by_daytype")):
+        rows["grp"] = offday(rows["date"])
     out = os.path.expanduser(a.out)
     os.makedirs(out, exist_ok=True)
     if a.apply:
@@ -138,11 +161,11 @@ def main(argv=None):
             print(f"[blend] quarter {k} held out: " + " | ".join(
                 f"h{b}: " + " ".join(f"{n} {w:.2f}" for n, w in zip(names, v) if w > 0) for b, v in wk.items()))
         blends = {"blend_cv": pd.concat(parts, ignore_index=True), "blend_insample": apply(rows, names, full)}
-        weights = dict(models=names, weights=full, blocks=BLOCKS, step=STEP, role=a.role)
+        weights = dict(models=names, weights=full, blocks=BLOCKS, step=STEP, role=a.role, by_daytype=bool(a.by_daytype))
         json.dump(weights, open(os.path.join(out, "weights.json"), "w"), indent=2)
         print("\nWEIGHTS (all of dev; saved to weights.json for the one test run)")
         for b, v in full.items():
-            print(f"  h{b:6s} " + "  ".join(f"{n} {w:.2f}" for n, w in zip(names, v)))
+            print(f"  h{b:16s} " + "  ".join(f"{n} {w:.2f}" for n, w in zip(names, v)))
     res = ns.score({**blends, **models}, targets, spec, a.role, nodes)
     text = ns.report(res, list(blends) + names)
     print("\n" + text)
