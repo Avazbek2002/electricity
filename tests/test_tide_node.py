@@ -280,7 +280,23 @@ def test_tide_end_to_end_on_nodes(data, tmp_path):
     assert r.returncode == 0, log[-4000:]
     assert "[leakage] PASSED" in log and "estimated runs" in log and "SUBSTATION" in log and "FEEDER" in log, log[-3000:]
     run = sorted((tmp_path / "eval" / "runs").iterdir())[-1]
-    s = pd.read_csv(run / "scores" / "summary.csv")
+    s = pd.read_csv(run / "scores" / "dev" / "summary.csv")
     m = s[(s["model"] == "tide_tiny") & (s["level"] == "substation")]
     assert len(m) == 60 and np.isfinite(m["median"]).all()
     assert m["median"].mean() < 0.6, s.to_string()           # a sane forecast after two tiny epochs
+    assert len(list((run / "scores" / "dev" / "windows").glob("*.png"))) >= 3     # substation window charts
+    # test mode: the dev AND the test substations in one run, the fits reused
+    r = subprocess.run([sys.executable, os.path.join(REPO, "evaluate.py"), "--model", str(mdir), "--mode", "test",
+                        "--test-set", sp, "--test-dir", str(tmp_path / "ts" / "ss-synthetic"), "--config", str(ev_p),
+                        "--allow-dirty", "--no-mlflow", "--no-wandb", "--workers", "1", "--no-substitution-test"],
+                       capture_output=True, text=True, cwd=REPO, env=env)
+    log = r.stdout + r.stderr
+    assert r.returncode == 0, log[-4000:]
+    assert "reusing" in log and "NODE SCORES (dev)" in log and "NODE SCORES (test)" in log, log[-3000:]
+    run2 = sorted((tmp_path / "eval" / "runs").iterdir())[-1]
+    assert run2.name.endswith("_nodes-dev-test")
+    for role in ("dev", "test"):
+        assert (run2 / "scores" / role / "summary.csv").exists() and list((run2 / "scores" / role / "windows").glob("*.png"))
+    cmp = subprocess.run([sys.executable, os.path.join(REPO, "scripts", "compare_node_runs.py"), str(run2), "--role",
+                          "test", "--spec", sp], capture_output=True, text=True, cwd=REPO)
+    assert cmp.returncode == 0 and "NODE SCORES (test)" in cmp.stdout, cmp.stdout[-2000:] + cmp.stderr[-2000:]

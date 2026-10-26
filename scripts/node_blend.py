@@ -32,10 +32,19 @@ BLOCKS = [(1, 7), (8, 14), (15, 30), (31, 45), (46, 60)]
 STEP = 0.05
 
 
+def _runs_with(eval_dir, model, role):
+    """Node runs of `model` that scored `role` (nodes-dev, nodes-test, or nodes-dev-test), oldest first."""
+    out = []
+    for r in sorted(glob.glob(os.path.join(os.path.expanduser(eval_dir), "runs", f"*_{model}_nodes-*"))):
+        if role in os.path.basename(r).rsplit("_nodes-", 1)[1].split("-"):
+            out.append(r)
+    return out
+
+
 def load(runs, latest, role, eval_dir):
     runs = list(runs)
     for m in latest or []:
-        found = sorted(glob.glob(os.path.join(os.path.expanduser(eval_dir), "runs", f"*_{m}_nodes-{role}")))
+        found = sorted(_runs_with(eval_dir, m, role))
         if not found:
             raise SystemExit(f"no node run of {m} ({role}) under {eval_dir}/runs")
         runs.append(found[-1])
@@ -47,8 +56,8 @@ def load(runs, latest, role, eval_dir):
             if name.endswith("_unscaled"):
                 continue
             meta = json.load(open(os.path.join(d, "forecast_meta.json")))
-            if meta["role"] != role:
-                raise SystemExit(f"{r} is a {meta['role']} run, not {role}")
+            if role not in meta.get("roles", [meta["role"]]):
+                raise SystemExit(f"{r} did not score the {role} substations ({meta['role']})")
             test_dir = test_dir or meta["test_dir"]
             models[name] = ns.read_forecasts(d)
     return models, test_dir

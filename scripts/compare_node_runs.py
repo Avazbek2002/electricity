@@ -19,6 +19,15 @@ import harness  # noqa: E402,F401
 from harness import nodeset as ns  # noqa: E402
 
 
+def _runs_with(eval_dir, model, role):
+    """Node runs of `model` that scored `role` (nodes-dev, nodes-test, or nodes-dev-test), oldest first."""
+    out = []
+    for r in sorted(glob.glob(os.path.join(os.path.expanduser(eval_dir), "runs", f"*_{model}_nodes-*"))):
+        if role in os.path.basename(r).rsplit("_nodes-", 1)[1].split("-"):
+            out.append(r)
+    return out
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("runs", nargs="*")
@@ -31,14 +40,14 @@ def main(argv=None):
     a = p.parse_args(argv)
     runs = list(a.runs)
     for m in a.latest or []:
-        found = sorted(glob.glob(os.path.join(os.path.expanduser(a.eval_dir), "runs", f"*_{m}_nodes-{a.role}")))
+        found = sorted(_runs_with(a.eval_dir, m, a.role))
         if not found:
             raise SystemExit(f"no node run of {m} ({a.role}) under {a.eval_dir}/runs")
         runs.append(found[-1])
     if not runs:
         raise SystemExit("give run folders or --latest <models>")
     spec = ns.load_spec(a.spec)
-    models, test_dir, role = {}, None, None
+    models, test_dir, role = {}, None, a.role
     for r in runs:
         r = os.path.expanduser(r)
         for fd in sorted(glob.glob(os.path.join(r, "forecasts", "*"))):
@@ -48,9 +57,9 @@ def main(argv=None):
             meta_p = os.path.join(fd, "forecast_meta.json")
             if os.path.exists(meta_p):
                 meta = json.load(open(meta_p))
-                test_dir, role = test_dir or meta["test_dir"], role or meta["role"]
-                if meta["role"] != role:
-                    raise SystemExit(f"{r} is a {meta['role']} run, the others {role}")
+                test_dir = test_dir or meta["test_dir"]
+                if a.role not in meta.get("roles", [meta["role"]]):
+                    raise SystemExit(f"{r} did not score the {a.role} substations ({meta['role']})")
             if name in models:
                 name = f"{name}@{os.path.basename(r)[:15]}"
             models[name] = ns.read_forecasts(fd)
