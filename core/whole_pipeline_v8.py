@@ -370,6 +370,11 @@ CATBOOST_PARAMS = dict(
     verbose=100,
 )
 CATBOOST_EARLY_STOPPING_ROUNDS = 200
+CALENDAR_FEATURES = False      # True: target-day calendar inputs (cal_*): weekday of the origin (so each of the 60 outputs
+                               # knows its own weekday), days to the next public holidays / Eids / transferred days off,
+                               # days to the start and end of Ramadan. Standing calendar, known years ahead (no leakage)
+CALENDAR_HORIZON = 70          # a holiday further than this from the origin -> CALENDAR_FAR
+CALENDAR_FAR = 99
 TRAIN_CATBOOST = True          # False (evaluation harness, train_only): fit XGBoost only (all-customer fits: CatBoost's
                                # 60-output MultiRMSE would take hours a refit)
 CAT_FEATURES = ["coato_code", "housing_type_id", "segment"]
@@ -1927,6 +1932,51 @@ def nm(a):
     return np.nanmean(a, axis=1)
 
 
+CAL_EVENTS = {"newyear": ("newyear",), "navruz": ("navruz",), "ramazan": ("ramazan",), "kurban": ("kurban",),
+              "other": ("women", "remembrance", "independence", "teachers", "constitution")}
+
+
+def calendar_features(origin):
+    """Target-day calendar inputs for windows whose last history day is `origin` (target day j = origin + j):
+    cal_dow_0..6 = weekday of the origin (one-hot): output j's weekday is (dow + j) mod 7, which each output's trees
+    learn; cal_d_<event> = days from the origin to the next such holiday (1 .. CALENDAR_HORIZON, else CALENDAR_FAR);
+    cal_d_xoff = to the next transferred day off; cal_d_ram_start / cal_d_ram_end = to the first / last day of the
+    next or current Ramadan (0 = inside it, for the start). From the standing calendar (fixed dates, tabular Hijri
+    Eids, weekend transfer rule), computable years ahead: no information after the origin is used."""
+    from harness.testset import standing_calendar
+    o = pd.DatetimeIndex(pd.to_datetime(origin)).normalize()
+    uo = o.unique()
+    lo, hi = uo.min() - pd.Timedelta(days=40), uo.max() + pd.Timedelta(days=CALENDAR_HORIZON + 40)
+    cal = standing_calendar(pd.date_range(lo, hi))
+    day = ((cal["date"] - lo).dt.days).to_numpy()
+    oi = ((uo - lo).days).to_numpy()
+
+    def ahead(idx, allow0=False):
+        idx = np.sort(np.asarray(idx))
+        if not len(idx):
+            return np.full(len(oi), float(CALENDAR_FAR))
+        k = np.searchsorted(idx, oi, side="left" if allow0 else "right")
+        nxt = np.where(k < len(idx), idx[np.minimum(k, len(idx) - 1)], 10 ** 9)
+        d = (nxt - oi).astype(float)
+        return np.where(d <= CALENDAR_HORIZON, d, float(CALENDAR_FAR))
+    out = {}
+    dow = uo.dayofweek.to_numpy()
+    for k in range(7):
+        out[f"cal_dow_{k}"] = (dow == k).astype(float)
+    hn = cal["hname"].to_numpy()
+    for name, keys in CAL_EVENTS.items():
+        out[f"cal_d_{name}"] = ahead(day[np.isin(hn, keys)])
+    out["cal_d_xoff"] = ahead(day[cal["xoff"].to_numpy() > 0])
+    ram = cal["ram"].to_numpy() > 0
+    starts = day[ram & ~np.r_[False, ram[:-1]]]
+    ends = day[ram & ~np.r_[ram[1:], False]]
+    inside = ram[np.clip(oi, 0, len(ram) - 1)]
+    out["cal_d_ram_start"] = np.where(inside, 0.0, ahead(starts))
+    out["cal_d_ram_end"] = ahead(ends, allow0=True)
+    pos = pd.Index(uo).get_indexer(o)
+    return {k: v[pos] for k, v in out.items()}
+
+
 def build_features(pdf, kin, ktg, clim, future_mode=None, normal_mode=None,
                     beta_h_prior=BETA_H_PRIOR, beta_c_prior=BETA_C_PRIOR,
                     forecast_mode=None, fc_grid=None, use_prev_year=None,
@@ -2006,6 +2056,8 @@ def build_features(pdf, kin, ktg, clim, future_mode=None, normal_mode=None,
     f["origin_doy_cos"] = np.cos(2 * np.pi * doy / 365.25)
     if OLD_REGIME_FLAG:                           # v8: 1 for old-regime rows, always 0 for new rows and at serving
         f["regime_old"] = (pdf["origin_date"].values < np.datetime64(REGIME_CUTOFF)).astype(float)
+    if CALENDAR_FEATURES:
+        f.update(calendar_features(pdf["origin_date"]))
 
     # --- consumption aggregates (input side) ---
     for lag in range(1, 8):
@@ -2809,7 +2861,7 @@ CONFIG_NAMES = [
     "ENRICHED_ROOT", "ENRICHED_BUCKETS", "ENRICHED_COATOS", "ENRICHED_LABELS", "ENRICHED_START", "ENRICHED_END",
     "WINDOW_STRIDE", "MIN_INPUT_DAYS", "MIN_RECENT_DAYS", "RECENT_WINDOW", "MIN_TARGET_DAYS", "TRAIN_MIN_TARGET_DAYS",
     "GLITCH_REPAIR",
-    "SEGMENT_MIN_COVERAGE_DAYS", "CATBOOST_EARLY_STOPPING_ROUNDS", "TRAIN_CATBOOST", "XGB_EARLY_STOPPING_ROUNDS", "SERVE_MODEL",
+    "SEGMENT_MIN_COVERAGE_DAYS", "CATBOOST_EARLY_STOPPING_ROUNDS", "TRAIN_CATBOOST", "CALENDAR_FEATURES", "XGB_EARLY_STOPPING_ROUNDS", "SERVE_MODEL",
     "BACKTEST_CUTOFFS", "BACKTEST_TEST_DAYS",
 ]
 
