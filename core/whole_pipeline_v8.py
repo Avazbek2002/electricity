@@ -2445,6 +2445,9 @@ def fit_and_evaluate(pdf, kin, ktg, ktg_raw, clim, fc_grid, fc_grid_mm, train_cu
     print(f"[xgboost] best iteration on validation: {xgb_best_iter} -> using {xgb_final_iters} for the final fit")
 
     xgb_final_params = dict(XGB_PARAMS, n_estimators=xgb_final_iters)
+    xgb_model = None                                         # free the early-stopping booster's GPU memory before the
+    import gc                                                # final fit (sklearn objects sit in reference cycles: without
+    gc.collect()                                             # this it held ~55 GB of a 91 GB GPU on all customers)
     xgb_model = xgb.XGBRegressor(**xgb_final_params)
     xgb_model.fit(Xg[train], Y[train], sample_weight=sw(train), verbose=False)
     if train_only:                                             # evaluation harness: the fitted pieces, no test scoring
