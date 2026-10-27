@@ -63,7 +63,7 @@ HTML = """<!doctype html><html><head><meta charset="utf-8"><title>Node forecasts
 <script>%(plotly)s</script>
 <style>body{font:14px system-ui,sans-serif;margin:16px;background:#fff;color:#222}select{font-size:14px;margin-right:12px}
 #c{width:100%%;height:640px}.note{color:#666;font-size:12px;margin-top:6px}</style></head><body>
-<h3 style="margin:0 0 8px">Node forecasts vs actual, %(role)s, %(start)s .. %(end)s</h3>
+<h3 style="margin:0 0 8px">Node forecasts vs actual, %(role)s, %(start)s .. %(end)s%(lp)s</h3>
 <label>Level <select id="lv"></select></label><label>Node <select id="nd"></select></label>
 <label>Horizon <select id="hz"></select></label>
 <div id="c"></div>
@@ -124,6 +124,25 @@ def png_total(data, names, out):
         print(f"[charts] {p}")
 
 
+def _not_leak_proof(fd):
+    """'' if the forecast folder is leak-proof, else the reason."""
+    mp = os.path.join(fd, "forecast_meta.json")
+    if not os.path.exists(mp):
+        return "no forecast_meta.json"
+    m = json.load(open(mp))
+    if "components" in m:                                     # a blend (scripts/node_blend.py)
+        return "" if m.get("leak_proof") else (f"blend '{m.get('model')}' is not leak-proof (use blend_exp from runs with "
+                                              f"safe node scaling)")
+    sc = m.get("scaling") or {}
+    if int(sc.get("safe_lag", 0)) < ns.EST_SAFE_LAG:
+        return (f"node scaling window ends on o - 1 (safe_lag {sc.get('safe_lag', 0)}): rerun the node run with the "
+                f"current harness (window ends on o - 1 - {ns.EST_SAFE_LAG})")
+    st = m.get("substitution_test")
+    if isinstance(st, dict) and not st.get("passed", False):
+        return "substitution test not passed"
+    return ""
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--forecasts", nargs="+", required=True, help="node forecast folders (node.csv.gz), optionally LABEL=folder; default label = folder name")
@@ -132,6 +151,10 @@ def main(argv=None):
     p.add_argument("--test-dir", default=None)
     p.add_argument("--horizons", nargs="+", type=int, default=[1, 7, 14, 30, 60])
     p.add_argument("--no-b0", action="store_true")
+    p.add_argument("--year", type=int, default=None, help="keep target days of this year only (e.g. 2025)")
+    p.add_argument("--leak-proof", action="store_true",
+                   help="refuse forecasts that are not leak-proof: model runs need node scaling with safe_lag >= "
+                        "nodeset.EST_SAFE_LAG, blends must be blend_exp built from such runs")
     p.add_argument("--out", default="~/work/analysis/year_chart")
     a = p.parse_args(argv)
     out = os.path.expanduser(a.out)
@@ -146,6 +169,10 @@ def main(argv=None):
         name = label or os.path.basename(fd)
         if name in models:
             name = f"{name}@{os.path.basename(os.path.dirname(os.path.dirname(fd)))[:15]}"
+        if a.leak_proof:
+            why = _not_leak_proof(fd)
+            if why:
+                raise SystemExit(f"[leak-proof] {fd}: {why}")
         models[name] = ns.read_forecasts(fd)
     if not a.no_b0:
         want = set(nodes.loc[nodes["role"] == a.role, "node"])
@@ -153,13 +180,15 @@ def main(argv=None):
         models[ns.REFERENCE] = b0[["node", "origin", "horizon", "forecast"]]
     names = list(models)
     rows, info = ns.common_rows(models, targets, spec, a.role, nodes)
+    if a.year:
+        rows = rows[rows["date"].dt.year == a.year]
     if not len(rows):
         raise SystemExit(f"no common rows (missing forecasts {info['missing']})")
     print(f"[rows] {len(rows):,} node-days x horizons on {rows['node'].nunique()} nodes, "
           f"{rows['date'].min():%Y-%m-%d} .. {rows['date'].max():%Y-%m-%d}")
     data = series(rows, names, a.horizons)
     from plotly.offline import get_plotlyjs
-    html = HTML % dict(plotly=get_plotlyjs(), data=json.dumps(data, separators=(",", ":")), horizons=json.dumps(a.horizons),
+    html = HTML % dict(lp=" (leak-proof)" if a.leak_proof else "", plotly=get_plotlyjs(), data=json.dumps(data, separators=(",", ":")), horizons=json.dumps(a.horizons),
                        models=json.dumps(names), colors=json.dumps(PALETTE), role=a.role,
                        start=f"{rows['date'].min():%Y-%m-%d}", end=f"{rows['date'].max():%Y-%m-%d}")
     p_html = os.path.join(out, "year_chart.html")

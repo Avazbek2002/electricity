@@ -9,7 +9,11 @@ Weights: for each horizon block (1-7, 8-14, 15-30, 31-45, 46-60) the convex comb
 grid that minimises the mean per-node sysMAPE (each node-day weighted by 1 / its node's actual total in the block, so a
 large substation does not outweigh small feeders). Substations and feeders share one set of weights.
 
-Honest dev score: leave-one-quarter-out (weights fitted on three quarters of the 2025 issue dates, scored on the fourth,
+Leak-proof score (blend_exp, the one to quote for deployment): the issue dates of each month (--exp-freq M) or quarter
+use weights fitted only on dev node-days whose target day is before that month (a horizon block with no such days yet,
+e.g. all of January: equal weights); with --apply the test gets the same dev weights per month. blend_cv below still sees later quarters of the same year.
+
+Dev score: leave-one-quarter-out (weights fitted on three quarters of the 2025 issue dates, scored on the fourth,
 the four held-out quarters put together). The weights saved are the ones fitted on all of dev. The test run only
 applies saved weights (--apply): nothing is fitted on the test substations.
 """
@@ -48,7 +52,7 @@ def load(runs, latest, role, eval_dir):
         if not found:
             raise SystemExit(f"no node run of {m} ({role}) under {eval_dir}/runs")
         runs.append(found[-1])
-    models, test_dir = {}, None
+    models, test_dir, metas = {}, None, {}
     for r in runs:
         fd = os.path.join(os.path.expanduser(r), "forecasts")
         for d in sorted(glob.glob(os.path.join(fd, "*"))):
@@ -60,7 +64,10 @@ def load(runs, latest, role, eval_dir):
                 raise SystemExit(f"{r} did not score the {role} substations ({meta['role']})")
             test_dir = test_dir or meta["test_dir"]
             models[name] = ns.read_forecasts(d)
-    return models, test_dir
+            metas[name] = dict(run=os.path.basename(os.path.normpath(r)), scaling=meta.get("scaling"),
+                               substitution_test=(meta.get("substitution_test") or {}).get("passed")
+                               if isinstance(meta.get("substitution_test"), dict) else meta.get("substitution_test"))
+    return models, test_dir, metas
 
 
 def simplex(k, step=STEP):
@@ -94,6 +101,9 @@ def fit_weights(rows, names, W):
     out = {}
     for key, cell in _cells(rows):
         q = rows[cell]
+        if not len(q):                                         # nothing to fit on (expanding window, first quarter)
+            out[key] = [1.0 / len(names)] * len(names)
+            continue
         tot = q.groupby("node")["y"].transform("sum").to_numpy()
         wt = 1.0 / np.where(tot > 0, tot, np.nan)
         P = q[names].to_numpy(float)
@@ -107,6 +117,26 @@ def fit_weights(rows, names, W):
                 best, bw = s[j], W[i + j]
         out[key] = [float(x) for x in bw]
     return out
+
+
+def expanding(rows, names, W, freq="M"):
+    """Leak-proof weights: each issue month / quarter gets weights fitted only on node-days whose TARGET day is before it
+    starts (all known when its first forecast is issued); cells with none -> equal weights. -> (blend rows, {period: w})."""
+    qs = rows["origin"].dt.to_period(freq)
+    parts, wq = [], {}
+    for p in sorted(qs.unique()):
+        past = rows[rows["date"] < p.start_time]
+        wq[str(p)] = fit_weights(past, names, W)              # a cell with no past rows -> equal weights
+        parts.append(apply(rows[qs == p], names, wq[str(p)]))
+    return pd.concat(parts, ignore_index=True), wq
+
+
+def apply_by_quarter(rows, names, wq, freq="M"):
+    qs = rows["origin"].dt.to_period(freq).astype(str)
+    missing = sorted(set(qs) - set(wq))
+    if missing:
+        raise SystemExit(f"no expanding weights for issue quarters {missing}")
+    return pd.concat([apply(rows[qs == k], names, wq[k]) for k in sorted(set(qs))], ignore_index=True)
 
 
 def apply(rows, names, weights):
@@ -126,13 +156,15 @@ def main(argv=None):
     p.add_argument("--spec", default=os.path.join(REPO, "configs", "test_set_substations_2025.yaml"))
     p.add_argument("--apply", default=None, help="weights.json from a dev run (required for --role test)")
     p.add_argument("--out", required=True)
+    p.add_argument("--exp-freq", default="M", choices=["M", "Q"],
+                   help="blend_exp: weights refitted every month (default) or quarter on the targets known by then")
     p.add_argument("--by-daytype", action="store_true",
                    help="separate weights for target days that are weekends / holidays and for workdays")
     a = p.parse_args(argv)
     if a.role == "test" and not a.apply:
         raise SystemExit("on the test substations the blend is only applied (--apply <dev weights.json>)")
     spec = ns.load_spec(a.spec)
-    models, test_dir = load(a.runs, a.latest, a.role, a.eval_dir)
+    models, test_dir, metas = load(a.runs, a.latest, a.role, a.eval_dir)
     ns.check_same_spec(spec, ns.read_manifest(test_dir))
     targets, nodes = ns.load_targets(test_dir), ns.load_nodes(test_dir)
     want = set(nodes.loc[nodes["role"] == a.role, "node"])
@@ -149,6 +181,8 @@ def main(argv=None):
         if weights["models"] != names:
             raise SystemExit(f"weights are for {weights['models']}, these runs give {names}")
         blends = {"blend": apply(rows, names, weights["weights"])}
+        if weights.get("expanding"):                               # leak-proof: quarter k uses dev targets before k
+            blends["blend_exp"] = apply_by_quarter(rows, names, weights["expanding"], weights.get("expanding_freq", "Q"))
     else:
         W = simplex(len(names))
         print(f"[blend] {len(names)} components {names}, {len(W)} weight vectors per horizon block, {len(rows):,} rows")
@@ -160,8 +194,13 @@ def main(argv=None):
             parts.append(apply(rows[q == k], names, wk))
             print(f"[blend] quarter {k} held out: " + " | ".join(
                 f"h{b}: " + " ".join(f"{n} {w:.2f}" for n, w in zip(names, v) if w > 0) for b, v in wk.items()))
-        blends = {"blend_cv": pd.concat(parts, ignore_index=True), "blend_insample": apply(rows, names, full)}
-        weights = dict(models=names, weights=full, blocks=BLOCKS, step=STEP, role=a.role, by_daytype=bool(a.by_daytype))
+        bexp, wq = expanding(rows, names, W, a.exp_freq)
+        for k, wk in wq.items():
+            print(f"[blend] expanding, issue quarter {k}: " + " | ".join(
+                f"h{b}: " + " ".join(f"{n} {w:.2f}" for n, w in zip(names, v) if w > 0) for b, v in wk.items()))
+        blends = {"blend_exp": bexp, "blend_cv": pd.concat(parts, ignore_index=True), "blend_insample": apply(rows, names, full)}
+        weights = dict(models=names, weights=full, blocks=BLOCKS, step=STEP, role=a.role, by_daytype=bool(a.by_daytype),
+                       expanding=wq, expanding_freq=a.exp_freq)
         json.dump(weights, open(os.path.join(out, "weights.json"), "w"), indent=2)
         print("\nWEIGHTS (all of dev; saved to weights.json for the one test run)")
         for b, v in full.items():
@@ -174,6 +213,12 @@ def main(argv=None):
         d = os.path.join(out, "forecasts", k)
         os.makedirs(d, exist_ok=True)
         v.to_csv(os.path.join(d, "node.csv.gz"), index=False, float_format="%.6f")
+        safe = all(int((m.get("scaling") or {}).get("safe_lag", 0)) >= ns.EST_SAFE_LAG for m in metas.values())
+        json.dump(dict(model=k, role=a.role, test_dir=test_dir, roles=[a.role], components=metas,
+                       b0_safe_lag=ns.EST_SAFE_LAG, weights=("per month/quarter, past targets only" if k == "blend_exp"
+                                                           else "fitted on the same year (not leak-proof)"),
+                       leak_proof=bool(k == "blend_exp" and safe)),
+                  open(os.path.join(d, "forecast_meta.json"), "w"), indent=2, default=str)
     print(f"\n-> {out}")
 
 

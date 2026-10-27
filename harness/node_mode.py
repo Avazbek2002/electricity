@@ -9,7 +9,8 @@
     under the role's substations and feeders with fresh history (data up to o - 1) get the model's forecast for
     o + 1 .. o + 60; per node
         F_node(o, h) = (households in span on o - 1) x (mean forecast of the node's fresh households) x c_node(o)
-    c_node(o) = node T2 per household over the last `days` days up to o - 1 / the fresh households' observed mean there
+    c_node(o) = node T2 per household over the last `days` days up to o - 1 - safe_lag / the fresh households' observed
+    mean there (safe_lag = nodeset.EST_SAFE_LAG: T2 of o - 2 and o - 1 can hold estimated readings taken after o - 1)
     (configs/eval.yaml run.scaling, as the district harness). The unscaled forecast is scored next to it.
   - Node membership is the household's network ids as read by harness.data.read_district (first known); the node
     targets use the row-level ids of each day (moved households <= 10 % by the selection rules).
@@ -157,11 +158,12 @@ def node_worker(code, cfg):
                 c = 1.0
                 pc = pcs.get(node)
                 if sc.get("method", "ratio") == "ratio" and pc is not None:
-                    w0 = max(0, last + 1 - sdays)
-                    win = M[members, w0:last + 1]
+                    e = last + 1 - int(sc.get("safe_lag", 0))
+                    w0 = max(0, e - sdays)
+                    win = M[members, w0:e]
                     n_obs = np.isfinite(win).sum()
                     fm = float(np.nansum(win) / n_obs) if n_obs else np.nan
-                    seg = pc[w0:last + 1]
+                    seg = pc[w0:e]
                     pm = float(np.nanmean(seg)) if np.isfinite(seg).any() else np.nan
                     if np.isfinite(fm) and np.isfinite(pm) and fm > 0:
                         c = float(np.clip(pm / fm, lo_c, hi_c))
@@ -263,6 +265,7 @@ def _run_node(args, cfg, git, model_dir, model_config, tracking, holder):
     if weather == "simulated":
         raise SystemExit("[nodes] --weather simulated is not supported here (none, aifs, fcn3, ens)")
     sc_run = dict(cfg["run"].get("scaling") or {"method": "ratio"})
+    sc_run.setdefault("safe_lag", ns.EST_SAFE_LAG)      # window ends on o - 1 - safe_lag: no estimated reading from after o - 1
     if getattr(args, "scaling_days", None):
         sc_run["days"] = int(args.scaling_days)
 

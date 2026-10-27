@@ -40,6 +40,9 @@ LEVELS = ("substation", "feeder")
 MIN_KNOWN = 10                     # a node-day needs this many known households (also the disclosure floor)
 FEEDER_BANDS = [(50, 150, "50-149"), (150, 400, "150-399"), (400, 10 ** 9, "400+")]
 REFERENCE = "B0"
+EST_SAFE_LAG = 2   # node T2 includes 2-3 day estimated readings spread evenly: the share on day d comes from a reading taken
+                   # up to d + 2, so on issue date o the T2 of o - 2 and o - 1 can carry consumption of o and o + 1 (ML guide
+                   # part 2, estimated days in history). Node-target windows (B0 level, scaling c(o)) end on o - 1 - EST_SAFE_LAG
 
 
 # ----------------------------------------------------------------------------- the definition
@@ -168,10 +171,12 @@ def per_customer(targets, spec):
 
 
 # ----------------------------------------------------------------------------- B0 (node)
-def b0_forecasts(targets, spec, nodes=None, issue=None):
+def b0_forecasts(targets, spec, nodes=None, issue=None, safe_lag=None):
     """B0 per node: m28 of T2 at o - gap x the last-year seasonal ratio of T3 (7-day centred mean on the target day over
-    the 28-day mean at o - gap - 364), else two years back, else 1; ratio clipped to 0.6 .. 1.7."""
+    the 28-day mean at o - gap - 364), else two years back, else 1; ratio clipped to 0.6 .. 1.7. The level window ends
+    safe_lag (EST_SAFE_LAG) days earlier, so no estimated reading taken after o - 1 is in it."""
     H, gap = int(spec["horizons"]), int(spec["history_gap_days"])
+    gap += EST_SAFE_LAG if safe_lag is None else int(safe_lag)
     start = pd.Timestamp(spec["data"]["start"])
     if issue is None:
         issue = pd.DatetimeIndex(sorted(set(issue_dates(spec, "dev")) | set(issue_dates(spec, "test"))))
