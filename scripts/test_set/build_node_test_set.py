@@ -29,7 +29,7 @@ import enriched_io as eio  # noqa: E402  (harness puts core/ on the path)
 
 LABEL_OBS, LABEL_EST = "complete_observed", "complete_with_estimated"
 WANT = ["date", "label_state", "kwh", "kwh_nano", "is_long_gap_allocated", "kwh_long_gap_allocated", "is_right_edge",
-        "crisis_context", "data_interruption", "substation_id", "feeder_id"]
+        "crisis_context", "data_interruption", "substation_id", "feeder_id", "t_mean"]
 KEYS = ("n_rows", "n_obs", "n_est", "n_lg", "kwh_obs", "kwh_est", "kwh_lg", "n_right", "crisis", "interruption")
 
 
@@ -49,6 +49,7 @@ def district_nodes(code, cfg):
     T = (d1 - d0).days + 1
     e0 = int((d0 - pd.Timestamp("1970-01-01")).days)
     acc = {k: np.zeros(K * T) for k in KEYS}
+    tmean = np.full(T, np.nan)                               # the district's daily mean temperature (same on every row)
     def vals_for(name, ids):                                 # the filter values in the column's own type
         typ = dset.schema.field(name).type
         return pa.array([str(i) for i in ids]) if pa.types.is_string(typ) else pa.array(list(ids), type=typ)
@@ -82,6 +83,10 @@ def district_nodes(code, cfg):
                     kwh_obs=np.where(obs, kwh, 0.0), kwh_est=np.where(est, kwh, 0.0),
                     kwh_lg=np.where(lg, col("kwh_long_gap_allocated"), 0.0),
                     n_right=col("is_right_edge", bool).astype(float))
+        if "t_mean" in cols:
+            tv = np.asarray(b.column("t_mean").to_numpy(zero_copy_only=False), dtype=float)
+            ok = (day >= 0) & (day < T) & np.isfinite(tv)
+            np.fmax.at(tmean, day[ok], tv[ok])
         flags = dict(crisis=col("crisis_context", bool).astype(float), interruption=col("data_interruption", bool).astype(float))
         for ids, keys_, idx in ((ints("substation_id"), sid_arr, s_idx), (ints("feeder_id"), fid_arr, f_idx)):
             pos = np.searchsorted(keys_, ids)
@@ -105,7 +110,30 @@ def district_nodes(code, cfg):
         df.loc[df["n_rows"] == 0, "n_rows"] = np.nan
         parts.append(df)
     return dict(code=str(code), counts=pd.concat(parts, ignore_index=True), seconds=time.time() - t0,
+                weather=pd.DataFrame({"coato": str(code), "date": dates, "t_mean": tmean}),
                 peak_bytes=ts.peak_rss_bytes())
+
+
+def _obs_only(g):
+    """T2 from the observed one-day readings only (T2obs = n_rows x kWh_obs / n_obs): the part of o - 1 and o - 2 that is
+    known on o (a 2-3 day estimated reading covering them is taken later). NaN below the disclosure floor."""
+    n_obs = g["n_obs"].where(g["n_obs"] >= ns.MIN_KNOWN)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        t2o = g["n_rows"] * g["kwh_obs"] / n_obs
+    return pd.DataFrame({"date": g["date"], "node": g["node"], "T2obs": t2o, "n_obs": g["n_obs"].fillna(0).astype(int)})
+
+
+def _write_extras(out, obs, wx):
+    """targets/node_obs.csv.gz (node-day T2 from observed readings only) and targets/district_weather.csv.gz (district
+    daily mean temperature of the enriched data) for the direct node models (scripts/node_direct.py)."""
+    os.makedirs(os.path.join(out, "targets"), exist_ok=True)
+    if obs:
+        o = pd.concat(obs, ignore_index=True).sort_values(["node", "date"])
+        o.loc[o["n_obs"] < ns.MIN_KNOWN, "n_obs"] = 0
+        o.to_csv(os.path.join(out, "targets", "node_obs.csv.gz"), index=False, float_format="%.10g")
+    if wx:
+        w = pd.concat(wx, ignore_index=True).dropna(subset=["t_mean"]).sort_values(["coato", "date"])
+        w.to_csv(os.path.join(out, "targets", "district_weather.csv.gz"), index=False, float_format="%.4f")
 
 
 def main(argv=None):
@@ -115,10 +143,13 @@ def main(argv=None):
     p.add_argument("--workers", type=int, default=8)
     p.add_argument("--root", default=None, help="data root instead of the spec's (tests)")
     p.add_argument("--overwrite", action="store_true", help="replace an existing build (only before it is used)")
+    p.add_argument("--extras-only", action="store_true",
+                   help="an existing build: (re)write only the extra tables (targets/node_obs.csv.gz, "
+                        "targets/district_weather.csv.gz), the built targets and manifest stay as they are")
     a = p.parse_args(argv)
     spec = ns.load_spec(a.spec)
     out = os.path.join(os.path.expanduser(a.out_root), spec["version"])
-    if os.path.exists(os.path.join(out, "manifest.json")) and not a.overwrite:
+    if os.path.exists(os.path.join(out, "manifest.json")) and not (a.overwrite or a.extras_only):
         raise SystemExit(f"{out} is already built (new version in the spec, or --overwrite before it is used)")
     os.makedirs(os.path.join(out, "targets"), exist_ok=True)
     d = dict(spec["data"])
@@ -134,7 +165,7 @@ def main(argv=None):
         jobs[c] = dict(data=d, names=q["node"].tolist(),
                        subs={int(r.node_id): i for i, r in q.iterrows() if r.level == "substation"},
                        feeds={int(r.node_id): i for i, r in q.iterrows() if r.level == "feeder"})
-    parts, t0 = [], time.time()
+    parts, t0, obs, wx = [], time.time(), [], []
     if a.workers <= 1:                                       # in process (tests, one district)
         done = (district_nodes(c, jobs[c]) for c in codes)
     else:
@@ -144,11 +175,19 @@ def main(argv=None):
     if True:
         for k, r in enumerate(done, 1):
             for node, g in r["counts"].groupby("node", sort=False):
-                parts.append(ns.node_target(g.reset_index(drop=True), spec))
+                g = g.reset_index(drop=True)
+                if not a.extras_only:
+                    parts.append(ns.node_target(g, spec))
+                obs.append(_obs_only(g))
+            wx.append(r["weather"])
             print(f"[build] {k}/{len(codes)} {r['code']}: {r['seconds']:.0f} s | {ts.memory_line(r['peak_bytes'])}",
                   flush=True)
     if a.workers > 1:
         ex.shutdown()
+    _write_extras(out, obs, wx)
+    if a.extras_only:
+        print(f"[build] extras written in {(time.time() - t0) / 60:.1f} min -> {out}/targets")
+        return out
     T = pd.concat(parts, ignore_index=True).sort_values(["node", "date"])
     T.loc[T["n_known"] < ns.MIN_KNOWN, "T2"] = np.nan                 # disclosure floor (already artefact)
     T.loc[T["n_known"] + T["n_lg"].fillna(0) < ns.MIN_KNOWN, "T3"] = np.nan

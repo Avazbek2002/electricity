@@ -8,6 +8,7 @@ wandb
 plotly
 catboost
 xgboost
+lightgbm>=4.0         # scripts/node_direct.py (linear trees)
 scikit-learn
 pytest
 interpret-core
