@@ -11,8 +11,8 @@
 
 For a horizon h, the point on target day d is the forecast issued on d - h (so every line is a forecast made h days
 ahead). B0 is added. Writes <out>/year_chart.html (self-contained: pick the node, the horizon and the level; the legend
-shows each model's sysMAPE on what is plotted) and year_total_<level>.png (the sum of all nodes of the role, h1 / h14 /
-h60). Node aggregates only (nodes of >= 50 households), no customer keys.
+shows each model's sysMAPE on what is plotted) and year_total_<level>.png (the sum of all nodes of the role, one panel
+per --horizons, default h1 / h7 / h14 / h30 / h60). Node aggregates only (nodes of >= 50 households), no customer keys.
 """
 import argparse
 import json
@@ -90,7 +90,7 @@ lv.onchange=()=>{nodes();draw()}; nd.onchange=draw; hz.onchange=draw; nodes(); d
 </script></body></html>"""
 
 
-def png_total(data, names, out):
+def png_total(data, names, out, horizons=(1, 7, 14, 30, 60)):
     try:
         import matplotlib
         matplotlib.use("Agg")
@@ -100,7 +100,7 @@ def png_total(data, names, out):
         return
     for lv, nodes in data.items():
         s = nodes[TOTAL]
-        hs = [h for h in ("h1", "h14", "h60") if h in s]
+        hs = [f"h{h}" for h in horizons if f"h{h}" in s]
         fig, axes = plt.subplots(len(hs), 1, figsize=(14, 3.2 * len(hs)), sharex=True)
         axes = np.atleast_1d(axes)
         x = pd.to_datetime(s["d"])
@@ -194,7 +194,7 @@ def main(argv=None):
     p_html = os.path.join(out, "year_chart.html")
     open(p_html, "w").write(html)
     print(f"[charts] {p_html} ({os.path.getsize(p_html) / 1e6:.1f} MB)")
-    png_total(data, names, out)
+    png_total(data, names, out, a.horizons)
     return out
 
 
