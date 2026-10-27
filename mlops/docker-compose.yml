@@ -1,0 +1,37 @@
+# Phase 1: the simulated operator database. Later phases add MinIO, MLflow and Airflow to this file.
+#   cp .env.example .env && docker compose up -d source-db
+#   docker compose --profile init run --rm sim-init        # generate + release history up to SIM_START
+#   docker compose --profile tools run --rm sim elecsim.clock --to 2025-01-05   # (later: the Airflow daily DAG)
+services:
+  source-db:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: source
+      POSTGRES_USER: operator
+      POSTGRES_PASSWORD: ${SOURCE_DB_PASSWORD}
+    ports: ["5433:5432"]
+    volumes: [source-db:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U operator -d source"]
+      interval: 5s
+      retries: 20
+
+  sim-init:
+    build: .
+    profiles: ["init"]
+    depends_on: { source-db: { condition: service_healthy } }
+    environment:
+      SOURCE_DSN: postgresql://operator:${SOURCE_DB_PASSWORD}@source-db:5432/source
+    command: ["python", "-m", "elecsim.generate", "--clock-to", "${SIM_START}"]
+
+  sim:
+    build: .
+    profiles: ["tools"]
+    depends_on: { source-db: { condition: service_healthy } }
+    environment:
+      SOURCE_DSN: postgresql://operator:${SOURCE_DB_PASSWORD}@source-db:5432/source
+    entrypoint: ["python", "-m"]
+    command: ["elecsim.clock", "--status"]
+
+volumes:
+  source-db:

@@ -1,0 +1,62 @@
+# Synthetic operator data (mlops/elecsim). Behaviour calibrated to the national data and the node analyses (aggregates
+# only: household_growth.py, node_calendar_spikes.py, regime_audit.py); no customer data is used.
+seed: 2026
+start: 2022-01-01
+end: 2026-06-30
+
+network:
+  districts: ["90101", "90102"]              # synthetic COATO codes (9xxxx: never a real district)
+  substations_per_district: 5
+  feeders_per_substation: 3
+  households_per_feeder: [60, 140]           # uniform range at the start date
+  transformers_per_feeder: 4
+
+households:
+  base_kwh_lognormal: [1.65, 0.45]           # log-mean, log-sd of daily kWh at mild weather (median ~5.2)
+  gas_share: 0.7                             # gas-heated; the rest heat with electricity
+  heat_beta_gas: [0.005, 0.01]               # relative load per heating degree day (base 18 C): mean, sd
+  heat_beta_electric: [0.045, 0.015]
+  cool_beta: [0.035, 0.015]                  # per cooling degree day (base 24 C)
+  apartment_share: 0.35
+  daily_noise_sd: 0.25                       # lognormal day-to-day noise of one household
+  growth_per_year: 0.03                      # new connections
+  disconnect_per_year: 0.01
+  regime_change: 2024-08-01                  # readings in whole kWh before this date (old billing regime)
+
+calendar:
+  weekday_factor: {Mon: 0.95, Tue: 0.98, Wed: 0.99, Thu: 0.99, Fri: 1.0, Sat: 1.02, Sun: 1.05}
+  holiday_factor: 1.03
+  eid_eve_factor: 1.12                       # the 3 days before Eid al-Fitr
+  national_events:                           # date: factor on every household (the Jan 2022 blackout)
+    2022-01-25: 0.70
+    2022-01-26: 0.92
+
+weather:
+  annual_mean: 15.0
+  annual_amplitude: 14.0
+  district_offset_sd: 1.5
+  ar1_rho: 0.8
+  ar1_sd: 2.0
+  forecast_models: ["aifs", "fcn3"]
+  forecast_lead_days: 15
+  forecast_error_sd: [0.9, 3.0]              # lead 0 -> lead 15, linear
+  forecast_bias_sd: 0.8                      # per model, district and season
+  forecast_issue_days: odd                   # odd | all | "1,9,17,25"
+
+readings:
+  askue_share_start: 0.45                    # share of meters on automatic daily reading at the start date
+  askue_share_end: 0.92                      # ... and at the end (meters migrate; drives the coverage growth)
+  askue_daily_success: 0.93                  # an ASKUE meter reports a given day
+  askue_outage_rate_per_year: 1.5            # stretches with no readings
+  askue_outage_days: [3, 60]
+  manual_interval_days: [25, 35]
+  coefficient_choices: [100, 100, 100, 100, 200]
+  meter_replacement_per_year: 0.03
+  duplicate_rate: 0.002                      # same meter and date twice
+  bad_status_rate: 0.001                     # status != 1 (quarantined downstream)
+  arrival_lag_askue: {1: 0.88, 2: 0.07, 3: 0.03, 7: 0.015, 20: 0.005}   # days after the reading date: probability
+  arrival_lag_manual: {0: 0.3, 1: 0.3, 3: 0.25, 7: 0.15}
+
+events:
+  remaps: 2                                  # a block of households moved to another feeder / substation
+  remap_share: [0.2, 0.5]                    # share of the source feeder moved
