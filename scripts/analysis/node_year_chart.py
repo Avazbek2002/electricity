@@ -5,6 +5,9 @@
         --forecasts ~/work/eval/runs/<..._xgboost_cal_edd_nodes-dev>/forecasts/xgboost_cal_edd \
                     ~/work/eval/runs/<..._nlinear_x_nodes-dev>/forecasts/nlinear_x \
                     ~/work/eval/node_blend_dev/forecasts/blend_cv
+    # labels (LABEL=folder) tell several blends apart (each blend folder is called blend_cv / blend):
+    python scripts/analysis/node_year_chart.py --role dev --forecasts \
+        blend_5pct=~/work/eval/node_blend_dev/forecasts/blend_cv blend_cal=~/work/eval/node_blend_dev_cal/forecasts/blend_cv
 
 For a horizon h, the point on target day d is the forecast issued on d - h (so every line is a forecast made h days
 ahead). B0 is added. Writes <out>/year_chart.html (self-contained: pick the node, the horizon and the level; the legend
@@ -123,7 +126,7 @@ def png_total(data, names, out):
 
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--forecasts", nargs="+", required=True, help="node forecast folders (node.csv.gz); name = folder name")
+    p.add_argument("--forecasts", nargs="+", required=True, help="node forecast folders (node.csv.gz), optionally LABEL=folder; default label = folder name")
     p.add_argument("--role", default="dev", choices=["dev", "test"])
     p.add_argument("--spec", default=os.path.join(REPO, "configs", "test_set_substations_2025.yaml"))
     p.add_argument("--test-dir", default=None)
@@ -138,8 +141,9 @@ def main(argv=None):
     targets, nodes = ns.load_targets(test_dir), ns.load_nodes(test_dir)
     models = {}
     for fd in a.forecasts:
-        fd = os.path.expanduser(fd.rstrip("/"))
-        name = os.path.basename(fd)
+        label, _, path = fd.rpartition("=") if "=" in fd else ("", "", fd)
+        fd = os.path.expanduser(path.rstrip("/"))
+        name = label or os.path.basename(fd)
         if name in models:
             name = f"{name}@{os.path.basename(os.path.dirname(os.path.dirname(fd)))[:15]}"
         models[name] = ns.read_forecasts(fd)
