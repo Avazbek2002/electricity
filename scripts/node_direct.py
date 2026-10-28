@@ -312,7 +312,7 @@ def fit_block(P, a, b, n_trees=N_TREES):
     return lgb.train(params, ds, num_boost_round=n_trees), len(q)
 
 
-def run_refits(P, refits, issue, b1_long=0.5, n_trees=N_TREES, log=print):
+def run_refits(P, refits, issue, b1_long=0.5, n_trees=N_TREES, log=print, b1_from=31):
     """Quarterly refits: models fitted on pairs with target day <= R - 3, predicting the issue dates up to the next refit."""
     refits = [pd.Timestamp(r) for r in refits]
     out = []
@@ -330,7 +330,7 @@ def run_refits(P, refits, issue, b1_long=0.5, n_trees=N_TREES, log=print):
             fc[sel] = m.predict(_fill(pred.loc[sel, FEATURES]))
             log(f"[fit] refit {R.date()} block h{a}-{b}: {n:,} training pairs")
         f = pred["m28"].to_numpy() * fc
-        far = pred["h"].to_numpy() >= 31
+        far = pred["h"].to_numpy() >= b1_from
         f[far] = (1 - b1_long) * f[far] + b1_long * pred["B1"].to_numpy()[far]
         out.append(pd.DataFrame({"node": pred["node"].to_numpy(), "origin": pred["origin"].to_numpy(),
                                  "horizon": pred["h"].to_numpy(), "forecast": f, "B1": pred["B1"].to_numpy()}))
@@ -376,7 +376,9 @@ def main(argv=None):
     p.add_argument("--eval-dir", default="~/work/eval")
     p.add_argument("--stride", type=int, default=2, help="training origins every N days (2025 issue dates: every day)")
     p.add_argument("--trees", type=int, default=N_TREES)
-    p.add_argument("--b1-long", type=float, default=0.5, help="weight of B1 on h31-60 (the champion: 0.5)")
+    p.add_argument("--b1-long", type=float, default=0.5, help="weight of B1 from --b1-from on (the champion: 0.5)")
+    p.add_argument("--b1-from", type=int, default=31,
+                   help="first horizon averaged with B1 (champion: 31 with weather, 8 without)")
     p.add_argument("--report-test", action="store_true", help="also print the test substations (once, chosen variant)")
     p.add_argument("--no-substitution-test", action="store_true")
     p.add_argument("--name", default="node_direct")
@@ -403,12 +405,12 @@ def main(argv=None):
     t0 = time.time()
     P = build_panel(t, nodes, obs, wx, spec, origins)
     print(f"[panel] {len(P):,} (node, origin, horizon) rows, {len(FEATURES)} features in {time.time() - t0:.0f} s", flush=True)
-    F = run_refits(P, spec["refits"], issue, a.b1_long, a.trees)
+    F = run_refits(P, spec["refits"], issue, a.b1_long, a.trees, b1_from=a.b1_from)
     run = os.path.join(os.path.expanduser(a.eval_dir), "runs", f"{time.strftime('%Y%m%d-%H%M%S')}_{a.name}_nodes-dev-test")
     meta = dict(model=a.name, test_set_version=spec["version"], test_dir=test_dir, role="dev+test", roles=roles,
                 git_commit=git, scaling=dict(method="direct", safe_lag=ns.EST_SAFE_LAG), substitution_test=sub,
                 obs_tail=obs is not None, weather="none (past observed + climate)", blocks=BLOCKS, trees=a.trees,
-                b1_long=a.b1_long, stride=a.stride, features=FEATURES)
+                b1_long=a.b1_long, b1_from=a.b1_from, stride=a.stride, features=FEATURES)
     for name, col in ((a.name, "forecast"), ("B1", "B1")):
         d = os.path.join(run, "forecasts", name)
         os.makedirs(d, exist_ok=True)
